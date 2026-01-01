@@ -2,9 +2,9 @@ import torch
 from torch import nn
 from sklearn.metrics import accuracy_score, matthews_corrcoef
 
-from Multimodel_Source_Encoding import MultimodalSourceEncoding
-from Gated_Cross_Feature_Fusion import CrossAttentionEncoder
-from Fine_grained_Movement_Prediction import FinegrainedMovementPrediction
+from encoders.mutil_encoder import MultimodalSourceEncoding
+from .fushion import CrossAttentionEncoder
+from .predictor import FinegrainedMovementPrediction
 
 
 class StockMovementModel(nn.Module):

@@ -1,9 +1,9 @@
 import torch
 import random
 import numpy as np
-from model import StockMovementModel
-from data_load import data_prepare
-from config import TrainConfig
+from src.model import StockMovementModel
+from src.data_loader import data_prepare
+from configs.config import TrainConfig
 
 def set_seed(seed):
     np.random.seed(seed)
