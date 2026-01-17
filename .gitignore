@@ -7,9 +7,6 @@ __pycache__/
 venv/
 .env/
 
-data/raw/
-data/processed/
-data/interim/
 
 # IDE
 .vscode/
