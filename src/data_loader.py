@@ -1,40 +1,22 @@
+# src/data_loader.py
 import pandas as pd
 import numpy as np
 import torch
-from sklearn.preprocessing import StandardScaler
-
+from configs.config import TrainConfig  # Đồng bộ với Config mới
 
 class data_prepare:
     def __init__(self, data_path) -> None:
         self.data_path = data_path
 
-        # ===== Scalers (fit on train only) =====
-        self.price_scaler = StandardScaler()
-        self.macro_scaler = StandardScaler()
-
-    def create_label(self, price_df, window_size=3, threshold=0.01):
-        """
-        Output label: 0 = DOWN, 1 = FLAT, 2 = UP
-        """
+    # ======================================================
+    # LABEL: GIỮ NGUYÊN CÔNG THỨC RETURN
+    # r_t = close_t / close_{t-1} - 1
+    # ======================================================
+    def create_return(self, price_df):
         df = price_df.copy()
-
-        df["future_return"] = (
-            df["close"].shift(-window_size) / df["close"] - 1
-        )
-
-        conditions = [
-            df["future_return"] < -threshold,   # DOWN
-            (df["future_return"] >= -threshold) &
-            (df["future_return"] <= threshold), # FLAT
-            df["future_return"] > threshold     # UP
-        ]
-
-        choices = [0, 1, 2]
-        df["label"] = np.select(conditions, choices)
-
+        df["return"] = df["close"] / df["close"].shift(1) - 1
         df.dropna(inplace=True)
-
-        return df[["label"]]
+        return df[["return"]]
 
     def make_window(self, data, window_size):
         """
@@ -49,81 +31,193 @@ class data_prepare:
     def prepare_data(
         self,
         stock_name,
-        window_size=20,
+        # Lấy window_size từ Config để đảm bảo khớp với Model Input
+        window_size=TrainConfig.window_size, 
         future_days=1,
-        train_ratio=0.8
+        # Tỷ lệ chia tập dữ liệu (cần thêm valid_ratio vào Config hoặc truyền tay)
+        train_ratio=getattr(TrainConfig, 'train_ratio', 0.70),
+        valid_ratio=getattr(TrainConfig, 'valid_ratio', 0.15),
+        flat_ratio=30
     ):
+        # ==========================
+        # LOAD DATA
+        # ==========================
         Data = pd.read_pickle(self.data_path)
+        rows = {}
+        
+        # In ra cấu trúc keys của 1 ngày đầu tiên để debug (nếu cần)
+        # first_date = next(iter(Data))
+        # print(f"DEBUG: Keys in Data[{first_date}]: {list(Data[first_date].keys())}")
 
-        df = pd.DataFrame({
-            d: {
-                **content["price"][stock_name],
-                **content["macro"],
+        for d, content in Data.items():
+            # Kiểm tra xem ngày này có dữ liệu giá của cổ phiếu không
+            if "price" not in content or stock_name not in content["price"]:
+                continue
+
+            price = content["price"][stock_name]
+            macro = content["macro"]
+
+            # [CRITICAL FIX]: LẤY DỮ LIỆU TỪ KEY 'news_embedding'
+            # Thay vì content["news"] (chứa text), ta lấy content["news_embedding"]
+            news_section = content.get("news_embedding", {})
+            
+            # Lấy vector của stock hiện tại, nếu không có thì trả về None
+            raw_vec = news_section.get(stock_name)
+
+            if raw_vec is None:
+                # Không có tin hoặc không có embedding -> Zero Vector
+                news_vec = np.zeros(TrainConfig.news_embed_dim, dtype=np.float32)
+            else:
+                # Có dữ liệu -> Đảm bảo là Numpy Array Float
+                # Theo builder.py: rec['embedding'] là list of floats -> OK
+                try:
+                    news_vec = np.array(raw_vec, dtype=np.float32)
+                except Exception as e:
+                    print(f"⚠️ Error converting embedding on {d}: {e}")
+                    news_vec = np.zeros(TrainConfig.news_embed_dim, dtype=np.float32)
+
+            # Map thành dict để pandas dễ xử lý column name
+            news_dict = {f"news_{i}": v for i, v in enumerate(news_vec)}
+
+            rows[d] = {
+                **price,
+                **macro,
+                **news_dict
             }
-            for d, content in Data.items()
-        }).T
+        
+        if not rows:
+            print(f"❌ No data found for stock {stock_name}")
+            return {}, {}, {}
 
-        price_df = df[["open", "high", "close"]]
+        df = pd.DataFrame.from_dict(rows, orient="index")
+        df.sort_index(inplace=True)
+
+        # ==========================
+        # SPLIT MODALITIES
+        # ==========================
+        price_df = df[["open", "high", "close"]].astype(float)
+
         macro_df = df[
             ["vix", "yield_spread_10y_2y",
-            "sp500", "sp500_return", "dxy", "wti"]
-        ]
+             "sp500", "sp500_return", "dxy", "wti"]
+        ].astype(float)
 
-        # ===== LABEL =====
-        label_df = self.create_label(price_df, window_size=future_days)
+        news_cols = [c for c in df.columns if c.startswith("news_")]
+        news_df = df[news_cols]
+        news_df = news_df.apply(pd.to_numeric, errors="coerce")
+        news_df = news_df.fillna(0.0)
 
-        price_df = price_df.loc[label_df.index]
-        macro_df = macro_df.loc[label_df.index]
+        # ==========================
+        # RETURN (PAST RETURN)
+        # ==========================
+        return_df = self.create_return(price_df)
 
-        # ==================================================
-        # 🔥 NORMALIZATION
-        # ==================================================
+        # ALIGN STEP 1: theo return
+        price_df = price_df.loc[return_df.index]
+        macro_df = macro_df.loc[return_df.index]
+        news_df  = news_df.loc[return_df.index]
 
-        # ----- Price: log-return -----
+        # ==========================
+        # PRICE INPUT: LOG-RETURN
+        # ==========================
         price_df = np.log(price_df / price_df.shift(1))
-        price_df = price_df.dropna()
+        price_df.dropna(inplace=True)
 
-        # align again
-        macro_df = macro_df.loc[price_df.index]
-        label_df = label_df.loc[price_df.index]
+        # ALIGN STEP 2 (QUAN TRỌNG NHẤT)
+        macro_df  = macro_df.loc[price_df.index]
+        news_df   = news_df.loc[price_df.index]
+        return_df = return_df.loc[price_df.index]
 
-        # ----- Macro: z-score (fit later) -----
+        # ==========================
+        # MACRO CLEAN
+        # ==========================
         macro_df = macro_df.replace([np.inf, -np.inf], np.nan)
-        macro_df = macro_df.fillna(method="ffill").fillna(method="bfill")
+        macro_df = macro_df.ffill().bfill()
 
-        # ===== numpy =====
-        price_np = price_df.values
-        macro_np = macro_df.values
-        label_np = label_df.values
+        # SAFETY CHECK
+        assert len(price_df) == len(macro_df) == len(news_df) == len(return_df), \
+            "❌ Modality length mismatch before windowing"
 
-        # ===== sliding window =====
+        # ==========================
+        # NUMPY & WINDOWING
+        # ==========================
+        price_np  = price_df.values           # (T, 3)
+        macro_np  = macro_df.values           # (T, Dm)
+        news_np   = news_df.values            # (T, 1024)
+        return_np = return_df.values          # (T, 1)
+
         price_win = self.make_window(price_np, window_size)
         macro_win = self.make_window(macro_np, window_size)
-        label_win = label_np[window_size - 1:]
+        news_win  = self.make_window(news_np, window_size)
 
-        # ===== split =====
-        split_idx = int(len(price_win) * train_ratio)
+        # LABEL = future return (NO LEAK)
+        label_raw = return_np[window_size - 1 + future_days:]
 
-        # ----- fit macro scaler on train -----
-        macro_mean = macro_win[:split_idx].mean(axis=(0, 1), keepdims=True)
-        macro_std = macro_win[:split_idx].std(axis=(0, 1), keepdims=True) + 1e-6
+        price_win = price_win[:-future_days]
+        macro_win = macro_win[:-future_days]
+        news_win  = news_win[:-future_days]
 
+        assert len(price_win) == len(macro_win) == len(news_win) == len(label_raw), \
+            "❌ Window length mismatch"
+
+        # ==========================
+        # [NEW] SPLIT 3 TẬP (TRAIN - VALID - TEST)
+        # ==========================
+        total_len = len(price_win)
+        idx_train = int(total_len * train_ratio)
+        idx_valid = int(total_len * (train_ratio + valid_ratio))
+        
+        # Tập Train: 0 -> idx_train
+        # Tập Valid: idx_train -> idx_valid
+        # Tập Test : idx_valid -> Hết
+
+        # ==========================
+        # THRESHOLD (FIT ON TRAIN ONLY - CHỐNG LEAKAGE)
+        # ==========================
+        # Chỉ dùng dữ liệu Train để tính ngưỡng phân loại
+        train_returns_only = label_raw[:idx_train].flatten()
+        threshold = np.percentile(np.abs(train_returns_only), flat_ratio)
+
+        def map_label(r):
+            if r < -threshold: return 0 # DOWN
+            elif r > threshold: return 2 # UP
+            else: return 1 # FLAT
+
+        label_all = np.array([map_label(r[0]) for r in label_raw])
+
+        # ==========================
+        # NORMALIZATION (FIT ON TRAIN ONLY - CHỐNG LEAKAGE)
+        # ==========================
+        # Tính Mean/Std chỉ trên tập Train
+        macro_mean = macro_win[:idx_train].mean(axis=(0, 1), keepdims=True)
+        macro_std  = macro_win[:idx_train].std(axis=(0, 1), keepdims=True) + 1e-6
+        
+        news_mean = news_win[:idx_train].mean(axis=(0, 1), keepdims=True)
+        news_std  = news_win[:idx_train].std(axis=(0, 1), keepdims=True) + 1e-6
+
+        # Áp dụng chuẩn hóa cho TOÀN BỘ dữ liệu (Train, Valid, Test)
         macro_win = (macro_win - macro_mean) / macro_std
+        news_win  = (news_win - news_mean) / news_std
 
-        train_data = {
-            "s_o": torch.tensor(price_win[:split_idx, :, 0:1], dtype=torch.float32),
-            "s_h": torch.tensor(price_win[:split_idx, :, 1:2], dtype=torch.float32),
-            "s_c": torch.tensor(price_win[:split_idx, :, 2:3], dtype=torch.float32),
-            "s_m": torch.tensor(macro_win[:split_idx], dtype=torch.float32),
-            "label": label_win[:split_idx].tolist()
-        }
+        # ==========================
+        # HELPER FUNCTION: CREATE DICT
+        # ==========================
+        def create_dataset(start, end):
+            if start >= end: # Handle edge cases
+                return {}
+            return {
+                "s_o": torch.tensor(price_win[start:end, :, 0:1], dtype=torch.float32),
+                "s_h": torch.tensor(price_win[start:end, :, 1:2], dtype=torch.float32),
+                "s_c": torch.tensor(price_win[start:end, :, 2:3], dtype=torch.float32),
+                "s_m": torch.tensor(macro_win[start:end], dtype=torch.float32),
+                "s_n": torch.tensor(news_win[start:end], dtype=torch.float32),
+                "label": torch.tensor(label_all[start:end], dtype=torch.long),
+            }
 
-        test_data = {
-            "s_o": torch.tensor(price_win[split_idx:, :, 0:1], dtype=torch.float32),
-            "s_h": torch.tensor(price_win[split_idx:, :, 1:2], dtype=torch.float32),
-            "s_c": torch.tensor(price_win[split_idx:, :, 2:3], dtype=torch.float32),
-            "s_m": torch.tensor(macro_win[split_idx:], dtype=torch.float32),
-            "label": label_win[split_idx:].tolist()
-        }
+        train_data = create_dataset(0, idx_train)
+        valid_data = create_dataset(idx_train, idx_valid)
+        test_data  = create_dataset(idx_valid, total_len)
 
-        return train_data, test_data
+        print(f"Stats: Train={len(train_data.get('label', []))}, Valid={len(valid_data.get('label', []))}, Test={len(test_data.get('label', []))}")
+        
+        return train_data, valid_data, test_data

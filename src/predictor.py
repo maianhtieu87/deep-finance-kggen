@@ -1,86 +1,62 @@
 import torch
 import torch.nn as nn
+from .modules.layers import ThreeLayerMLP
 
-
-# ======================================================
-# 1. Time Dimension Aggregation
-# ======================================================
-class TimeDimensionAggregation(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.mlp_fusion = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.GELU(),
-            nn.Linear(dim, dim)
-        )
-        self.mlp_indicator = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.GELU(),
-            nn.Linear(dim, dim)
-        )
-
-    def forward(self, h_im, v_i):
-        """
-        h_im : (B, T, T, D) or (B, T, D)
-        v_i  : (B, T, D)
-        """
-
-        # ===== h_im =====
-        if h_im.dim() == 4:
-            # (B, T, T, D) → lấy temporal summary
-            h_im = h_im.mean(dim=2)  # → (B, T, D)
-
-        # ===== MLP =====
-        h_im_out = self.mlp_fusion(h_im)    # (B, T, D)
-        h_i_out  = self.mlp_indicator(v_i) # (B, T, D)
-
-        return h_im_out, h_i_out
-
-
-# ======================================================
-# 2. Feature Dimension Aggregation (Classifier)
-# ======================================================
-class FeatureDimensionAggregation(nn.Module):
-    def __init__(self, dim, num_classes=3):
-        super().__init__()
-        self.classifier = nn.Sequential(
-            nn.Linear(dim * 2, dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(dim, num_classes)
-        )
-
-    def forward(self, x):
-        # x : (B, dim*2)
-        return self.classifier(x)   # (B, num_classes)
-
-
-# ======================================================
-# 3. Fine-grained Movement Prediction Head
-# ======================================================
 class FinegrainedMovementPrediction(nn.Module):
-    def __init__(self, dim, num_classes=3):
+    """
+    Decoder module for Fine-grained Movement Prediction (Proposal Section 3.5).
+    Replaces RNNs with MLPs for dimension aggregation.
+    """
+    def __init__(self, dim, window_size, num_classes=3, dropout=0.0): # [NEW] Nhận tham số dropout
         super().__init__()
-        self.time_agg = TimeDimensionAggregation(dim)
-        self.head = FeatureDimensionAggregation(dim, num_classes)
+        
+        # --- 1. Time Dimension Aggregation (Reduce T -> 1) ---
+        self.time_agg_fused = ThreeLayerMLP(
+            d_in=window_size, 
+            d_out=1, 
+            d_h1=window_size // 2, 
+            d_h2=window_size // 4, 
+            final_activation=True,
+            dropout=dropout # [NEW]
+        )
+        
+        self.time_agg_orig = ThreeLayerMLP(
+            d_in=window_size, 
+            d_out=1, 
+            d_h1=window_size // 2, 
+            d_h2=window_size // 4, 
+            final_activation=True,
+            dropout=dropout # [NEW]
+        )
+        
+        # --- 2. Feature Dimension Aggregation (Reduce 2D -> Classes) ---
+        self.feat_agg = ThreeLayerMLP(
+            d_in=2 * dim, 
+            d_out=num_classes, 
+            d_h1=dim, 
+            d_h2=dim // 2, 
+            final_activation=False, # No activation -> Raw Logits
+            dropout=dropout # [NEW]
+        )
 
-    def forward(self, h_im, v_i):
+    def forward(self, fused_seq, orig_seq):
         """
-        h_im : (B, T, T, D) or (B, T, D)
-        v_i  : (B, T, D)
+        Args:
+            fused_seq: Multimodal features after fusion (B, T, D)
+            orig_seq: Original Indicator/Price features (B, T, D)
         """
-
-        # ===== 1. Time aggregation =====
-        h_im_out, h_i_out = self.time_agg(h_im, v_i)
-        # (B, T, D)
-
-        # ===== 2. Last timestep =====
-        h_im_final = h_im_out[:, -1, :]   # (B, D)
-        h_i_final  = h_i_out[:, -1, :]    # (B, D)
-
-        # ===== 3. Feature fusion =====
-        combined = torch.cat([h_im_final, h_i_final], dim=-1)
-        # (B, 2D)
-
-        # ===== 4. Classification =====
-        return self.head(combined)  # (B, 3)
+        # Transpose to (B, D, T) so Linear layers operate on T dimension
+        fused_trans = fused_seq.transpose(1, 2)
+        orig_trans = orig_seq.transpose(1, 2)
+        
+        # --- Step 1: Time Aggregation ---
+        h_fused = self.time_agg_fused(fused_trans).squeeze(-1)
+        h_orig = self.time_agg_orig(orig_trans).squeeze(-1)
+        
+        # --- Step 2: Concatenation ---
+        h_final = torch.cat([h_fused, h_orig], dim=-1) # Shape: (B, 2D)
+        
+        # --- Step 3: Feature Aggregation (Prediction) ---
+        logits = self.feat_agg(h_final) # Shape: (B, 3)
+        
+        return logits

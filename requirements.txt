@@ -1,0 +1,21 @@
+# --- Core ML & Data ---
+torch
+numpy
+pandas
+scikit-learn
+
+# --- Data Fetching ---
+yfinance              # Yahoo Fetcher
+pandas-datareader     # FRED data (Macro)
+httpx                 # News Fetcher (High performance HTTP client)
+tenacity              # Retry logic cho API calls
+
+# --- Data Processing ---
+polars                # News Processing (High performance DataFrame)
+pyarrow               # Backend cho Polars/Pandas đọc file Parquet
+openpyxl              # Backend cho Pandas đọc file Excel (.xlsx)
+tqdm                  # Progress bars
+rich                  # Pretty printing (dùng trong news_fetcher log)
+
+# --- Embedding ---
+voyageai              # Voyage AI Client cho News Embedding
