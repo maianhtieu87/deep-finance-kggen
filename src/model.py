@@ -10,21 +10,25 @@ class FocalLoss(nn.Module):
     """
     Focal Loss: Giải quyết mất cân bằng bằng cách tập trung vào mẫu khó (Hard Examples).
     Công thức: FL(pt) = - (1 - pt)^gamma * log(pt)
+    alpha: Tensor trọng số [w_0, w_1, w_2]. Ví dụ: [1.5, 0.5, 1.5]
+    gamma: Độ tập trung vào mẫu khó.
     """
     def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
         super(FocalLoss, self).__init__()
         self.gamma = gamma
-        self.alpha = alpha # Alpha = None nghĩa là không dùng class weights
+        self.alpha = alpha # Alpha chính là class weights
         self.reduction = reduction
 
     def forward(self, inputs, targets):
-        # Tính CE Loss (không reduce để nhân với thừa số Focal)
+        # 1. Tính Cross Entropy Loss với Weight (Alpha)
+        # weight=self.alpha sẽ tự động nhân trọng số vào loss của từng lớp tương ứng
         ce_loss = F.cross_entropy(inputs, targets, reduction='none', weight=self.alpha)
         
-        # Tính pt (xác suất dự báo đúng)
+        # 2. Tính pt (xác suất model dự đoán đúng)
         pt = torch.exp(-ce_loss)
         
-        # Công thức Focal: giảm trọng số mẫu dễ (pt cao)
+        # 3. Công thức Focal: (1 - pt)^gamma * CE
+        # Lưu ý: ce_loss ở trên đã bao gồm alpha rồi, nên không cần nhân lại thủ công
         focal_loss = ((1 - pt) ** self.gamma) * ce_loss
 
         if self.reduction == 'mean':
@@ -85,8 +89,12 @@ class StockMovementModel(nn.Module):
         # ===== 4. Loss Function =====
         if use_focal_loss:
             # Chiến lược: Chỉ dùng Gamma=2.0 để tự cân bằng, bỏ qua Alpha (class_weights)
-            self.loss_fn = FocalLoss(alpha=None, gamma=2.0)
-            print("🔧 Using Loss Strategy: FOCAL LOSS (Gamma=2.0, No Class Weights)")
+            self.loss_fn = FocalLoss(alpha=class_weights, gamma=2.0)
+            # Sửa lại câu in log để verify
+            if class_weights is not None:
+                print("🔧 Using Loss Strategy: FOCAL LOSS (Gamma=2.0) + ALPHA BALANCING ✅")
+            else:
+                print("🔧 Using Loss Strategy: FOCAL LOSS (Gamma=2.0) - No Alpha ⚠️")
         else:
             self.loss_fn = nn.CrossEntropyLoss(weight=class_weights)
     def forward(self, s_o, s_h, s_c, s_m, s_n, label=None, mode="train"):

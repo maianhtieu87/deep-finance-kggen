@@ -41,21 +41,51 @@ class StableGatedCrossAttention(nn.Module):
         # unstable_fused shape: (B, T, D)
         unstable_fused, _ = self.mha(query=primary, key=aux, value=aux)
         
-        # --- Step 2: Calculate H_a (Eq. 13) ---
-        # Ha = H^l_{i,d} * Wa + b
+        
+        # # --- Step 2: Calculate H_a (Eq. 13) ---
+        # # Ha = H^l_{i,d} * Wa + b
+        # H_a = self.transform_linear(unstable_fused)
+        
+        # # --- Step 3: Calculate H_b (Eq. 14) ---
+        # # Hb = Sigmoid(Hi * Wb + b')
+        # H_b = self.sigmoid(self.gate_linear(primary))
+        
+        # # --- Step 4: Stable Feature Selection (Eq. 12) ---
+        # # Output = Gate * New_Info + (1 - Gate) * Old_Info
+        # # Ý nghĩa: Gate quyết định bao nhiêu % thông tin mới được nạp vào, 
+        # # và bao nhiêu % thông tin cũ được giữ lại.
+        # H_id = H_a * H_b 
+        
+        # # --- Step 5: Residual Connection & Norm ---
+        # # Note: The paper implies Hi,d is the stable feature. 
+        # # Usually, Transformer blocks add Residual connection with the Query (Primary).
+        # output = self.norm(primary + self.dropout(H_id))
+        
+        # 2. GATING MECHANISM (SỬA LẠI ĐÚNG CHUẨN HIGHWAY)
+        # ---------------------------------------------------------
+        
+        # A. Tính Gate (H_b): Quyết định dựa trên Primary (Giá)
+        # Gate chạy từ 0 đến 1. 
+        # Gate -> 1: Tin vào News/Macro (Aux)
+        # Gate -> 0: Tin vào Price (Primary)
+        gate = self.sigmoid(self.gate_linear(primary)) 
+
+        # B. Transform New Info (H_a)
         H_a = self.transform_linear(unstable_fused)
         
-        # --- Step 3: Calculate H_b (Eq. 14) ---
-        # Hb = Sigmoid(Hi * Wb + b')
-        H_b = self.sigmoid(self.gate_linear(primary))
+        # C. Áp dụng Gating (Highway Connection)
+        # Đây là dòng quan trọng nhất sửa lỗi "Leaky Residual"
         
-        # --- Step 4: Stable Feature Selection (Eq. 12) ---
-        # Hi,d = Ha ⊙ Hb
-        H_id = H_a * H_b 
+        # Nhánh 1: Thông tin Mới (News) được Gate cho phép đi qua
+        gated_new = H_a * gate
         
-        # --- Step 5: Residual Connection & Norm ---
-        # Note: The paper implies Hi,d is the stable feature. 
-        # Usually, Transformer blocks add Residual connection with the Query (Primary).
-        output = self.norm(primary + self.dropout(H_id))
+        # Nhánh 2: Thông tin Cũ (Price) bị Gate chặn lại (Complementary Gate)
+        # Nếu Gate=1 (News tốt), thì (1-Gate)=0 -> Price nhiễu bị loại bỏ hoàn toàn.
+        gated_primary = primary * (1.0 - gate)
+        
+        # 3. KẾT HỢP & NORM
+        # ---------------------------------------------------------
+        # Áp dụng Dropout lên phần New Info (nơi chứa nhiều tham số học được)
+        output = self.norm(gated_primary + self.dropout(gated_new))
         
         return output

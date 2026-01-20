@@ -33,6 +33,25 @@ def merge_datasets(list_of_dicts, shuffle=False):
             merged_data[key] = merged_data[key][indices]
     return merged_data
 
+def compute_class_weights(labels_tensor):
+    """
+    Tính weights theo phương pháp Inverse Class Frequency (Sklearn style).
+    Weight_class_i = Total_Samples / (Num_Classes * Count_class_i)
+    """
+    # Chuyển về CPU numpy để tính toán
+    labels = labels_tensor.cpu().numpy()
+    class_counts = np.bincount(labels)
+    total_samples = len(labels)
+    num_classes = len(class_counts)
+    
+    # Tránh chia cho 0 nếu lỡ có class nào rỗng (dù khó xảy ra với Z-score)
+    class_counts = np.maximum(class_counts, 1) 
+    
+    weights = total_samples / (num_classes * class_counts)
+    
+    # Chuyển về Tensor
+    return torch.tensor(weights, dtype=torch.float32)
+
 # --- 3. EVALUATE ---
 def evaluate(model, data_dict):
     if not data_dict: return 0.0, 0.0
@@ -54,8 +73,16 @@ def train_model(train_data, valid_data, test_data):
 
     s_m_dim = train_data["s_m"].shape[-1]
     
+    print("\n  Calculating Class Weights (Balancing Strategy)...")
+    train_labels = train_data["label"]
+    class_weights = compute_class_weights(train_labels).to(device)
+    
+    print(f"   ► Class Counts: {np.bincount(train_labels.cpu().numpy())}")
+    print(f"   ► Computed Alpha: {class_weights.cpu().numpy()}")
+    # Ví dụ output: [1.2, 0.6, 1.2] -> Lớp Flat (giữa) weight thấp, 2 bên weight cao
+    
     print(f"\n🚀 Initializing Model on {device}...")
-    print(f"   ► Strategy: Focal Loss (Gamma=2.0) | Class Weights: NONE")
+    print(f"   ► Strategy: FOCAL LOSS (Gamma=2.0) + ALPHA BALANCING")
     
     # KHỞI TẠO MODEL VỚI FOCAL LOSS & KHÔNG WEIGHTS
     model = StockMovementModel(
@@ -66,9 +93,9 @@ def train_model(train_data, valid_data, test_data):
         input_dim=TrainConfig.window_size,   
         output_dim=TrainConfig.output_dim,   
         num_head=TrainConfig.num_head,
-        dropout=0.2,                         # Dropout vừa phải
-        class_weights=None,                  # [IMPORTANT] Không dùng Weights thủ công
-        use_focal_loss=True,                 # [IMPORTANT] Bật Focal Loss
+        dropout=0.1,                         # Dropout vừa phải
+        class_weights=class_weights,                  # [IMPORTANT] Không dùng Weights thủ công
+        use_focal_loss=True,                   # [IMPORTANT] Bật Focal Loss
         device=device
     ).to(device)
 
@@ -107,10 +134,17 @@ def train_model(train_data, valid_data, test_data):
             print(f"Epoch {epoch+1:03d} | Loss {loss.item():.4f} | Val ACC {val_acc:.4f} | Val MCC {val_mcc:.4f}")
 
         # Ưu tiên lưu model có MCC cao nhất (tránh lưu model đoán bừa Mode Collapse)
+        is_best = False
         if val_mcc > best_val_mcc:
+            is_best = True
+        elif val_mcc == best_val_mcc and val_acc > best_val_acc:
+            is_best = True
+            
+        if is_best:
             best_val_mcc = val_mcc
+            best_val_acc = val_acc # Cập nhật best ACC
             torch.save(model.state_dict(), save_path)
-            print(f"   >>> New Best Model (MCC: {val_mcc:.4f} - Acc: {val_acc:.4f})")
+            print(f"   >>> New Best Model Saved! (MCC: {val_mcc:.4f} - Acc: {val_acc:.4f})")
 
     # =========================================================
     # [UPDATED] FINAL TEST & SANITY CHECK BLOCK
@@ -127,11 +161,6 @@ def train_model(train_data, valid_data, test_data):
         val_acc_check, val_mcc_check = evaluate(model, valid_data) 
         print(f"   VALID RESULT -> ACC: {val_acc_check:.4f}, MCC: {val_mcc_check:.4f}")
         
-        if val_mcc_check > 0.1:
-            print("   ✅ Hàm evaluate hoạt động TỐT (Vì tái tạo được kết quả Valid cao).")
-            print("   👉 Vấn đề chắc chắn nằm ở Dữ liệu Test.")
-        else:
-            print("   ❌ Có lỗi gì đó khi load model hoặc hàm evaluate.")
 
         # --- BƯỚC 2: CHẠY TRÊN TEST ---
         print("\n🔍 Run on TEST SET:")

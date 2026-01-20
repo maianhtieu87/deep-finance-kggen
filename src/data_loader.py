@@ -171,19 +171,63 @@ class data_prepare:
         # Tập Valid: idx_train -> idx_valid
         # Tập Test : idx_valid -> Hết
 
-        # ==========================
-        # THRESHOLD (FIT ON TRAIN ONLY - CHỐNG LEAKAGE)
-        # ==========================
-        # Chỉ dùng dữ liệu Train để tính ngưỡng phân loại
-        train_returns_only = label_raw[:idx_train].flatten()
-        threshold = np.percentile(np.abs(train_returns_only), flat_ratio)
+        # ==============================================================================
+        # [UPDATED] LABELING STRATEGY: ROLLING Z-SCORE (ADAPTIVE THRESHOLD)
+        # ==============================================================================
+        # Thay vì dùng ngưỡng cố định từ quá khứ, ta dùng ngưỡng động dựa trên độ biến động
+        # của 20 ngày gần nhất. Giải quyết triệt để vấn đề "Mode Collapse" khi thị trường Sideway.
+        # Công thức: Z_t = (R_t - Mean_20) / Std_20
+        # ==============================================================================
+        
+        # 1. Chuyển đổi return_np thành Pandas Series để dùng hàm rolling
+        # return_np shape (T, 1) -> flatten thành (T,)
+        full_returns_series = pd.Series(return_np.flatten())
+        
+        # 2. Tính Rolling Stats (Cửa sổ 20 ngày - tương đương 1 tháng giao dịch)
+        # shift(1) để đảm bảo không nhìn thấy tương lai (dùng volatility của quá khứ để xét hiện tại)
+        # Tuy nhiên, ở đây ta đang xét nhãn cho chính ngày đó, nên ta chuẩn hóa độ lớn của Return
+        # dựa trên độ biến động của cửa sổ bao quanh nó (hoặc liền trước nó).
+        # Cách chuẩn nhất: Z-score của chính return đó so với độ lệch chuẩn của 20 ngày gần nhất.
+        rolling_window = 20
+        
+        # Mean và Std của 20 ngày gần nhất
+        roll_mean = full_returns_series.rolling(window=rolling_window).mean()
+        roll_std  = full_returns_series.rolling(window=rolling_window).std()
+        
+        # 3. Tính Z-Score
+        # Thêm 1e-6 để tránh chia cho 0
+        z_scores = (full_returns_series - roll_mean) / (roll_std + 1e-6)
+        
+        # 4. Define Threshold (0.5 Sigma)
+        z_threshold = 0.5 
+        
+        def map_z_label(z):
+            if np.isnan(z): return 1 # Handle NaN ở đầu chuỗi -> FLAT
+            if z < -z_threshold: return 0  # DOWN (Biến động tiêu cực lớn hơn 0.5 std)
+            elif z > z_threshold: return 2 # UP   (Biến động tích cực lớn hơn 0.5 std)
+            else: return 1                 # FLAT (Biến động nhỏ trong vùng 0.5 std)
 
-        def map_label(r):
-            if r < -threshold: return 0 # DOWN
-            elif r > threshold: return 2 # UP
-            else: return 1 # FLAT
+        # 5. Áp dụng Mapping
+        # Lưu ý: z_scores có độ dài bằng return_np (T)
+        # label_raw được cắt từ index: window_size - 1 + future_days
+        # Nên ta cũng cắt z_scores y hệt như vậy để khớp index
+        start_idx = window_size - 1 + future_days
+        
+        # Đảm bảo start_idx không vượt quá độ dài
+        if start_idx < len(z_scores):
+            z_scores_sliced = z_scores.values[start_idx:]
+            label_all = np.array([map_z_label(z) for z in z_scores_sliced])
+        else:
+            # Fallback nếu dữ liệu quá ngắn
+            label_all = np.array([])
 
-        label_all = np.array([map_label(r[0]) for r in label_raw])
+        # [DEBUG] In ra phân phối nhãn để kiểm tra độ cân bằng
+        unique, counts = np.unique(label_all, return_counts=True)
+        dist = dict(zip(unique, counts))
+        total_lbl = sum(counts)
+        print(f"   ⚖️  Label Distribution (Rolling Z): {dist}")
+        if total_lbl > 0:
+            print(f"      Down: {dist.get(0,0)/total_lbl:.2%}, Flat: {dist.get(1,0)/total_lbl:.2%}, Up: {dist.get(2,0)/total_lbl:.2%}")
 
         # ==========================
         # NORMALIZATION (FIT ON TRAIN ONLY - CHỐNG LEAKAGE)
