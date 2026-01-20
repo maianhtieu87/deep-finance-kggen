@@ -184,7 +184,7 @@ if __name__ == "__main__":
     pkl_path = r"D:\DeepFinance\data\processed\unified_dataset_test.pkl" 
     dp = data_prepare(pkl_path)
     
-    target_tickers = ["TSLA", "AMZN", "MSFT", "NFLX", "AAPL", "GOOGL", "NVDA", "META"] 
+    target_tickers = ["TSLA", "AMZN", "MSFT", "NFLX"] 
     
     list_train, list_valid, list_test = [], [], []
     for ticker in target_tickers:
