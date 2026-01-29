@@ -13,7 +13,7 @@ from configs.config import TrainConfig, GlobalConfig
 # --- CONFIG ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_PATH = os.path.join("output", "best_model.pt")
-DATA_PATH = r"D:\DeepFinance\data\processed\unified_dataset_test.pkl" # Đảm bảo đường dẫn đúng
+DATA_PATH = r"D:\ProjectNCKH\deep_finance\data\processed\unified_dataset_test.pkl" # Đảm bảo đường dẫn đúng
 
 def print_header(title):
     print(f"\n{'='*60}")

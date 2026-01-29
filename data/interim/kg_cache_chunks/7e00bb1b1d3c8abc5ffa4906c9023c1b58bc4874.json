@@ -1,0 +1,1 @@
+{"entities": ["W", "call option", "August 16, 2024", "SBUX", "put option", "May 3, 2024"], "triples": [["W", "has", "call option"], ["call option", "expires on", "August 16, 2024"], ["SBUX", "has", "put option"], ["put option", "expires on", "May 3, 2024"]]}

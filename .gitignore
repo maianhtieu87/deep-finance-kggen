@@ -5,9 +5,15 @@ __pycache__/
 
 # Virtual environment
 venv/
+.venv/
 .env/
 
 
 # IDE
 .vscode/
 .idea/
+
+data/
+*.pt
+*.parquet
+*.log

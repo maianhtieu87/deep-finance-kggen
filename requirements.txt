@@ -1,21 +1,47 @@
-# --- Core ML & Data ---
+# ===============================
+# Core ML & Data
+# ===============================
 torch
 numpy
 pandas
 scikit-learn
 
-# --- Data Fetching ---
-yfinance              # Yahoo Fetcher
-pandas-datareader     # FRED data (Macro)
-httpx                 # News Fetcher (High performance HTTP client)
-tenacity              # Retry logic cho API calls
+# ===============================
+# Data Fetching
+# ===============================
+yfinance
+pandas-datareader
+httpx
+tenacity
 
-# --- Data Processing ---
-polars                # News Processing (High performance DataFrame)
-pyarrow               # Backend cho Polars/Pandas đọc file Parquet
-openpyxl              # Backend cho Pandas đọc file Excel (.xlsx)
-tqdm                  # Progress bars
-rich                  # Pretty printing (dùng trong news_fetcher log)
+# ===============================
+# Data Processing
+# ===============================
+polars
+pyarrow
+openpyxl
+tqdm
+rich
 
-# --- Embedding ---
-voyageai              # Voyage AI Client cho News Embedding
+# ===============================
+# Knowledge Graph / LLM
+# ===============================
+dspy-ai
+litellm
+
+# ===============================
+# Semantic Embedding & Similarity
+# ===============================
+sentence-transformers
+
+# ===============================
+# Utils / Env
+# ===============================
+python-dotenv
+orjson
+
+# ===============================
+# Notebook / Debug
+# ===============================
+jupyter
+ipykernel

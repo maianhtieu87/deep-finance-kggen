@@ -24,7 +24,7 @@ class GlobalConfig:
     # --- API Keys (Load from env or set here) ---
     ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "YOUR_API_KEY")
     ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "YOUR_SECRET_KEY")
-    VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY", "pa-CcuVotIUxYiHLOYmsJBAMESqQQnro316zjhoWs8LGrW")
+    VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY", "---")
     
     # --- Data Settings ---
     START_DATE = '2024-05-01'
@@ -71,7 +71,7 @@ class TrainConfig:
 
     # data
     train_ratio = 0.70  # 70% để học
-    valid_ratio = 0.10  # 15% để tinh chỉnh (chọn best model)
+    valid_ratio = 0.15  # 15% để tinh chỉnh (chọn best model)
     train_batch_size = 64
 
     # Window Size (T): Số ngày quá khứ dùng để dự báo.

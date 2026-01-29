@@ -1,0 +1,1 @@
+{"entities": ["President Joe Biden", "TikTok", "ByteDance", "Shou Zi Chew", "European Commission president", "Apple", "iPhone"], "triples": [["President Joe Biden", "signed legislation related to", "ByteDance"], ["ByteDance", "is parent company of", "TikTok"], ["Shou Zi Chew", "is CEO of", "TikTok"], ["European Commission president", "suggested ban on", "TikTok"]]}
