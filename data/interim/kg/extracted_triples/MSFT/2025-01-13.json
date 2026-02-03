@@ -1,1 +1,1 @@
-{"date": "2025-01-13", "ticker": "MSFT", "triples": [["market", "affects", "price"]]}
+{"date": "2025-01-13", "ticker": "MSFT", "triples": [["PLTR", "experienced", "bullish put option sweep expiring today with a total trade price of 50.2K"], ["MCHP", "experienced", "bearish call option sweep expiring on February 21, 2025 with a total trade price of 62.9K"], ["AAPL", "experienced", "bearish call option sweep expiring on January 24, 2025 with a total trade price of 90.0K"]]}

@@ -1,1 +1,1 @@
-{"date": "2024-10-01", "ticker": "NFLX", "triples": [["market", "affects", "price"]]}
+{"date": "2024-10-01", "ticker": "NFLX", "triples": [["RDDT", "experienced bearish put option sweep", "40.2K total trade price at 66.00 strike, expiring October 18, 2024"], ["BILI", "experienced bullish call option sweep", "42.0K total trade price at 24.00 strike, expiring January 17, 2025"], ["DJT", "experienced bearish call option sweep", "38.6K total trade price at 15.50 strike, expiring October 18, 2024"]]}

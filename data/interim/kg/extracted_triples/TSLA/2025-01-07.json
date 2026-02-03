@@ -1,1 +1,1 @@
-{"date": "2025-01-07", "ticker": "TSLA", "triples": [["market", "affects", "price"]]}
+{"date": "2025-01-07", "ticker": "TSLA", "triples": [["ABNB", "observed", "call option sweep with bearish sentiment"], ["GM", "observed", "put option sweep with bearish sentiment"], ["PDD", "observe", "call option sweep with bullish sentiment"]]}

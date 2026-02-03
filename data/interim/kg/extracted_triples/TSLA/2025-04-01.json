@@ -1,1 +1,1 @@
-{"date": "2025-04-01", "ticker": "TSLA", "triples": [["market", "affects", "price"]]}
+{"date": "2025-04-01", "ticker": "TSLA", "triples": [["DKNG", "observed", "bearish call option sweep expiring on 04/11/25 with total trade price of 34.7K"], ["BABA", "observed", "bullish call option sweep expiring on 06/20/25 with total trade price of 39.7K"], ["AMZN", "observed", "bearish call option sweep expiring on 04/17/25 with total trade price of 150.3K"]]}

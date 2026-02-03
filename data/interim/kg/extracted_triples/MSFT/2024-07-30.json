@@ -1,1 +1,1 @@
-{"date": "2024-07-30", "ticker": "MSFT", "triples": [["market", "affects", "price"]]}
+{"date": "2024-07-30", "ticker": "MSFT", "triples": [["TSM", "saw bullish call option trade", "expiring August 2, 2024 with strike price $165.00 for $35.0K"], ["INTC", "saw bullish call option trade", "expiring August 2, 2024 with strike price $32.00 for $36.0K"], ["ARM", "saw bearish put option sweep", "expiring March 21, 2025 with strike price $100.00 for $76.7K"]]}

@@ -1,1 +1,1 @@
-{"date": "2024-10-02", "ticker": "AMZN", "triples": [["market", "affects", "price"]]}
+{"date": "2024-10-02", "ticker": "AMZN", "triples": [["Amazon", "launched", "Cedric, a new AI chatbot for internal use"], ["Amazon", "developed Cedric using", "Bedrock AI platform and Anthropic s Claude large language model"], ["Amazon", "banned", "external AI tools for business purposes"]]}

@@ -1,1 +1,1 @@
-{"date": "2025-03-28", "ticker": "AMZN", "triples": [["market", "affects", "price"]]}
+{"date": "2025-03-28", "ticker": "AMZN", "triples": [["TJX", "experienced bullish call option sweep", "expiring April 17, 2025 with strike price 125.00 and volume 9.3K"], ["TSLA", "experienced bullish call option sweep", "expiring March 28, 2025 with strike price 280.00 and volume 160.3K"], ["GME", "experienced bearish put option sweep", "expiring March 28, 2025 with strike price 24.00 and volume 20.7K"]]}

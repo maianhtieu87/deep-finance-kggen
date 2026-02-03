@@ -1,1 +1,1 @@
-{"date": "2025-03-21", "ticker": "AMZN", "triples": [["market", "affects", "price"]]}
+{"date": "2025-03-21", "ticker": "AMZN", "triples": [["DASH", "observed", "call option sweep with bearish sentiment"], ["TSLA", "observed", "put option sweep with bullish sentiment"], ["CVNA", "observed", "put option trade with bearish sentiment"]]}

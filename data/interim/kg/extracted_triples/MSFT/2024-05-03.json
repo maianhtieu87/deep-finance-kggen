@@ -1,1 +1,1 @@
-{"date": "2024-05-03", "ticker": "MSFT", "triples": [["market", "affects", "price"]]}
+{"date": "2024-05-03", "ticker": "MSFT", "triples": [["SMCI", "experienced", "bullish call option sweep expiring on May 3, 2024 with 5.3K contracts traded"], ["AAPL", "experienced", "bearish call option sweep expiring on August 16, 2024 with 4.5K contracts traded"], ["CRWD", "experienced", "bearish put option sweep expiring on May 3, 2024 with 539 contracts traded"]]}

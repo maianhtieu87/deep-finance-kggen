@@ -1,1 +1,1 @@
-{"date": "2024-06-13", "ticker": "NFLX", "triples": [["market", "affects", "price"]]}
+{"date": "2024-06-13", "ticker": "NFLX", "triples": [["ROKU", "observed", "put option sweep with bullish sentiment expiring on June 14, 2024"], ["GOOG", "observed", "put option trade with bullish sentiment expiring on June 21, 2024"], ["META", "observed", "call option trade with bullish sentiment expiring on June 21, 2024"]]}

@@ -1,1 +1,1 @@
-{"date": "2024-10-10", "ticker": "MSFT", "triples": [["market", "affects", "price"]]}
+{"date": "2024-10-10", "ticker": "MSFT", "triples": [["AVGO", "experienced", "bearish call option sweep expiring on October 11, 2024 with a strike price of 182.50 and a total trade price of 117.6K"], ["MSFT", "experienced", "bearish call option trade expiring on October 11, 2024 with a strike price of 420.00 and a total trade price of 25.2K"], ["TWLO", "experienced", "bullish put option sweep expiring on November 1, 2024 with a strike price of 63.00 and a total trade price of 39.2K"]]}

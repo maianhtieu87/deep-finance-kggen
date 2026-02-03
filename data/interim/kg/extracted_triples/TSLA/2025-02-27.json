@@ -1,1 +1,1 @@
-{"date": "2025-02-27", "ticker": "TSLA", "triples": [["market", "affects", "price"]]}
+{"date": "2025-02-27", "ticker": "TSLA", "triples": [["RIVN", "experienced", "bearish call option sweep expiring in 296 days with total trade price of 108.7K"], ["NIO", "experienced", "bullish put option sweep expiring in 324 days with total trade price of 147.1K"], ["TSLA", "experienced", "bearish put option sweep expiring in 2 days with total trade price of 38.2K"]]}

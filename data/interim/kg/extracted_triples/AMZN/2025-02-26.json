@@ -1,1 +1,1 @@
-{"date": "2025-02-26", "ticker": "AMZN", "triples": [["market", "affects", "price"]]}
+{"date": "2025-02-26", "ticker": "AMZN", "triples": [["DKNG", "observed", "bearish put option sweep expiring in 325 days at a 28.00 strike with a total trade price of 105.9K"], ["BROS", "noticed", "bearish put option sweep expiring in 24 days at a 75.00 strike with a total trade price of 260.0K"], ["PVH", "observed", "bearish put option sweep expiring in 24 days at a 75.00 strike with a total trade price of 75.8K"]]}

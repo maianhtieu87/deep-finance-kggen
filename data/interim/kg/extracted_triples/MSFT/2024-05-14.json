@@ -1,1 +1,1 @@
-{"date": "2024-05-14", "ticker": "MSFT", "triples": [["market", "affects", "price"]]}
+{"date": "2024-05-14", "ticker": "MSFT", "triples": [["AMD", "observed", "bullish put option sweep expiring May 17, 2024 with strike price $152.50 and total trade price $52.5K"], ["MSFT", "observed", "bearish call option trade expiring May 17, 2024 with strike price $405.00 and total trade price $31.2K"], ["AAPL", "observed", "bullish call option trade expiring July 19, 2024 with strike price $190.00 and total trade price $25.7K"]]}

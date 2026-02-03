@@ -1,1 +1,1 @@
-{"date": "2024-12-03", "ticker": "Tesla", "triples": [["market", "affects", "price"]]}
+{"date": "2024-12-03", "ticker": "Tesla", "triples": [["Tesla", "settled", "lawsuit with JPMorgan Chase"], ["JPMorgan Chase", "sued", "Tesla for $162.2 million in 2021"], ["Tesla", "countersued", "JPMorgan in January 2023"]]}

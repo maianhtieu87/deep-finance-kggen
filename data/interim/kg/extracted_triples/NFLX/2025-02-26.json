@@ -1,1 +1,1 @@
-{"date": "2025-02-26", "ticker": "NFLX", "triples": [["market", "affects", "price"]]}
+{"date": "2025-02-26", "ticker": "NFLX", "triples": [["RBLX", "experienced", "bullish call option sweep expiring September 19, 2025 with total trade price of 126.7K"], ["TTD", "experienced", "bullish call option sweep expiring January 16, 2026 with total trade price of 62.5K"], ["DIS", "experienced", "bearish call option trade expiring March 21, 2025 with total trade price of 101.0K"]]}

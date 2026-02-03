@@ -1,1 +1,1 @@
-{"date": "2024-05-20", "ticker": "AMZN", "triples": [["market", "affects", "price"]]}
+{"date": "2024-05-20", "ticker": "AMZN", "triples": [["TSLA", "saw", "bearish put option sweep expiring today with total cost of $37.5K"], ["SABR", "saw", "bullish put option trade expiring in 945 days with total cost of $537.1K"], ["W", "saw", "bearish put option trade expiring in 609 days with total cost of $1.1 million"]]}

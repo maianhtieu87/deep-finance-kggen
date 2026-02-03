@@ -4,16 +4,19 @@ import os
 import json
 import re
 import ast
-from typing import List, Tuple, Dict, Any
+import time
+from typing import List, Tuple, Dict, Any, Optional
+import hashlib
+from pathlib import Path
 
 import dspy
 import pandas as pd
 import torch
+
 from sentence_transformers import SentenceTransformer, util
 from sklearn.cluster import KMeans
 
-from data_pipeline.kg.prompts import ENTITY_PROMPT, RELATION_PROMPT
-
+from data_pipeline.kg.prompts import PRICE_IMPACT_PROMPT
 
 # ==============================
 # News Processor (baseline API)
@@ -31,17 +34,6 @@ class NewsProcessor:
         pass
 
     def align_to_trading_days(self, news_input, trading_days):
-        """
-        Accepts:
-          - path string (.parquet/.csv)
-          - pandas DataFrame already loaded
-
-        Returns DataFrame with:
-          - date (python date)
-          - equity
-          - content (if available)
-          - title (if available)
-        """
         # 1) Load df
         if isinstance(news_input, pd.DataFrame):
             df = news_input.copy()
@@ -132,31 +124,29 @@ def _safe_parse_py_list(x):
         return []
 
 
-def _normalize_entity(e: str) -> str:
-    return re.sub(r"\s+", " ", (e or "").strip())
-
-
 # ==============================
-# KGGen DSPy Extractor (Entity -> Triple)
+# Price-Impact DSPy Extractor (Single Call)
 # ==============================
 
-class EntitySig(dspy.Signature):
-    text = dspy.InputField(desc=ENTITY_PROMPT)
-    entities = dspy.OutputField(desc="Python list of strings")
-
-
-class TripleSig(dspy.Signature):
-    text = dspy.InputField(desc=RELATION_PROMPT)
-    entities = dspy.InputField(desc="Python list of strings extracted from the same text")
-    triples = dspy.OutputField(desc="Python list of (subject, predicate, object) tuples")
+class PriceImpactSig(dspy.Signature):
+    """
+    Single-call signature:
+      Input: full news text
+      Output: list of (subject, predicate, object) tuples,
+              ordered from most to least impactful on stock price.
+    """
+    text = dspy.InputField(desc=PRICE_IMPACT_PROMPT)
+    triples = dspy.OutputField(
+        desc="Python list of (subject, predicate, object) tuples, ordered by price impact."
+    )
 
 
 class KGGenDSPyExtractor:
     """
-    KGGen 2-stage extraction:
-      1) entities from text
-      2) triples constrained to extracted entities
+    One LLM call per article:
+      - Uses PRICE_IMPACT_PROMPT to extract up to K triples (default K=5).
     """
+
     def __init__(self, model: str = None, api_key: str = None, temperature: float = 0.0):
         if model is None:
             model = os.getenv("KG_LLM_MODEL", "gemini/gemini-2.0-flash")
@@ -169,51 +159,45 @@ class KGGenDSPyExtractor:
         lm = dspy.LM(model=model, api_key=api_key, temperature=temperature)
         dspy.settings.configure(lm=lm)
 
-        self.ent_prog = dspy.ChainOfThought(EntitySig)
-        self.tri_prog = dspy.ChainOfThought(TripleSig)
+        self.prog = dspy.ChainOfThought(PriceImpactSig)
 
-    def extract(self, text: str):
-        # 1) entities
-        ent_raw = self.ent_prog(text=text).entities
-        entities = [_normalize_entity(e) for e in _safe_parse_py_list(ent_raw)]
-        entities = [e for e in entities if e]
-        entities = list(dict.fromkeys(entities))
+    def extract_triples(self, text: str, limit_k: int = 5) -> List[Triple]:
+        if not text or not str(text).strip():
+            return []
 
-        # 2) triples constrained to entities
-        tri_raw = self.tri_prog(text=text, entities=entities).triples
-        triples_raw = _safe_parse_py_list(tri_raw)
+        out = self.prog(text=text).triples
+        triples_raw = _safe_parse_py_list(out)
 
-        ent_set = set(entities)
         triples: List[Triple] = []
         for t in triples_raw:
             if isinstance(t, (list, tuple)) and len(t) == 3:
-                s, p, o = str(t[0]).strip(), str(t[1]).strip(), str(t[2]).strip()
-                if s in ent_set and o in ent_set and p:
+                s = str(t[0]).strip()
+                p = str(t[1]).strip()
+                o = str(t[2]).strip()
+                if s and p and o:
                     triples.append((s, p, o))
 
-        triples = list(dict.fromkeys(triples))
-        return entities, triples
+        # remove duplicates, preserve order
+        seen = set()
+        deduped: List[Triple] = []
+        for t in triples:
+            if t not in seen:
+                seen.add(t)
+                deduped.append(t)
 
+        return deduped[:limit_k]
 
 # ==============================
-# KGGen OFFLINE Embedder (Phase B′)
+# KGGen OFFLINE Embedder (NEW LOGIC)
 # ==============================
 
 class KGGenNewsEmbedder:
     """
-    KGGen offline builder (Phase B′):
-      Input: aligned_news DataFrame với các cột:
-        - date, equity
-        - content (ưu tiên) hoặc title (fallback)
-
-      Output dirs:
-        data/interim/kg/
-          - extracted_triples/{ticker}/{date}.json
-          - window_graph_raw/{ticker}/{date}.json
-          - window_graph_stable/{ticker}/{date}.json
-          - tensors/{ticker}/{date}.pt
-        data/interim/kg_embeddings/
-          - embedded_kg.json (index cho builder)
+    NEW LOGIC (theo yêu cầu):
+    - Per-article: mỗi bài news -> top_triples_per_article triples -> LƯU FILE
+    - Per-day: gom tất cả bài trong ngày => N * top_triples_per_article triples (KHÔNG top-k/day)
+    - Không gọi LLM nếu per-article file đã tồn tại
+    - Graph rebuild (raw/stable/tensors/index) tách riêng, NO LLM
     """
 
     def __init__(
@@ -221,213 +205,197 @@ class KGGenNewsEmbedder:
         interim_root: str = None,
         window_days: int = 20,
         kmeans_k: int = 128,
-        chunk_max_chars: int = 1200,
-        chunk_min_chars: int = 200,
-        max_triples_per_day: int = 250,
+        top_triples_per_article: int = 5,
         debug_print_samples: bool = False,
+        # resolution
+        use_voyage_resolution: bool = True,
+        voyage_model: str = "voyage-3-large",
         enable_cache: bool = True,
-        cache_dirname: str = "kg_cache_chunks",
+        cache_dirname: str = "kg_article_cache",
+        **kwargs,
     ):
         if interim_root is None:
             interim_root = os.path.join("data", "interim")
 
         self.window_days = window_days
         self.kmeans_k = kmeans_k
-        self.chunk_max_chars = chunk_max_chars
-        self.chunk_min_chars = chunk_min_chars
-        self.max_triples_per_day = max_triples_per_day
+        self.top_triples_per_article = top_triples_per_article
         self.debug_print_samples = debug_print_samples
 
-        # SBERT cho node feature + similarity
+        self.use_voyage_resolution = use_voyage_resolution
+        self.voyage_model = voyage_model
+
+        # SBERT node features (giữ nguyên)
         self.sbert = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
-        # KGGen LLM extractor
+        # LLM extractor (chỉ dùng khi thiếu)
         self.kg_extractor = KGGenDSPyExtractor()
 
         # output dirs
         self.base_dir = os.path.join(interim_root, "kg")
-        self.dir_triples = os.path.join(self.base_dir, "extracted_triples")
+        self.dir_triples = os.path.join(self.base_dir, "extracted_triples")            # per-day (merged)
+        self.dir_articles = os.path.join(self.base_dir, "extracted_articles")          # ✅ NEW per-article
         self.dir_raw = os.path.join(self.base_dir, "window_graph_raw")
         self.dir_stable = os.path.join(self.base_dir, "window_graph_stable")
         self.dir_tensors = os.path.join(self.base_dir, "tensors")
-        for d in [self.dir_triples, self.dir_raw, self.dir_stable, self.dir_tensors]:
+        for d in [self.dir_triples, self.dir_articles, self.dir_raw, self.dir_stable, self.dir_tensors]:
             os.makedirs(d, exist_ok=True)
 
         self.emb_dir = os.path.join(interim_root, "kg_embeddings")
         os.makedirs(self.emb_dir, exist_ok=True)
 
-        # cache
+        # legacy cache (optional)
         self.enable_cache = enable_cache
         self.cache_dir = os.path.join(interim_root, cache_dirname)
         if self.enable_cache:
             os.makedirs(self.cache_dir, exist_ok=True)
 
     # ------------------------------
-    # Chunking
+    # ID helpers (per article)
     # ------------------------------
-    @staticmethod
-    def _normalize_space(s: str) -> str:
-        return re.sub(r"\s+", " ", s or "").strip()
-
-    def split_into_chunks(self, text: str) -> List[str]:
+    def _article_id(self, row: pd.Series) -> str:
         """
-        Chunk long content:
-          - split by paragraph
-          - sentence split if paragraph too long
-          - final hard split if still too long
+        Tạo ID ổn định cho 1 news row:
+        ưu tiên url; nếu không có thì hash(content)
         """
-        text = (text or "").strip()
-        if not text:
-            return []
+        url = str(row.get("url", "") or "").strip()
+        if url:
+            base = url
+        else:
+            base = str(row.get("content", "") or "").strip()
+        if not base:
+            base = str(row.get("title", "") or "").strip()
 
-        paras = [p.strip() for p in re.split(r"\n{2,}|\r\n{2,}", text) if p.strip()]
-        chunks: List[str] = []
+        h = hashlib.sha1(base.encode("utf-8")).hexdigest()
+        return h
 
-        sent_split_re = re.compile(r"(?<=[\.\?\!;])\s+")
-        for p in paras:
-            p = self._normalize_space(p)
-            if len(p) <= self.chunk_max_chars:
-                chunks.append(p)
-                continue
-
-            sents = [s.strip() for s in sent_split_re.split(p) if s.strip()]
-            buf = ""
-            for s in sents:
-                if not buf:
-                    buf = s
-                elif len(buf) + 1 + len(s) <= self.chunk_max_chars:
-                    buf = buf + " " + s
-                else:
-                    if len(buf) >= self.chunk_min_chars:
-                        chunks.append(buf)
-                    else:
-                        chunks.append(buf)
-                    buf = s
-
-            if buf:
-                chunks.append(buf)
-
-        final_chunks: List[str] = []
-        for c in chunks:
-            c = c.strip()
-            if len(c) <= self.chunk_max_chars:
-                final_chunks.append(c)
-            else:
-                for i in range(0, len(c), self.chunk_max_chars):
-                    final_chunks.append(c[i:i + self.chunk_max_chars])
-
-        return [c for c in final_chunks if c.strip()]
+    def _article_path(self, ticker: str, date_str: str, article_id: str) -> str:
+        out_dir = os.path.join(self.dir_articles, ticker, date_str)
+        os.makedirs(out_dir, exist_ok=True)
+        return os.path.join(out_dir, f"{article_id}.json")
 
     # ------------------------------
-    # Cache helpers
+    # Legacy cache by text (optional)
     # ------------------------------
-    def _chunk_hash(self, chunk: str) -> str:
-        import hashlib
-        return hashlib.sha1(chunk.encode("utf-8")).hexdigest()
+    def _hash_text(self, s: str) -> str:
+        return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
 
     def _cache_path(self, h: str) -> str:
         return os.path.join(self.cache_dir, f"{h}.json")
 
-    def _load_cache(self, chunk: str):
+    def _load_legacy_cache(self, text: str):
         if not self.enable_cache:
             return None
-        h = self._chunk_hash(chunk)
+        h = self._hash_text(text)
         p = self._cache_path(h)
         if os.path.exists(p):
             try:
                 with open(p, "r", encoding="utf-8") as f:
                     obj = json.load(f)
-                return obj.get("entities", []), [tuple(t) for t in obj.get("triples", [])]
+                triples = obj.get("triples", [])
+                triples = [tuple(t) for t in triples if isinstance(t, (list, tuple)) and len(t) == 3]
+                return triples
             except Exception:
                 return None
         return None
 
-    def _save_cache(self, chunk: str, entities: List[str], triples: List[Triple]):
+    def _save_legacy_cache(self, text: str, triples: List[Triple]):
         if not self.enable_cache:
             return
-        h = self._chunk_hash(chunk)
+        h = self._hash_text(text)
         p = self._cache_path(h)
-        obj = {"entities": entities, "triples": [list(t) for t in triples]}
         with open(p, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False)
+            json.dump({"triples": [list(t) for t in triples]}, f, ensure_ascii=False)
 
     # ------------------------------
-    # Extract (REAL KGGen via DSPy+Gemini)
+    # Per-article triples: load or extract
     # ------------------------------
-    def extract_entities_triples(self, text: str) -> Tuple[List[str], List[Triple]]:
-        """
-        KGGen extraction cho 1 chunk (có cache).
-        """
-        cached = self._load_cache(text)
-        if cached is not None:
-            return cached
+    def get_or_extract_article_triples(self, ticker: str, date_str: str, row: pd.Series, text_col: str) -> List[Triple]:
+        article_id = self._article_id(row)
+        apath = self._article_path(ticker, date_str, article_id)
 
-        entities, triples = self.kg_extractor.extract(text)
-        self._save_cache(text, entities, triples)
-        return entities, triples
+        # 1) Nếu đã có file per-article => load luôn, NO LLM
+        if os.path.exists(apath):
+            try:
+                with open(apath, "r", encoding="utf-8") as f:
+                    obj = json.load(f)
+                triples = obj.get("triples", [])
+                triples = [tuple(t) for t in triples if isinstance(t, (list, tuple)) and len(t) == 3]
+                return triples
+            except Exception:
+                pass  # nếu hỏng file thì fallthrough để trích lại
 
-    def filter_top3_triples(self, triples: List[Triple], full_text: str) -> List[Triple]:
-        """
-        Giữ tối đa 3 triples có similarity cao nhất với toàn bộ news.
-        """
-        if len(triples) <= 3:
-            return triples
+        text = str(row.get(text_col, "") or "").strip()
+        if not text:
+            return []
 
-        full_emb = self.sbert.encode(full_text, convert_to_tensor=True)
-        scored = []
+        # 2) thử legacy cache (hash theo text)
+        cached = self._load_legacy_cache(text)
+        if cached is not None and len(cached) > 0:
+            triples = cached[: self.top_triples_per_article]
+        else:
+            # 3) gọi LLM (chỉ khi thiếu)
+            triples = self.kg_extractor.extract_triples(text, limit_k=self.top_triples_per_article)
+            self._save_legacy_cache(text, triples)
 
-        for s, p, o in triples:
-            triple_text = f"{s} {p} {o}"
-            triple_emb = self.sbert.encode(triple_text, convert_to_tensor=True)
-            sim = util.cos_sim(triple_emb, full_emb).item()
-            scored.append((sim, (s, p, o)))
-
-        scored.sort(reverse=True, key=lambda x: x[0])
-        return [t for _, t in scored[:3]]
-
-    def extract_entities_triples_chunked(self, text: str) -> Tuple[List[str], List[Triple]]:
-        """
-        Extract per chunk and merge; filter top-3 triples by semantic similarity.
-        """
-        chunks = self.split_into_chunks(text)
-        all_entities: List[str] = []
-        all_triples: List[Triple] = []
-
-        for ch in chunks:
-            ents, triples = self.extract_entities_triples(ch)
-            all_entities.extend([str(e) for e in ents if str(e).strip()])
-            for t in triples:
-                if isinstance(t, (list, tuple)) and len(t) == 3:
-                    all_triples.append((str(t[0]), str(t[1]), str(t[2])))
-
-        all_entities = list(dict.fromkeys(all_entities))
-        all_triples = list(dict.fromkeys(all_triples))
-
-        if self.max_triples_per_day is not None and len(all_triples) > self.max_triples_per_day:
-            all_triples = all_triples[: self.max_triples_per_day]
-
-        # ✅ Lọc top-3 triples quan trọng nhất bằng SBERT
-        filtered_triples = self.filter_top3_triples(all_triples, text)
-        return all_entities, filtered_triples
+        # 4) save per-article file
+        with open(apath, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "ticker": ticker,
+                    "date": date_str,
+                    "article_id": article_id,
+                    "url": str(row.get("url", "") or ""),
+                    "title": str(row.get("title", "") or ""),
+                    "triples": [list(t) for t in triples],
+                },
+                f,
+                ensure_ascii=False,
+            )
+        return triples
 
     # ------------------------------
-    # Aggregate rolling window
+    # Voyage embeddings for resolution
     # ------------------------------
-    def aggregate_window(self, per_day_triples: List[List[Triple]]) -> List[Triple]:
-        agg: List[Triple] = []
-        for t in per_day_triples:
-            agg.extend(t)
-        return list(dict.fromkeys(agg))
+    def _voyage_embed(self, texts: List[str]):
+        import numpy as np
+        import requests
+        import time
+
+        api_key = os.getenv("VOYAGE_API_KEY")
+        if not api_key:
+            raise RuntimeError("Missing VOYAGE_API_KEY for Voyage resolution.")
+
+        url = "https://api.voyageai.com/v1/embeddings"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        payload = {"model": self.voyage_model, "input": texts}
+
+        for attempt in range(6):
+            r = requests.post(url, headers=headers, json=payload, timeout=60)
+            if r.status_code == 200:
+                data = r.json()
+                vecs = [x["embedding"] for x in data["data"]]
+                return np.array(vecs, dtype=np.float32)
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(2 ** attempt)
+                continue
+            raise RuntimeError(f"Voyage embedding error: {r.status_code} {r.text}")
+
+        raise RuntimeError("Voyage embedding failed after retries.")
 
     # ------------------------------
-    # Resolve entities (SBERT + kmeans)
+    # Resolve entities (Voyage + KMeans)
     # ------------------------------
     def resolve_triples(self, triples: List[Triple]) -> List[Triple]:
         ents = list({s for s, _, _ in triples} | {o for _, _, o in triples})
         if len(ents) <= 1:
             return triples
 
-        emb = self.sbert.encode(ents, normalize_embeddings=True)
+        if self.use_voyage_resolution:
+            emb = self._voyage_embed(ents)
+        else:
+            emb = self.sbert.encode(ents, normalize_embeddings=True)
+
         k = min(self.kmeans_k, len(ents))
         labels = KMeans(n_clusters=k, n_init="auto", random_state=42).fit_predict(emb)
 
@@ -439,7 +407,31 @@ class KGGenNewsEmbedder:
         out: List[Triple] = []
         for s, p, o in triples:
             out.append((mapping.get(s, s), p, mapping.get(o, o)))
-        return list(dict.fromkeys(out))
+
+        # dedup preserve order
+        seen = set()
+        deduped = []
+        for t in out:
+            if t not in seen:
+                seen.add(t)
+                deduped.append(t)
+        return deduped
+
+    # ------------------------------
+    # Aggregate rolling window
+    # ------------------------------
+    def aggregate_window(self, per_day_triples: List[List[Triple]]) -> List[Triple]:
+        agg: List[Triple] = []
+        for t in per_day_triples:
+            agg.extend(t)
+
+        seen = set()
+        deduped = []
+        for tri in agg:
+            if tri not in seen:
+                seen.add(tri)
+                deduped.append(tri)
+        return deduped
 
     # ------------------------------
     # Tensorize graph
@@ -454,10 +446,7 @@ class KGGenNewsEmbedder:
             if edges else torch.zeros((2, 0), dtype=torch.long)
         )
 
-        node_x = torch.tensor(
-            self.sbert.encode(nodes, normalize_embeddings=True), dtype=torch.float32
-        )
-
+        node_x = torch.tensor(self.sbert.encode(nodes, normalize_embeddings=True), dtype=torch.float32)
         ticker_idx = node2id.get(ticker, 0)
 
         obj: Dict[str, Any] = {
@@ -474,12 +463,11 @@ class KGGenNewsEmbedder:
         return out_path
 
     # ------------------------------
-    # Main runner
+    # MAIN: build extracted_triples (per-day) using per-article (reuse or extract)
     # ------------------------------
     def process_and_save(self, news_df: pd.DataFrame) -> str:
         df = news_df.copy()
 
-        # normalize column names
         if "equity" not in df.columns and "ticker" in df.columns:
             df = df.rename(columns={"ticker": "equity"})
         if "title" not in df.columns and "headline" in df.columns:
@@ -490,54 +478,77 @@ class KGGenNewsEmbedder:
             elif "text" in df.columns:
                 df = df.rename(columns={"text": "content"})
 
-        base_req = {"date", "equity"}
-        missing = base_req - set(df.columns)
-        if missing:
-            raise ValueError(f"aligned_news missing columns: {missing}. Has: {list(df.columns)}")
-
-        if ("content" not in df.columns) and ("title" not in df.columns):
-            raise ValueError("aligned_news must contain either 'content' or 'title' for KG input.")
+        if "date" not in df.columns or "equity" not in df.columns:
+            raise ValueError("aligned_news must contain date & equity")
 
         df["date"] = pd.to_datetime(df["date"]).dt.date
 
         text_col = "content" if "content" in df.columns else "title"
         df[text_col] = df[text_col].fillna("").astype(str)
 
-        grouped = (
-            df.groupby(["equity", "date"])[text_col]
-              .apply(lambda x: "\n\n".join([t for t in x.astype(str) if t.strip()]))
-              .reset_index()
-              .rename(columns={text_col: "merged_text"})
-        )
+        grouped = df.groupby(["equity", "date"])
 
-        ticker_days: Dict[str, Dict[Any, str]] = {}
-        for _, r in grouped.iterrows():
-            ticker_days.setdefault(r["equity"], {})[r["date"]] = r["merged_text"]
+        # 1) Build per-day merged triples from per-article files
+        for (ticker, day), g in grouped:
+            date_str = str(day)
 
+            day_triples: List[Triple] = []
+
+            for _, row in g.iterrows():
+                triples_article = self.get_or_extract_article_triples(
+                    ticker=ticker,
+                    date_str=date_str,
+                    row=row,
+                    text_col=text_col
+                )
+                # giữ đúng top-5 mỗi bài (đã enforce ở extractor)
+                day_triples.extend(triples_article)
+
+            # ✅ IMPORTANT: yêu cầu bạn muốn giữ hết N*5, không top-k/day
+            # Nếu bạn vẫn muốn dedup để giảm noise, có thể bật đoạn dưới:
+            # seen = set(); deduped=[]
+            # for t in day_triples:
+            #     if t not in seen:
+            #         seen.add(t); deduped.append(t)
+            # day_triples = deduped
+
+            out_dir = os.path.join(self.dir_triples, ticker)
+            os.makedirs(out_dir, exist_ok=True)
+            with open(os.path.join(out_dir, f"{date_str}.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {"date": date_str, "ticker": ticker, "triples": [list(t) for t in day_triples]},
+                    f,
+                    ensure_ascii=False,
+                )
+
+        # 2) Rebuild graph-only (NO LLM)
+        return self.rebuild_graph_only()
+
+    # ------------------------------
+    # Graph-only rebuild from per-day extracted_triples
+    # ------------------------------
+    def rebuild_graph_only(self) -> str:
         results_json: Dict[str, List[Dict[str, Any]]] = {}
 
-        for ticker, day_map in ticker_days.items():
-            dates_sorted = sorted(day_map.keys())
+        for ticker in sorted(os.listdir(self.dir_triples)):
+            tdir = os.path.join(self.dir_triples, ticker)
+            if not os.path.isdir(tdir):
+                continue
+
+            files = sorted([f for f in os.listdir(tdir) if f.endswith(".json")])
+            if not files:
+                continue
+
             window_triples: List[List[Triple]] = []
 
-            for d in dates_sorted:
-                date_str = str(d)
-                text = day_map[d]
+            for fn in files:
+                date_str = fn.replace(".json", "")
+                fp = os.path.join(tdir, fn)
+                with open(fp, "r", encoding="utf-8") as f:
+                    obj = json.load(f)
 
-                if self.debug_print_samples:
-                    print(f"[KG INPUT] {ticker} {date_str} chars={len(text)} preview={text[:200]}")
-
-                entities, triples = self.extract_entities_triples_chunked(text)
-
-                # save extracted triples (per-day)
-                out_dir = os.path.join(self.dir_triples, ticker)
-                os.makedirs(out_dir, exist_ok=True)
-                with open(os.path.join(out_dir, f"{date_str}.json"), "w", encoding="utf-8") as f:
-                    json.dump(
-                        {"date": date_str, "ticker": ticker, "entities": entities, "triples": triples},
-                        f,
-                        ensure_ascii=False,
-                    )
+                triples = obj.get("triples", [])
+                triples = [tuple(t) for t in triples if isinstance(t, (list, tuple)) and len(t) == 3]
 
                 window_triples.append(triples)
                 if len(window_triples) > self.window_days:
@@ -548,26 +559,25 @@ class KGGenNewsEmbedder:
                 out_dir = os.path.join(self.dir_raw, ticker)
                 os.makedirs(out_dir, exist_ok=True)
                 with open(os.path.join(out_dir, f"{date_str}.json"), "w", encoding="utf-8") as f:
-                    json.dump({"date": date_str, "ticker": ticker, "triples": raw_graph}, f, ensure_ascii=False)
+                    json.dump({"date": date_str, "ticker": ticker, "triples": [list(t) for t in raw_graph]}, f, ensure_ascii=False)
 
                 stable = self.resolve_triples(raw_graph)
 
                 out_dir = os.path.join(self.dir_stable, ticker)
                 os.makedirs(out_dir, exist_ok=True)
                 with open(os.path.join(out_dir, f"{date_str}.json"), "w", encoding="utf-8") as f:
-                    json.dump({"date": date_str, "ticker": ticker, "triples": stable}, f, ensure_ascii=False)
+                    json.dump({"date": date_str, "ticker": ticker, "triples": [list(t) for t in stable]}, f, ensure_ascii=False)
 
                 kg_path = self.tensorize(ticker, date_str, stable)
 
-                rec = {"date": date_str, "equity": ticker, "kg_tensor_path": kg_path}
-                results_json.setdefault(date_str, []).append(rec)
+                results_json.setdefault(date_str, []).append(
+                    {"date": date_str, "equity": ticker, "kg_tensor_path": kg_path}
+                )
 
         out_path = os.path.join(self.emb_dir, "embedded_kg.json")
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(results_json, f, ensure_ascii=False)
 
-        print("✅ KGGen offline outputs saved at:", self.base_dir)
-        print("✅ Builder index saved:", out_path)
-        if self.enable_cache:
-            print("✅ KG chunk cache dir:", self.cache_dir)
+        print("✅ Graph-only rebuild done. Index:", out_path)
         return out_path
+

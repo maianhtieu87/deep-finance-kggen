@@ -1,1 +1,1 @@
-{"date": "2024-05-10", "ticker": "AMZN", "triples": [["market", "affects", "price"]]}
+{"date": "2024-05-10", "ticker": "AMZN", "triples": [["BABA", "experienced", "bullish call sweep expiring May 17, 2024 with strike price 80.00"], ["TSLA", "experienced", "bullish put sweep expiring May 10, 2024 with strike price 172.50"], ["ABNB", "experienced", "bearish put trade expiring May 10, 2024 with strike price 160.00"]]}

@@ -1,1 +1,1 @@
-{"date": "2024-05-09", "ticker": "NFLX", "triples": [["market", "affects", "price"]]}
+{"date": "2024-05-09", "ticker": "NFLX", "triples": [["Netflix", "price target range implied by options activity", "between 230.0 and 1110.0"], ["Netflix", "faces", "large bearish options positions"], ["Pivotal Research analyst", "maintains Buy rating on", "Netflix with a price target of 800"]]}

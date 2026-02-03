@@ -1,1 +1,1 @@
-{"date": "2025-03-21", "ticker": "MSFT", "triples": [["market", "affects", "price"]]}
+{"date": "2025-03-21", "ticker": "MSFT", "triples": [["CRWD", "observed", "call option trade with bullish sentiment"], ["SOUN", "observed", "call option sweep with bearish sentiment"], ["PLTR", "observed", "put option sweep with bullish sentiment"]]}

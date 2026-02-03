@@ -1,1 +1,1 @@
-{"date": "2024-09-05", "ticker": "AMZN", "triples": [["market", "affects", "price"]]}
+{"date": "2024-09-05", "ticker": "AMZN", "triples": [["HD", "observed", "bearish call option sweep expiring January 16, 2026 with total trade price of 32.1K"], ["GME", "observed", "bearish call option sweep expiring September 20, 2024 with total trade price of 96.2K"], ["TSLA", "observed", "bullish put option sweep expiring September 6, 2024 with total trade price of 34.5K and high volume"]]}

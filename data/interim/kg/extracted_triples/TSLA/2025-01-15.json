@@ -1,1 +1,1 @@
-{"date": "2025-01-15", "ticker": "TSLA", "triples": [["market", "affects", "price"]]}
+{"date": "2025-01-15", "ticker": "TSLA", "triples": [["LVS", "noticed a", "put option sweep that happens to be bullish expiring in 10 days on January 24, 2025 with total trade price of 288.0K"], ["TPR", "observed a", "call option sweep with bullish sentiment expiring in 520 days on June 18, 2026 with total trade price of 335.1K"], ["Tesla", "sold", "about 634,000 EVs in the U.S. in 2024"]]}

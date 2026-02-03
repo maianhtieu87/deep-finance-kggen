@@ -1,1 +1,1 @@
-{"date": "2024-06-13", "ticker": "MSFT", "triples": [["market", "affects", "price"]]}
+{"date": "2024-06-13", "ticker": "MSFT", "triples": [["AVGO", "shows", "bearish call option trade expiring in 9 days"], ["AAPL", "shows", "bearish call option sweep expiring in 2 days"], ["ARM", "shows", "bearish call option sweep expiring in 2 days"]]}

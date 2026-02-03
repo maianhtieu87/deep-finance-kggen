@@ -1,1 +1,1 @@
-{"date": "2025-01-07", "ticker": "MSFT", "triples": [["market", "affects", "price"]]}
+{"date": "2025-01-07", "ticker": "MSFT", "triples": [["INTC", "saw bullish call option sweep", "expiring April 17, 2025 with a strike price of $20.00 and a total trade price of $235.7K"], ["MU", "saw bearish call option trade", "expiring February 21, 2025 with a strike price of $100.00 and a total trade price of $68.0K"], ["MSTR", "saw bullish call option sweep", "expiring January 17, 2025 with a strike price of $420.00 and a total trade price of $51.3K"]]}

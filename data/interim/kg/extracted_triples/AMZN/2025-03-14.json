@@ -1,1 +1,1 @@
-{"date": "2025-03-14", "ticker": "AMZN", "triples": [["market", "affects", "price"]]}
+{"date": "2025-03-14", "ticker": "AMZN", "triples": [["TSLA", "saw bullish put option sweep", "expiring March 14, 2025 with total cost of $44.1K"], ["SHAK", "saw bullish put option sweep", "expiring January 16, 2026 with total cost of $572.0K"], ["ANF", "saw bearish put option trade", "expiring September 19, 2025 with total cost of $43.6K"]]}

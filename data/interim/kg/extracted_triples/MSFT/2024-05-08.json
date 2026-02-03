@@ -1,1 +1,1 @@
-{"date": "2024-05-08", "ticker": "MSFT", "triples": [["market", "affects", "price"]]}
+{"date": "2024-05-08", "ticker": "MSFT", "triples": [["INTC", "saw bullish put option trade", "expiring September 20, 2024 with total cost of 689.9K"], ["PANW", "saw bearish call option trade", "expiring June 21, 2024 with total cost of 35.9K"], ["SMCI", "saw bearish put option trade", "expiring May 10, 2024 with total cost of 90.5K"]]}

@@ -1,1 +1,1 @@
-{"date": "2024-07-01", "ticker": "TSLA", "triples": [["market", "affects", "price"]]}
+{"date": "2024-07-01", "ticker": "TSLA", "triples": [["DKNG", "received", "127.7K for bullish call option sweep expiring September 20, 2024 at a 38.00 strike"], ["TSLA", "received", "26.8K for bullish call option sweep expiring July 5, 2024 at a 210.00 strike"], ["RIVN", "received", "804.9K for bullish put option trade expiring January 17, 2025 at a 10.00 strike"]]}

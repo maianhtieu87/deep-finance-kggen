@@ -1,1 +1,1 @@
-{"date": "2024-06-18", "ticker": "NFLX", "triples": [["market", "affects", "price"]]}
+{"date": "2024-06-18", "ticker": "NFLX", "triples": [["GOOG", "observed", "bearish call option sweep expiring June 21, 2024 with total cost of 125.0K"], ["NFLX", "observed", "bearish call option sweep expiring June 21, 2024 with total cost of 45.3K"], ["PARA", "observed", "bearish call option trade expiring September 20, 2024 with total cost of 99.3K"]]}
