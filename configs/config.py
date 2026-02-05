@@ -69,13 +69,13 @@ class TrainConfig:
     valid_ratio = 0.15
 
     # ⚠ batch_size: dùng trong main.py
-    batch_size = 128
+    batch_size = 64
 
     # Window Size (T): số ngày quá khứ dùng để dự báo
     window_size = 20
 
     # ⚠ NHỚ CHỈNH CHO KHỚP VỚI news_dim TỪ KG/GNN
-    news_embed_dim = 256    
+    news_embed_dim = 128    
     
     # Model Hyperparameters
     dim = 128
@@ -86,3 +86,4 @@ class TrainConfig:
     epoch_num = 200
     learning_rate = 1e-4
     weight_decay = 1e-5
+    drop_out = 0.1

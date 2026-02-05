@@ -61,7 +61,6 @@ def _quick_check_kg_index(kg_index_path: str, n_samples: int = 5) -> bool:
     if missing > 0:
         print(f"⚠️ KG index check: {missing}/{checked} sampled tensor paths are missing.")
         print("   → Có thể bạn đã move folder data/interim/kg hoặc rebuild chưa xong.")
-        # vẫn return True vì có thể sample trúng missing; nhưng bạn nên cân nhắc
         return True
 
     print(f"✅ KG index sanity-check OK. Sampled {checked} tensor paths exist.")
@@ -142,16 +141,21 @@ def run_test_pipeline_skipping_news_fetch():
                 embedder = KGGenNewsEmbedder(
                     interim_root=GlobalConfig.INTERIM_PATH,
                     top_triples_per_article=5,
-                    top_triples_per_day=None,   # giữ hết per-day (no top-k/day)
-                    # NOTE: voyage resolution nếu bạn đã implement trong news_processor
-                    # và đã set VOYAGE_API_KEY env. Nếu chưa, hãy để module tự handle.
+                    # ✅ REMOVED: top_triples_per_day (không tồn tại)
+                    use_voyage_resolution=True,
+                    use_voyage_node_features=True,
+                    allow_llm_when_missing=True,  # Allow LLM calls
+                    # ✅ GNN params (khớp với config)
+                    graph_out_dim=128,
+                    graph_hidden_dim=128,
+                    graph_num_layers=2,
                 )
                 kg_index_path = embedder.process_and_save(aligned_news)
             else:
                 print("   ❌ Không rebuild nhưng KG index hiện không ổn. Dừng để tránh builder lỗi.")
                 return
         else:
-            # ✅ default: reuse (NO rebuild graph-only, NO voyage, NO llm)
+            # ✅ default: reuse
             ans = input("   → Reuse KG đã build sẵn (skip build KG)? (y/n): ").strip().lower()
             if ans == "y":
                 print("   ✅ Reusing existing KG index. (NO LLM / NO Voyage / NO graph rebuild)")
@@ -160,7 +164,14 @@ def run_test_pipeline_skipping_news_fetch():
                 embedder = KGGenNewsEmbedder(
                     interim_root=GlobalConfig.INTERIM_PATH,
                     top_triples_per_article=5,
-                    top_triples_per_day=None,   # giữ hết per-day (no top-k/day)
+                    # ✅ REMOVED: top_triples_per_day
+                    use_voyage_resolution=True,
+                    use_voyage_node_features=True,
+                    allow_llm_when_missing=True,
+                    # ✅ GNN params
+                    graph_out_dim=128,
+                    graph_hidden_dim=128,
+                    graph_num_layers=2,
                 )
                 kg_index_path = embedder.process_and_save(aligned_news)
     else:
@@ -172,7 +183,13 @@ def run_test_pipeline_skipping_news_fetch():
         embedder = KGGenNewsEmbedder(
             interim_root=GlobalConfig.INTERIM_PATH,
             top_triples_per_article=5,
-            top_triples_per_day=None,
+            # ✅ REMOVED: top_triples_per_day
+            use_voyage_resolution=True,
+            use_voyage_node_features=True,
+            allow_llm_when_missing=True,
+            graph_out_dim=128,
+            graph_hidden_dim=128,
+            graph_num_layers=2,
         )
         kg_index_path = embedder.process_and_save(aligned_news)
 
