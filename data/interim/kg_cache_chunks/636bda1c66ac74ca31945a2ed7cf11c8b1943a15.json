@@ -1,1 +1,0 @@
-{"entities": ["DKNG", "NASDAQ", "call option", "May 17, 2024", "contract", "shares", "Expiration Date", "PremiumOption Price", "Benzinga"], "triples": [["DKNG", "related to", "call option"], ["call option", "expires on", "May 17, 2024"]]}
