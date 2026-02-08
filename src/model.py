@@ -1,50 +1,42 @@
+# src/model.py - FIXED VERSION WITH GNN INTEGRATION
+"""
+Stock Movement Model với Graph Neural Network
+
+CHANGES:
+- Thay MultimodalEncoding bằng KGGraphEncoder cho news
+- Forward nhận graph data (x, edge_index) thay vì flat vector
+- Hỗ trợ dynamic loading từ paths
+- L2 normalization cho graph embeddings
+"""
+
 import torch
 from torch import nn
 from sklearn.metrics import accuracy_score, matthews_corrcoef
 import torch.nn.functional as F
+import os
+from torch_geometric.data import Batch
+
+from encoders.kg_graph_encoder import KGGraphEncoder  # ✅ Import GNN
 from encoders.mutil_encoder import MultimodalSourceEncoding
 from .fusion import StableGatedCrossAttention
-from .predictor import FinegrainedMovementPrediction    
+from .predictor import FinegrainedMovementPrediction
+
 
 class FocalLoss(nn.Module):
     """
     Focal Loss: Giải quyết mất cân bằng bằng cách tập trung vào mẫu khó (Hard Examples).
-    Công thức: FL(pt) = - alpha * (1 - pt)^gamma * log(pt)
-    
-    Args:
-        alpha: Tensor trọng số cho từng class [w_0, w_1, w_2]. 
-               Ví dụ: [1.5, 0.5, 1.5] nghĩa là class 0 và 2 được chú ý hơn class 1
-        gamma: Độ tập trung vào mẫu khó. 
-               gamma=0: giống CE loss thông thường
-               gamma=2: mặc định trong paper
-               gamma=1: nhẹ hơn, khuyến nghị cho imbalanced data
-        reduction: 'mean', 'sum', hoặc 'none'
     """
     def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
         super(FocalLoss, self).__init__()
         self.gamma = gamma
-        self.alpha = alpha  # Class weights
+        self.alpha = alpha
         self.reduction = reduction
 
     def forward(self, inputs, targets):
-        """
-        Args:
-            inputs: Logits (B, num_classes)
-            targets: Ground truth labels (B,)
-        """
-        # 1. Tính Cross Entropy Loss với Weight (Alpha)
-        # weight=self.alpha sẽ tự động nhân trọng số vào loss của từng lớp
         ce_loss = F.cross_entropy(inputs, targets, reduction='none', weight=self.alpha)
-        
-        # 2. Tính pt (xác suất model dự đoán đúng class)
         pt = torch.exp(-ce_loss)
-        
-        # 3. Áp dụng Focal modulation: (1 - pt)^gamma
-        # Khi pt cao (model tự tin đúng) → (1-pt) nhỏ → giảm loss (easy sample)
-        # Khi pt thấp (model không chắc) → (1-pt) lớn → tăng loss (hard sample)
         focal_loss = ((1 - pt) ** self.gamma) * ce_loss
-
-        # 4. Reduction
+        
         if self.reduction == 'mean':
             return focal_loss.mean()
         elif self.reduction == 'sum':
@@ -52,84 +44,108 @@ class FocalLoss(nn.Module):
         else:
             return focal_loss
 
-# ================================================================
-# [NEW] LABEL SMOOTHING CROSS ENTROPY
-# ================================================================
+
 class LabelSmoothingCrossEntropy(nn.Module):
-    """
-    Cross Entropy với Label Smoothing để chống overconfident.
-    
-    Thay vì target = [0, 1, 0] (one-hot), dùng [ε/K, 1-ε+ε/K, ε/K]
-    
-    Args:
-        smoothing: Hệ số làm mượt (0-1). Khuyến nghị 0.1-0.2
-        weight: Class weights (tương tự alpha trong Focal)
-    """
+    """Cross Entropy với Label Smoothing."""
     def __init__(self, smoothing=0.1, weight=None):
         super().__init__()
         self.smoothing = smoothing
         self.weight = weight
-        
+
     def forward(self, inputs, targets):
         num_classes = inputs.size(-1)
         log_probs = F.log_softmax(inputs, dim=-1)
         
-        # Tạo smoothed targets
         with torch.no_grad():
             true_dist = torch.zeros_like(log_probs)
             true_dist.fill_(self.smoothing / (num_classes - 1))
             true_dist.scatter_(1, targets.unsqueeze(1), 1.0 - self.smoothing)
         
-        # Áp dụng class weights nếu có
         if self.weight is not None:
             weight_expanded = self.weight.unsqueeze(0).expand_as(log_probs)
             loss = -(true_dist * log_probs * weight_expanded).sum(dim=-1)
         else:
             loss = -(true_dist * log_probs).sum(dim=-1)
-            
+        
         return loss.mean()
 
-        
+
 class StockMovementModel(nn.Module):
     """
-    MSGCA Framework Implementation (Refactored).
-    Integrates Stable Gated Fusion and MLP-based Aggregation.
+    MSGCA Framework với Graph Neural Network Integration.
+    
+    Architecture:
+    - Price/Macro: Temporal encoding (LSTM/Transformer)
+    - News: KG Graph Encoder (GNN: GraphSAGE + GAT)
+    - Fusion: Stable Gated Cross Attention
+    - Prediction: MLP-based movement classifier
     """
-
     def __init__(
         self,
         price_dim,
         macro_dim,
-        news_dim,
-        dim,
-        input_dim,
-        output_dim,
+        news_dim,  # Node feature dimension
+        dim,       # Hidden dimension
+        input_dim,  # Window size
+        output_dim, # Num classes
         num_head,
-        device, 
-        dropout=0.1, 
+        device,
+        dropout=0.1,
         class_weights=None,
         use_focal_loss=True,
-        focal_gamma=2.0,           # [NEW] Cho phép điều chỉnh gamma
-        use_label_smoothing=False, # [NEW] Option để dùng label smoothing
-        smoothing=0.1,             # [NEW] Smoothing factor
+        focal_gamma=2.0,
+        use_label_smoothing=False,
+        smoothing=0.1,
+        # ===== GNN Params =====
+        use_gnn=True,              # Enable GNN encoder
+        gnn_type="sage",           # "sage" or "gat"
+        gnn_hidden_dim=256,        # GNN hidden dimension
+        gnn_num_layers=2,          # Number of GNN layers
+        gnn_heads=4,               # GAT heads (if use_gat)
+        gnn_pool="attention",      # Pooling: "mean", "max", "attention"
     ):
         super().__init__()
         self.device = device
         self.output_dim = output_dim
-
-        # ===== 1. Multimodal Source Encoding =====
+        self.use_gnn = use_gnn
+        self.news_dim = news_dim
+        
+        # ===== 1. Encoders =====
+        if use_gnn:
+            # ✅ Use GNN for news encoding
+            self.kg_encoder = KGGraphEncoder(
+                node_dim=news_dim,
+                hidden_dim=gnn_hidden_dim,
+                output_dim=dim,
+                num_sage_layers=gnn_num_layers,  # ✅ FIXED
+                use_gat=(gnn_type == "gat"),
+                gat_heads=gnn_heads,
+                dropout=dropout
+            ).to(device)
+            print(f"🔧 KG Encoder: {gnn_type.upper()} (layers={gnn_num_layers}, pool={gnn_pool})")
+        else:
+            # Fallback: Simple linear projection
+            self.kg_encoder = nn.Sequential(
+                nn.Linear(news_dim, dim),
+                nn.LayerNorm(dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            ).to(device)
+            print("⚠️ Using Linear Projection for News (GNN disabled)")
+        
+        # Price & Macro encoder (keep existing)
         self.multimodal_encoder = MultimodalSourceEncoding(
             price_dim=price_dim,
             macro_dim=macro_dim,
-            news_dim=news_dim,
+            news_dim=dim,  # Will be replaced by GNN output
             dim=dim
         )
 
-        # ===== 2. Stable Gated Cross-Feature Fusion =====
+        # ===== 2. Fusion =====
         self.fusion_news = StableGatedCrossAttention(dim=dim, num_head=num_head)
         self.fusion_macro = StableGatedCrossAttention(dim=dim, num_head=num_head)
 
-        # ===== 3. Fine-grained Movement Prediction (Decoder) =====
+        # ===== 3. Predictor =====
         self.movement_predictor = FinegrainedMovementPrediction(
             dim=dim,
             window_size=input_dim,
@@ -137,66 +153,136 @@ class StockMovementModel(nn.Module):
             dropout=dropout
         )
 
-        # ===== 4. Loss Function Strategy =====
+        # ===== 4. Loss =====
         self.use_focal_loss = use_focal_loss
         self.use_label_smoothing = use_label_smoothing
         
         if use_label_smoothing:
-            # Label Smoothing (good alternative to Focal)
             self.loss_fn = LabelSmoothingCrossEntropy(smoothing=smoothing, weight=class_weights)
-            print(f"🔧 Loss Strategy: LABEL SMOOTHING (ε={smoothing}) + Weights={class_weights is not None} ✅")
-            
+            print(f"🔧 Loss: LABEL SMOOTHING (ε={smoothing})")
         elif use_focal_loss:
-            # Focal Loss với gamma điều chỉnh được
             self.loss_fn = FocalLoss(alpha=class_weights, gamma=focal_gamma)
-            
-            # Log chi tiết
-            if class_weights is not None:
-                print(f"🔧 Loss Strategy: FOCAL LOSS (γ={focal_gamma}) + ALPHA BALANCING ✅")
-                print(f"   ► Alpha weights: {class_weights.cpu().numpy() if torch.is_tensor(class_weights) else class_weights}")
-            else:
-                print(f"🔧 Loss Strategy: FOCAL LOSS (γ={focal_gamma}) - No Alpha ⚠️")
+            print(f"🔧 Loss: FOCAL LOSS (γ={focal_gamma})")
         else:
-            # Vanilla Cross Entropy
             self.loss_fn = nn.CrossEntropyLoss(weight=class_weights)
-            print(f"🔧 Loss Strategy: STANDARD CE + Weights={class_weights is not None}")
+            print(f"🔧 Loss: STANDARD CE")
 
-    def forward(self, s_o, s_h, s_c, s_m, s_n, label=None, mode="train", return_preds=False, return_logits=False):
+    def _process_graph_batch(self, graph_list):
         """
-        Forward pass with multiple output options for debugging.
+        Process list of PyG Data objects into batch.
+        
+        Args:
+            graph_list: List of Data objects (length B)
+        
+        Returns:
+            batched_graph: Batch object or None if all empty
+        """
+        if not graph_list:
+            return None
+        
+        # Filter out None/empty graphs
+        valid_graphs = [g for g in graph_list if g is not None and g.x.size(0) > 0]
+        
+        if len(valid_graphs) == 0:
+            # All graphs are empty, return dummy
+            return None
+        
+        # Batch graphs using PyG
+        try:
+            batched = Batch.from_data_list(valid_graphs)
+            return batched
+        except Exception as e:
+            print(f"❌ Error batching graphs: {e}")
+            return None
+
+    def _encode_graphs(self, graph_list):
+        """
+        Encode batch of graphs to fixed-size embeddings.
+        
+        Args:
+            graph_list: List of PyG Data objects
+        
+        Returns:
+            v_n: Graph embeddings (B, T, dim)
+        """
+        B = len(graph_list)
+        
+        if not self.use_gnn:
+            # Fallback: Use mean of node features
+            embeddings = []
+            for graph in graph_list:
+                if graph is None or graph.x.size(0) == 0:
+                    emb = torch.zeros(self.news_dim).to(self.device)
+                else:
+                    emb = graph.x.mean(dim=0)  # Mean pooling
+                embeddings.append(emb)
+            
+            v_n_flat = torch.stack(embeddings).to(self.device)  # (B, news_dim)
+            v_n_projected = self.kg_encoder(v_n_flat)  # (B, dim)
+            
+            # Expand to sequence
+            v_n = v_n_projected.unsqueeze(1)  # (B, 1, dim)
+            return v_n
+        
+        # ✅ Use GNN
+        batched_graph = self._process_graph_batch(graph_list)
+        
+        if batched_graph is None:
+            # All empty, return zeros
+            v_n = torch.zeros(B, 1, self.kg_encoder.output_dim).to(self.device)
+            return v_n
+        
+        # Move to device
+        batched_graph = batched_graph.to(self.device)
+        
+        # Run GNN
+        graph_embeddings = self.kg_encoder(
+            batched_graph.x, 
+            batched_graph.edge_index,
+            batched_graph.batch
+        )  # (B, dim)
+        
+        # L2 Normalize to preserve geometry
+        graph_embeddings = F.normalize(graph_embeddings, p=2, dim=-1)
+        
+        # Expand to sequence (B, 1, dim)
+        v_n = graph_embeddings.unsqueeze(1)
+        
+        return v_n
+
+    def forward(self, s_o, s_h, s_c, s_m, s_n_graphs, label=None, mode="train", 
+                return_preds=False, return_logits=False):
+        """
+        Forward pass với Graph Neural Network.
         
         Args:
             s_o, s_h, s_c: Price features (B, T, 1)
             s_m: Macro features (B, T, macro_dim)
-            s_n: News features (B, T, news_dim)
+            s_n_graphs: List of PyG Data objects (length B)
             label: Ground truth labels (B,)
             mode: "train" or "test"
-            return_preds: If True, return predictions in test mode
-            return_logits: If True, return raw logits in test mode
-            
+        
         Returns:
-            - mode="train": loss (scalar)
-            - mode="test": 
-                - Default: (acc, mcc)
-                - With return_preds: (acc, mcc, predictions)
-                - With return_logits: (acc, mcc, predictions, logits)
+            - mode="train": loss
+            - mode="test": (acc, mcc) or with predictions/logits
         """
-        # 1. Encode Features
-        v_m, v_i, v_n = self.multimodal_encoder(s_o, s_h, s_c, s_m, s_n)
-
-        # 2. Stable Fusion (Guided by Indicator v_i)
+        # 1. Encode Price & Macro (existing logic)
+        v_m, v_i, _ = self.multimodal_encoder(s_o, s_h, s_c, s_m, None)
+        
+        # 2. Encode News Graphs using GNN
+        v_n = self._encode_graphs(s_n_graphs)  # (B, 1, dim)
+        
+        # 3. Stable Fusion (Guided by Indicator v_i)
         fused_news = self.fusion_news(primary=v_i, aux=v_n)
         fused_macro = self.fusion_macro(primary=v_i, aux=v_m)
         
-        # 3. Combine Fused Features
+        # 4. Combine Fused Features
         v_fused_total = (fused_news + fused_macro) / 2.0
         
-        # 4. Prediction
+        # 5. Prediction
         logits = self.movement_predictor(fused_seq=v_fused_total, orig_seq=v_i)
-        
-        # Numerical stability: Clamp logits to prevent overflow
         logits = torch.clamp(logits, -15, 15)
-
+        
         # ===== TRAIN MODE =====
         if mode == "train":
             if isinstance(label, list):
@@ -206,22 +292,18 @@ class StockMovementModel(nn.Module):
             
             loss = self.loss_fn(logits, target)
             return loss
-
+        
         # ===== TEST MODE =====
         elif mode == "test":
             if isinstance(label, list):
                 target = torch.tensor([item[0] for item in label], dtype=torch.long, device=self.device)
             else:
                 target = label.long().to(self.device)
-
-            # Get predictions
+            
             preds = torch.argmax(logits, dim=1)
-
-            # Compute metrics
             acc = accuracy_score(target.cpu().numpy(), preds.cpu().numpy())
             mcc = matthews_corrcoef(target.cpu().numpy(), preds.cpu().numpy())
             
-            # Return based on flags
             if return_logits:
                 return acc, mcc, preds, logits
             elif return_preds:
@@ -229,27 +311,22 @@ class StockMovementModel(nn.Module):
             else:
                 return acc, mcc
         
-        # ===== LOGITS MODE (For Temperature Scaling Experiments) =====
+        # ===== LOGITS MODE =====
         elif mode == "logits":
             return logits
-    
-    def get_prediction_confidence(self, s_o, s_h, s_c, s_m, s_n):
-        """
-        Utility method to analyze prediction confidence.
-        
-        Returns:
-            probs: Softmax probabilities (B, num_classes)
-            preds: Predicted classes (B,)
-            confidence: Max probability for each sample (B,)
-        """
+
+    def get_prediction_confidence(self, s_o, s_h, s_c, s_m, s_n_graphs):
+        """Utility method to analyze prediction confidence."""
         with torch.no_grad():
-            v_m, v_i, v_n = self.multimodal_encoder(s_o, s_h, s_c, s_m, s_n)
+            v_m, v_i, _ = self.multimodal_encoder(s_o, s_h, s_c, s_m, None)
+            v_n = self._encode_graphs(s_n_graphs)
+            
             fused_news = self.fusion_news(primary=v_i, aux=v_n)
             fused_macro = self.fusion_macro(primary=v_i, aux=v_m)
             v_fused_total = (fused_news + fused_macro) / 2.0
-            logits = self.movement_predictor(fused_seq=v_fused_total, orig_seq=v_i)
             
+            logits = self.movement_predictor(fused_seq=v_fused_total, orig_seq=v_i)
             probs = F.softmax(logits, dim=-1)
             confidence, preds = torch.max(probs, dim=-1)
             
-        return probs, preds, confidence
+            return probs, preds, confidence

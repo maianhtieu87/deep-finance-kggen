@@ -1,19 +1,23 @@
-import pandas as pd
-import pickle
-from configs.config import GlobalConfig as Config
+# D:\ProjectNCKH\deep_finance\data_pipeline\builder.py
 import os
 import json
+import pickle
+import pandas as pd
+from configs.config import GlobalConfig as Config
+
 
 class DatasetBuilder:
     def create_synchronized_data(self, price_macro_dict, news_df, filing_path, embedding_path):
         """
         Final Union Logic.
-        FIX:
+
+        ✅ FIXED for KGGen:
           - Ensure news_df['date'] is datetime-like before using .dt
           - Handle missing filing_path gracefully
           - Keep full news object (title, content, summary, source, url)
+          - ✅ Write news embeddings into key: "news_embedding" (expected by src/data_loader.py)
+          - ✅ Optionally keep kg_tensor_path under key: "kg_tensor" for debugging
         """
-        news_df["date"] = pd.to_datetime(news_df["date"]) # fix .dt.normalize() bug
 
         # -------------------------
         # 0) Filings (optional)
@@ -24,11 +28,10 @@ class DatasetBuilder:
             filing_df["filedAt"] = pd.to_datetime(filing_df["filedAt"], errors="coerce").dt.normalize()
             filing_df = filing_df.dropna(subset=["filedAt"])
         else:
-            # allow running without filings
             filing_df = pd.DataFrame(columns=["filedAt", "ticker", "formType", "content_summary"])
 
         # -------------------------
-        # 0.1) News dtype fix (✅ this fixes your error)
+        # 0.1) News dtype fix
         # -------------------------
         if news_df is None:
             news_df = pd.DataFrame(columns=["date", "equity"])
@@ -36,29 +39,27 @@ class DatasetBuilder:
             news_df = news_df.copy()
 
         if "date" in news_df.columns:
-            # make datetime-like so .dt works
             news_df["date"] = pd.to_datetime(news_df["date"], errors="coerce")
             news_df = news_df.dropna(subset=["date"])
             news_df["date"] = news_df["date"].dt.normalize()
 
-        # ensure expected cols exist (avoid KeyError when selecting)
         for c in ["title", "content", "summary", "source", "url"]:
             if c not in news_df.columns:
                 news_df[c] = None
 
         # -------------------------
-        # 1) Load embeddings index
+        # 1) Load KG index JSON
         # -------------------------
         embedding_data = {}
         if embedding_path and os.path.exists(embedding_path):
-            print(f"Loading embeddings from {embedding_path}...")
+            print(f"Loading KG index from {embedding_path}...")
             with open(embedding_path, "r", encoding="utf-8") as f:
-                raw_embed_data = json.load(f)
-
-            # Standardize key to YYYY-MM-DD
-            for k, v in raw_embed_data.items():
-                clean_key = str(k)[:10]
+                raw = json.load(f)
+            for k, v in raw.items():
+                clean_key = str(k)[:10]  # YYYY-MM-DD
                 embedding_data[clean_key] = v
+        else:
+            print("⚠️ embedding_path not found. Continue without KG embeddings.")
 
         synchronized_data = {}
         mapping = Config.TICKER_MAPPING
@@ -68,7 +69,8 @@ class DatasetBuilder:
         # -------------------------
         for date_obj, data in price_macro_dict.items():
             date_dt = pd.to_datetime(date_obj).normalize()
-            date_str = str(date_obj)[:10]   # ✅ ensure YYYY-MM-DD
+            date_str = str(date_obj)[:10]  # YYYY-MM-DD
+
             synchronized_data[date_obj] = {}
 
             # 2.1 Price
@@ -82,37 +84,42 @@ class DatasetBuilder:
 
             # 2.3 News (full object)
             synchronized_data[date_obj]["news"] = {}
-
             if len(news_df) > 0:
                 date_news = news_df[news_df["date"] == date_dt]
-
                 for ticker in date_news["equity"].unique():
                     if ticker in mapping:
                         clean_ticker = mapping[ticker]
-
                         news_records = date_news[date_news["equity"] == ticker][
                             ["title", "content", "summary", "source", "url"]
                         ].to_dict(orient="records")
-
-                        if clean_ticker not in synchronized_data[date_obj]["news"]:
-                            synchronized_data[date_obj]["news"][clean_ticker] = []
-
+                        synchronized_data[date_obj]["news"].setdefault(clean_ticker, [])
                         synchronized_data[date_obj]["news"][clean_ticker].extend(news_records)
 
-            # 2.4 News Embeddings (KG index)
+            # 2.4 ✅ News Embedding vector expected by src/data_loader.py
+            #     key MUST be "news_embedding"
+            synchronized_data[date_obj]["news_embedding"] = {}
+
+            # 2.4b Optional: keep kg tensor path for debugging
             synchronized_data[date_obj]["kg_tensor"] = {}
 
             if date_str in embedding_data:
                 for rec in embedding_data[date_str]:
                     raw_ticker = rec.get("equity")
-                    if raw_ticker in mapping:
-                        clean_ticker = mapping[raw_ticker]
+                    if raw_ticker not in mapping:
+                        continue
+                    clean_ticker = mapping[raw_ticker]
 
-                        # ✅ KG version: may have "kg_tensor_path" instead of "embedding"
-                        if "kg_tensor_path" in rec:
-                            synchronized_data[date_obj]["kg_tensor"][clean_ticker] = rec["kg_tensor_path"]
-                        else:
-                            synchronized_data[date_obj]["kg_tensor"][clean_ticker] = rec.get("embedding", [])
+                    # ✅ Prefer embedding vector if present
+                    emb = rec.get("embedding", None)
+                    if isinstance(emb, list) and len(emb) > 0:
+                        synchronized_data[date_obj]["news_embedding"][clean_ticker] = emb
+                    else:
+                        # if embedding missing, still set empty list (data_loader will replace with zeros)
+                        synchronized_data[date_obj]["news_embedding"][clean_ticker] = []
+
+                    # optional tensor path
+                    if "kg_tensor_path" in rec:
+                        synchronized_data[date_obj]["kg_tensor"][clean_ticker] = rec["kg_tensor_path"]
 
             # 2.5 Filings
             date_filings = filing_df[filing_df["filedAt"] == date_dt]

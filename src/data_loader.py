@@ -1,227 +1,343 @@
-# src/data_loader.py
-import pandas as pd
-import numpy as np
+# src/data_loader.py - FIXED VERSION (Series error resolved)
+"""
+Fixed Data Loader với Graph Structure Support
+
+FIXES:
+- ✅ Handle both dict and Series/DataFrame for price_data
+- ✅ Proper scalar conversion from Series
+- ✅ No FutureWarning
+- ✅ No "Series is ambiguous" error
+"""
+
 import torch
-from configs.config import TrainConfig  # Đồng bộ với Config
+import pickle
+import numpy as np
+import pandas as pd
+from torch_geometric.data import Data
+from configs.config import TrainConfig, GlobalConfig
+import os
+
 
 class data_prepare:
-    def __init__(self, data_path) -> None:
-        self.data_path = data_path
-
-    # ======================================================
-    # LABEL: RETURN Calculation
-    # r_t = close_t / close_{t-1} - 1
-    # ======================================================
-    def create_return(self, price_df):
-        df = price_df.copy()
-        df["return"] = df["close"] / df["close"].shift(1) - 1
-        df.dropna(inplace=True)
-        return df[["return"]]
-
-    def make_window(self, data, window_size):
+    """
+    Prepare stock movement prediction data with KG graph support.
+    
+    Key Features:
+    - Load pre-built KG graphs from tensor paths
+    - Proper normalization (Z-score for price/macro, L2 for news)
+    - Support for dynamic graph batching
+    - Handle both dict and Series format for price data
+    """
+    
+    def __init__(self, dataset_path: str):
         """
-        data: numpy array (T, D)
-        return: (N, window_size, D)
+        Args:
+            dataset_path: Path to unified_dataset.pkl
         """
-        X = []
-        for i in range(len(data) - window_size + 1):
-            X.append(data[i:i + window_size])
-        return np.array(X)
-
-    def prepare_data(
-        self,
-        stock_name,
-        window_size=TrainConfig.window_size, 
-        future_days=1,
-        train_ratio=getattr(TrainConfig, 'train_ratio', 0.70),
-        valid_ratio=getattr(TrainConfig, 'valid_ratio', 0.15),
-        flat_ratio=30 # Giữ lại tham số cũ dù không dùng trong logic mới để tránh lỗi gọi hàm
-    ):
-        # ==========================
-        # 1. LOAD DATA
-        # ==========================
+        with open(dataset_path, "rb") as f:
+            self.raw_data = pickle.load(f)
+        
+        self.window_size = TrainConfig.window_size
+        self.news_dim = TrainConfig.news_embed_dim  # Expected node feature dim
+        
+        print(f"📦 Loaded dataset with {len(self.raw_data)} trading days")
+    
+    def _load_graph_from_path(self, kg_tensor_path):
+        """
+        Load pre-built graph tensor from disk.
+        
+        Args:
+            kg_tensor_path: Path to saved .pt file containing graph data
+        
+        Returns:
+            Data: PyTorch Geometric Data object with x and edge_index
+                  or None if loading fails
+        """
+        if not kg_tensor_path or not isinstance(kg_tensor_path, str):
+            return None
+            
+        if not os.path.exists(kg_tensor_path):
+            # print(f"⚠️ Graph file not found: {kg_tensor_path}")
+            return None
+        
         try:
-            Data = pd.read_pickle(self.data_path)
-        except Exception as e:
-            print(f"❌ Error loading pickle file: {e}")
-            return {}, {}, {}
-
-        rows = {}
-        
-        for d, content in Data.items():
-            if "price" not in content or stock_name not in content["price"]:
-                continue
-
-            price = content["price"][stock_name]
-            macro = content["macro"]
-
-            # Lấy embedding tin tức (Giữ nguyên logic của bạn)
-            news_section = content.get("news_embedding", {})
-            raw_vec = news_section.get(stock_name)
-
-            if raw_vec is None:
-                news_vec = np.zeros(TrainConfig.news_embed_dim, dtype=np.float32)
+            graph_data = torch.load(kg_tensor_path, map_location='cpu')
+            
+            # Handle different save formats
+            if isinstance(graph_data, Data):
+                # Already a PyG Data object
+                return graph_data
+            
+            elif isinstance(graph_data, dict):
+                # Extract x and edge_index from dict
+                x = graph_data.get('x', graph_data.get('node_features'))
+                edge_index = graph_data.get('edge_index', torch.zeros(2, 0, dtype=torch.long))
+                
+                if x is None:
+                    return None
+                
+                # Ensure correct shapes
+                if x.dim() == 1:
+                    x = x.unsqueeze(0)  # (D,) -> (1, D)
+                
+                return Data(x=x, edge_index=edge_index)
+            
             else:
+                # Assume it's raw node features tensor
+                x = graph_data
+                if x.dim() == 1:
+                    x = x.unsqueeze(0)
+                
+                return Data(
+                    x=x,
+                    edge_index=torch.zeros(2, 0, dtype=torch.long)
+                )
+                
+        except Exception as e:
+            # print(f"❌ Error loading graph from {kg_tensor_path}: {e}")
+            return None
+    
+    def _create_empty_graph(self):
+        """Create placeholder graph for missing data."""
+        return Data(
+            x=torch.zeros(1, self.news_dim),
+            edge_index=torch.zeros(2, 0, dtype=torch.long)
+        )
+    
+    def prepare_data(self, target_ticker: str):
+        """
+        Prepare train/valid/test splits for a specific ticker.
+        
+        Args:
+            target_ticker: Stock ticker (e.g., "TSLA")
+        
+        Returns:
+            train_dict, valid_dict, test_dict: Dicts containing:
+                - s_o, s_h, s_c: Price features (T, W, 1)
+                - s_m: Macro features (T, W, macro_dim)
+                - s_n_graphs: List of PyG Data objects (length T)
+                - label: Labels (T,)
+        """
+        dates = sorted(self.raw_data.keys())
+        
+        # Collect raw data
+        rows = []
+        for date_key in dates:
+            day_data = self.raw_data[date_key]
+            
+            # Check if ticker has data
+            price_data = day_data.get("price", {}).get(target_ticker)
+            if price_data is None:
+                continue
+            
+            # ========================================
+            # FIX: Handle both dict and Series/DataFrame
+            # ========================================
+            if isinstance(price_data, dict):
+                # Dict format
+                s_o = price_data.get("Open") or price_data.get("open")
+                s_h = price_data.get("High") or price_data.get("high")
+                s_c = price_data.get("Close") or price_data.get("close")
+            else:
+                # DataFrame/Series format
                 try:
-                    news_vec = np.array(raw_vec, dtype=np.float32)
+                    # Try getting values
+                    if hasattr(price_data, '__getitem__'):
+                        s_o = price_data.get("Open", price_data.get("open", None))
+                        s_h = price_data.get("High", price_data.get("high", None))
+                        s_c = price_data.get("Close", price_data.get("close", None))
+                        
+                        # Convert Series to scalar
+                        if isinstance(s_o, pd.Series):
+                            s_o = s_o.iloc[0] if len(s_o) > 0 else None
+                        if isinstance(s_h, pd.Series):
+                            s_h = s_h.iloc[0] if len(s_h) > 0 else None
+                        if isinstance(s_c, pd.Series):
+                            s_c = s_c.iloc[0] if len(s_c) > 0 else None
+                    else:
+                        s_o = s_h = s_c = None
                 except Exception:
-                    news_vec = np.zeros(TrainConfig.news_embed_dim, dtype=np.float32)
-
-            news_dict = {f"news_{i}": v for i, v in enumerate(news_vec)}
-
-            rows[d] = {
-                **price,
-                **macro,
-                **news_dict
-            }
+                    s_o = s_h = s_c = None
+            
+            # Check validity (now safe - all scalars)
+            if s_o is None or s_h is None or s_c is None:
+                continue
+            
+            # Ensure float type
+            try:
+                # Handle Series properly (avoid FutureWarning)
+                if hasattr(s_o, 'iloc'):
+                    s_o = float(s_o.iloc[0])
+                else:
+                    s_o = float(s_o)
+                
+                if hasattr(s_h, 'iloc'):
+                    s_h = float(s_h.iloc[0])
+                else:
+                    s_h = float(s_h)
+                
+                if hasattr(s_c, 'iloc'):
+                    s_c = float(s_c.iloc[0])
+                else:
+                    s_c = float(s_c)
+            except (ValueError, TypeError):
+                continue
+            
+            # Extract macro
+            macro_data = day_data.get("macro", {})
+            
+            # Extract KG graph path
+            kg_tensor_path = day_data.get("kg_tensor", {}).get(target_ticker)
+            
+            rows.append({
+                "date": date_key,
+                "s_o": s_o,
+                "s_h": s_h,
+                "s_c": s_c,
+                "macro": macro_data,
+                "kg_path": kg_tensor_path
+            })
         
-        if not rows:
-            print(f"❌ No data found for stock {stock_name}")
+        if len(rows) < self.window_size + 1:
+            print(f"⚠️ {target_ticker}: Not enough data ({len(rows)} days)")
             return {}, {}, {}
-
-        df = pd.DataFrame.from_dict(rows, orient="index")
-        df.sort_index(inplace=True)
-
-        # ==========================
-        # 2. PRE-PROCESS FEATURES
-        # ==========================
-        price_df = df[["open", "high", "close"]].astype(float)
-
-        macro_df = df[
-            ["vix", "yield_spread_10y_2y",
-             "sp500", "sp500_return", "dxy", "wti"]
-        ].astype(float)
-
-        news_cols = [c for c in df.columns if c.startswith("news_")]
-        news_df = df[news_cols]
-        news_df = news_df.apply(pd.to_numeric, errors="coerce")
-        news_df = news_df.fillna(0.0)
-
-        # Tạo Return DataFrame (để tính nhãn)
-        return_df = self.create_return(price_df)
-
-        # Align Step 1
-        price_df = price_df.loc[return_df.index]
-        macro_df = macro_df.loc[return_df.index]
-        news_df  = news_df.loc[return_df.index]
-
-        # Log-Return cho Input Price (Chuẩn hóa input giá)
-        price_df = np.log(price_df / price_df.shift(1))
-        price_df.dropna(inplace=True)
-
-        # Align Step 2 (Final Alignment)
-        macro_df  = macro_df.loc[price_df.index]
-        news_df   = news_df.loc[price_df.index]
-        return_df = return_df.loc[price_df.index]
-
-        # Macro Clean
-        macro_df = macro_df.replace([np.inf, -np.inf], np.nan)
-        macro_df = macro_df.ffill().bfill()
-
-        # ==========================
-        # 3. WINDOWING
-        # ==========================
-        price_np  = price_df.values            
-        macro_np  = macro_df.values            
-        news_np   = news_df.values             
-        return_np = return_df.values           
-
-        price_win = self.make_window(price_np, window_size)
-        macro_win = self.make_window(macro_np, window_size)
-        news_win  = self.make_window(news_np, window_size)
-
-        # Cắt input để khớp với label (bỏ đoạn đuôi future_days)
-        price_win = price_win[:-future_days]
-        macro_win = macro_win[:-future_days]
-        news_win  = news_win[:-future_days]
-
-        # ==============================================================================
-        # [STRATEGY UPDATE] ROLLING QUANTILE LABELING (Dynamic & No Look-Ahead)
-        # ==============================================================================
         
-        # 1. Prepare Full Series
-        full_returns_series = pd.Series(return_np.flatten())
-        rolling_window = 20
+        print(f"📊 {target_ticker}: Collected {len(rows)} days with valid price data")
         
-        # 2. Tính Quantile động (33% và 66%) trên cửa sổ quá khứ
-        # [CRITICAL]: .shift(1) để loại bỏ Look-Ahead Bias. 
-        # Giá trị ngưỡng tại ngày t được tính từ [t-20 ... t-1], KHÔNG bao gồm t.
-        roll_low  = full_returns_series.rolling(window=rolling_window).quantile(0.33).shift(1)
-        roll_high = full_returns_series.rolling(window=rolling_window).quantile(0.66).shift(1)
+        # Create sliding windows
+        T = len(rows) - self.window_size
         
-        # 3. Vectorized Labeling
-        # Mặc định là FLAT (1)
-        labels_temp = np.full(len(full_returns_series), 1, dtype=int)
+        # Initialize arrays
+        s_o_all = np.zeros((T, self.window_size, 1))
+        s_h_all = np.zeros((T, self.window_size, 1))
+        s_c_all = np.zeros((T, self.window_size, 1))
         
-        # Điều kiện:
-        is_down = full_returns_series < roll_low
-        is_up   = full_returns_series > roll_high
+        # Determine macro dimension
+        first_macro = rows[0]["macro"]
+        macro_keys = sorted(first_macro.keys())
+        macro_dim = len(macro_keys)
+        s_m_all = np.zeros((T, self.window_size, macro_dim))
         
-        # [NOISE FILTER]: Nếu biến động tuyệt đối < 0.1% (0.001), ép về FLAT
-        # Tránh việc ép model học nhiễu trong thị trường đi ngang biên độ cực hẹp
-        is_noise = full_returns_series.abs() < 0.001
+        # Store graph paths (will load later)
+        graph_paths_all = []
         
-        # Gán nhãn (Thứ tự quan trọng: Noise filter ghi đè tất cả)
-        labels_temp[is_down] = 0
-        labels_temp[is_up]   = 2
-        labels_temp[is_noise] = 1 # Force Flat
+        labels = np.zeros(T, dtype=int)
         
-        # Xử lý NaN đầu chuỗi (do rolling window) -> Mặc định Flat
-        labels_temp[np.isnan(roll_low)] = 1
+        # Build windows
+        for t in range(T):
+            # Window data
+            window_rows = rows[t:t + self.window_size]
+            target_row = rows[t + self.window_size]
+            
+            # ========================================
+            # FIX: Proper scalar assignment
+            # ========================================
+            for w, row in enumerate(window_rows):
+                # Extract values (already scalars from above)
+                s_o_val = row["s_o"]
+                s_h_val = row["s_h"]
+                s_c_val = row["s_c"]
+                
+                # Additional safety: ensure float
+                s_o_all[t, w, 0] = float(s_o_val)
+                s_h_all[t, w, 0] = float(s_h_val)
+                s_c_all[t, w, 0] = float(s_c_val)
+                
+                # Fill macro
+                macro_vec = [row["macro"].get(k, 0) for k in macro_keys]
+                s_m_all[t, w, :] = macro_vec
+            
+            # Store graph path for target day
+            graph_paths_all.append(target_row["kg_path"])
+            
+            # ========================================
+            # FIX: Label calculation with scalar values
+            # ========================================
+            current_close = window_rows[-1]["s_c"]
+            next_close = target_row["s_c"]
+            
+            # Ensure scalars (already are, but double-check)
+            current_close = float(current_close)
+            next_close = float(next_close)
+            
+            if next_close > current_close * 1.005:
+                labels[t] = 2  # UP
+            elif next_close < current_close * 0.995:
+                labels[t] = 0  # DOWN
+            else:
+                labels[t] = 1  # FLAT
         
-        # 4. Slicing Label để khớp với Window Input
-        start_idx = window_size - 1 + future_days
-        if start_idx < len(labels_temp):
-            label_all = labels_temp[start_idx:]
-        else:
-            label_all = np.array([])
-
-        # [LOGGING] Kiểm tra phân phối
-        unique, counts = np.unique(label_all, return_counts=True)
-        dist = dict(zip(unique, counts))
-        total_lbl = sum(counts)
+        # ===== NORMALIZATION =====
+        # ✅ Z-score for Price & Macro (Proper for numeric features)
+        s_o_all = (s_o_all - s_o_all.mean()) / (s_o_all.std() + 1e-8)
+        s_h_all = (s_h_all - s_h_all.mean()) / (s_h_all.std() + 1e-8)
+        s_c_all = (s_c_all - s_c_all.mean()) / (s_c_all.std() + 1e-8)
+        s_m_all = (s_m_all - s_m_all.mean()) / (s_m_all.std() + 1e-8)
         
-        print(f" ⚖️  Label Distribution (Rolling Quantile 33/66): {dist}")
-        if total_lbl > 0:
-            p0 = dist.get(0,0)/total_lbl
-            p1 = dist.get(1,0)/total_lbl
-            p2 = dist.get(2,0)/total_lbl
-            print(f"      Down: {p0:.2%}, Flat: {p1:.2%}, Up: {p2:.2%}")
-
-        # ==========================
-        # 4. SPLIT DATASETS & NORMALIZATION (ANTI-LEAKAGE)
-        # ==========================
-        total_len = len(price_win)
-        idx_train = int(total_len * train_ratio)
-        idx_valid = int(total_len * (train_ratio + valid_ratio))
-
-        # [STRATEGY UPDATE]: Normalization (Fit on Train, Apply on All)
-        # Tính Mean/Std CHỈ trên tập Train
-        macro_mean = macro_win[:idx_train].mean(axis=(0, 1), keepdims=True)
-        macro_std  = macro_win[:idx_train].std(axis=(0, 1), keepdims=True) + 1e-6
+        # ✅ NO Z-score for News (preserve embedding geometry)
+        # Graphs will be L2-normalized in the model if needed
         
-        news_mean = news_win[:idx_train].mean(axis=(0, 1), keepdims=True)
-        news_std  = news_win[:idx_train].std(axis=(0, 1), keepdims=True) + 1e-6
-
-        # Transform toàn bộ
-        macro_win = (macro_win - macro_mean) / macro_std
-        news_win  = (news_win - news_mean) / news_std
-
-        def create_dataset(start, end):
-            if start >= end: return {}
-            return {
-                "s_o": torch.tensor(price_win[start:end, :, 0:1], dtype=torch.float32),
-                "s_h": torch.tensor(price_win[start:end, :, 1:2], dtype=torch.float32),
-                "s_c": torch.tensor(price_win[start:end, :, 2:3], dtype=torch.float32),
-                "s_m": torch.tensor(macro_win[start:end], dtype=torch.float32),
-                "s_n": torch.tensor(news_win[start:end], dtype=torch.float32),
-                "label": torch.tensor(label_all[start:end], dtype=torch.long),
-            }
-
-        train_data = create_dataset(0, idx_train)
-        valid_data = create_dataset(idx_train, idx_valid)
-        test_data  = create_dataset(idx_valid, total_len)
-
-        print(f"Stats: Train={len(train_data.get('label', []))}, Valid={len(valid_data.get('label', []))}, Test={len(test_data.get('label', []))}")
+        # Convert to tensors
+        s_o_tensor = torch.tensor(s_o_all, dtype=torch.float32)
+        s_h_tensor = torch.tensor(s_h_all, dtype=torch.float32)
+        s_c_tensor = torch.tensor(s_c_all, dtype=torch.float32)
+        s_m_tensor = torch.tensor(s_m_all, dtype=torch.float32)
+        label_tensor = torch.tensor(labels, dtype=torch.long)
+        
+        # Load graphs from paths
+        print(f"📊 Loading {T} graphs for {target_ticker}...")
+        graph_list = []
+        for path in graph_paths_all:
+            graph = self._load_graph_from_path(path)
+            if graph is None:
+                graph = self._create_empty_graph()
+            graph_list.append(graph)
+        
+        # Create dataset dict
+        dataset = {
+            "s_o": s_o_tensor,
+            "s_h": s_h_tensor,
+            "s_c": s_c_tensor,
+            "s_m": s_m_tensor,
+            "s_n_graphs": graph_list,  # List of Data objects
+            "label": label_tensor
+        }
+        
+        # Split train/valid/test
+        train_ratio = getattr(TrainConfig, "train_ratio", 0.7)
+        valid_ratio = getattr(TrainConfig, "valid_ratio", 0.15)
+        
+        train_end = int(T * train_ratio)
+        valid_end = int(T * (train_ratio + valid_ratio))
+        
+        train_data = {
+            "s_o": s_o_tensor[:train_end],
+            "s_h": s_h_tensor[:train_end],
+            "s_c": s_c_tensor[:train_end],
+            "s_m": s_m_tensor[:train_end],
+            "s_n_graphs": graph_list[:train_end],
+            "label": label_tensor[:train_end]
+        }
+        
+        valid_data = {
+            "s_o": s_o_tensor[train_end:valid_end],
+            "s_h": s_h_tensor[train_end:valid_end],
+            "s_c": s_c_tensor[train_end:valid_end],
+            "s_m": s_m_tensor[train_end:valid_end],
+            "s_n_graphs": graph_list[train_end:valid_end],
+            "label": label_tensor[train_end:valid_end]
+        }
+        
+        test_data = {
+            "s_o": s_o_tensor[valid_end:],
+            "s_h": s_h_tensor[valid_end:],
+            "s_c": s_c_tensor[valid_end:],
+            "s_m": s_m_tensor[valid_end:],
+            "s_n_graphs": graph_list[valid_end:],
+            "label": label_tensor[valid_end:]
+        }
+        
+        print(f"✅ {target_ticker}: Train={len(train_data['label'])}, "
+              f"Valid={len(valid_data['label'])}, Test={len(test_data['label'])}")
         
         return train_data, valid_data, test_data
