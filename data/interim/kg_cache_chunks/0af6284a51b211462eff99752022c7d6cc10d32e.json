@@ -1,1 +1,0 @@
-{"entities": ["Amazon.com, Inc.", "NASDAQ", "AMZN", "Twitch", "ByteDance", "TikTok", "Discovery Feed", "Bloomberg", "Benzinga Tech Trends"], "triples": [["Twitch", "competes with", "TikTok"], ["Twitch", "has introduced", "Discovery Feed"], ["Amazon.com, Inc.", "owns", "Twitch"], ["ByteDance", "owns", "TikTok"]]}

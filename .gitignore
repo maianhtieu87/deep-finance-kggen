@@ -17,3 +17,5 @@ data/
 *.pt
 *.parquet
 *.log
+*.json
+*.jsonl
