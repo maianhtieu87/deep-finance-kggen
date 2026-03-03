@@ -1,264 +1,263 @@
+# validate_contribution.py - PERFORMANCE DEEP DIVE (V2 COMPATIBLE)
+"""
+Script phân tích sâu hiệu suất mô hình (Deep Dive Analysis) cho phiên bản V2.
+- Hỗ trợ GNN (Graph Neural Networks) thông qua DataLoader.
+- Chạy qua luồng Sequential MSGCA chuẩn xác từ model.py.
+- Phân tích chi tiết: Phân phối nhãn, Mode Collapse, Confusion Matrix.
+"""
+
 import torch
 import numpy as np
 import os
-import pandas as pd
-from sklearn.metrics import accuracy_score, matthews_corrcoef, classification_report
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score, matthews_corrcoef
+from collections import Counter
+from torch.utils.data import DataLoader, Dataset
 
-# Import modules từ dự án
+# Import project modules
 from src.model import StockMovementModel
 from src.data_loader import data_prepare
 from configs.config import TrainConfig, GlobalConfig
-from main import merge_datasets, set_seed  # KHÔNG cần StockDataset, compute_class_weights
 
 # --- CONFIG ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL_PATH = os.path.join("output", "best_model.pt")  # Đường dẫn model tốt nhất
-
-# ✅ Dùng đúng path trong project hiện tại
+MODEL_PATH = os.path.join("output", "best_model.pt")
 DATA_PATH = os.path.join(GlobalConfig.PROCESSED_PATH, "unified_dataset_test.pkl")
-TARGET_TICKERS = ["TSLA", "AMZN", "MSFT", "NFLX"]
 
+# ============================================
+# UTILITIES FOR GRAPH BATCHING (V2)
+# ============================================
 
-def run_ablation_test():
-    print("=" * 60)
-    print("🧪 MODULE CONTRIBUTION ANALYSIS (ABLATION STUDY)")
-    print("=" * 60)
+class StockGraphDataset(Dataset):
+    """Dataset để bọc dữ liệu đa phương thức có chứa Graph cho V2"""
+    def __init__(self, data_dict):
+        self.s_o = data_dict["s_o"]
+        self.s_h = data_dict["s_h"]
+        self.s_c = data_dict["s_c"]
+        self.s_m = data_dict["s_m"]
+        self.s_n_graphs = data_dict["s_n_graphs"]
+        self.label = data_dict["label"]
 
-    # 1. LOAD DATA (TEST SET)
-    print("\n📥 Loading TEST Data...")
-    print(f"   Using DATA_PATH = {DATA_PATH}")
+    def __len__(self):
+        return len(self.label)
+
+    def __getitem__(self, idx):
+        return {
+            "s_o": self.s_o[idx],
+            "s_h": self.s_h[idx],
+            "s_c": self.s_c[idx],
+            "s_m": self.s_m[idx],
+            "s_n_graph": self.s_n_graphs[idx],
+            "label": self.label[idx],
+        }
+
+def collate_graph_batch(batch):
+    """Hàm gom batch cho Pytorch Geometric"""
+    s_o_batch = torch.stack([item["s_o"] for item in batch])
+    s_h_batch = torch.stack([item["s_h"] for item in batch])
+    s_c_batch = torch.stack([item["s_c"] for item in batch])
+    s_m_batch = torch.stack([item["s_m"] for item in batch])
+    
+    s_n_graphs = [item["s_n_graph"] for item in batch]
+    label_batch = torch.stack([item["label"] for item in batch])
+    
+    return {
+        "s_o": s_o_batch,
+        "s_h": s_h_batch,
+        "s_c": s_c_batch,
+        "s_m": s_m_batch,
+        "s_n_graphs": s_n_graphs,
+        "label": label_batch,
+    }
+
+# ============================================
+# ANALYSIS LOGIC
+# ============================================
+
+def print_header(title):
+    print(f"\n{'='*60}")
+    print(f"🔎 {title}")
+    print(f"{'='*60}")
+
+def load_data_per_ticker(tickers):
+    """
+    Load dữ liệu Test riêng biệt cho từng mã để phân tích behavior.
+    Sử dụng V2 data_prepare.
+    """
     dp = data_prepare(DATA_PATH)
-    list_test = []
-
-    # Load 1 sample để lấy dimension config
-    sample_dim_check = None
-
-    for ticker in TARGET_TICKERS:
+    ticker_datasets = {}
+    
+    print(f"📥 Loading TEST data for: {tickers}")
+    for t in tickers:
         try:
-            _, _, te = dp.prepare_data(ticker)
-            if te and len(te.get("label", [])) > 0:
-                list_test.append(te)
-                if sample_dim_check is None:
-                    sample_dim_check = te
-                print(f"   ✅ {ticker}: {len(te['label'])} test samples")
+            # prepare_data trả về: train, valid, test (index 2)
+            _, _, test_data = dp.prepare_data(target_ticker=t)
+            
+            if test_data and len(test_data.get("label", [])) > 0:
+                ticker_datasets[t] = test_data
+                print(f"   ✅ {t}: {len(test_data['label'])} samples")
             else:
-                print(f"   ⚠️ {ticker}: no test data.")
+                print(f"   ⚠️ {t}: No data or empty test set")
         except Exception as e:
-            print(f"   ❌ {ticker}: error when loading test data: {e}")
+            print(f"   ❌ {t}: Error {e}")
+            
+    return ticker_datasets
 
-    if not list_test:
-        print("❌ Error: No test data found.")
-        return
+def run_prediction(model, data_dict):
+    """
+    Chạy forward pass qua DataLoader để tránh Over-Of-Memory với Graph V2.
+    Lấy Logits và Predictions thông qua model(..., mode="logits").
+    """
+    dataset = StockGraphDataset(data_dict)
+    loader = DataLoader(
+        dataset, 
+        batch_size=32, 
+        shuffle=False, 
+        collate_fn=collate_graph_batch
+    )
+    
+    model.eval()
+    all_preds, all_labels, all_probs = [], [], []
+    
+    with torch.no_grad():
+        for batch in loader:
+            # Gọi trực tiếp qua mô hình V2 (đã tích hợp Hợp nhất tuần tự & GNN)
+            logits = model(
+                s_o=batch["s_o"].to(DEVICE),
+                s_h=batch["s_h"].to(DEVICE),
+                s_c=batch["s_c"].to(DEVICE),
+                s_m=batch["s_m"].to(DEVICE),
+                s_n_graphs=batch["s_n_graphs"],
+                mode="logits"
+            )
+            
+            # Probability & Prediction
+            probs = torch.softmax(logits, dim=1)
+            preds = torch.argmax(logits, dim=1)
+            
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(batch["label"].cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+            
+    return np.array(all_preds), np.array(all_labels), np.array(all_probs)
 
-    final_test = merge_datasets(list_test, shuffle=False)
-    print(f"\n✅ Total Test Samples (merged): {len(final_test['label'])}")
-
-    # Lấy Dimension thực tế từ dữ liệu
-    s_m_dim = sample_dim_check["s_m"].shape[-1]
-
-    # 2. LOAD TRAINED MODEL
-    print(f"\n🤖 Loading Model from: {MODEL_PATH}")
+def analyze_performance():
+    # 1. Load Model
+    print_header("1. LOADING MODEL")
     if not os.path.exists(MODEL_PATH):
-        print("❌ Model file not found! Please train a model first.")
+        print(f"❌ Cannot find model at {MODEL_PATH}")
         return
 
-    # Dummy weights chỉ để init; eval không dùng loss
-    dummy_weights = torch.tensor([1.0, 1.0, 1.0])
+    # Lấy dimension macro thực tế để init model cho đúng
+    dp = data_prepare(DATA_PATH)
+    dummy_train, _, _ = dp.prepare_data("TSLA") 
+    if dummy_train:
+        macro_dim = dummy_train["s_m"].shape[-1]
+    else:
+        macro_dim = 6 # Fallback
+    
+    print(f"🔧 Model Config: Dim={TrainConfig.dim}, Heads={TrainConfig.num_head}, Macro={macro_dim}")
 
+    # Khởi tạo model architecture chuẩn V2 (GNN + Sequential Fusion)
+    # Khởi tạo model architecture chuẩn V2 (GNN + Sequential Fusion)
     model = StockMovementModel(
         price_dim=1,
-        macro_dim=s_m_dim,
+        macro_dim=macro_dim,
         news_dim=TrainConfig.news_embed_dim,
-        dim=TrainConfig.dim,
+        dim=TrainConfig.dim,                 
         input_dim=TrainConfig.window_size,
         output_dim=TrainConfig.output_dim,
-        num_head=TrainConfig.num_head,
-        dropout=0.0,  # Tắt dropout khi test
-        class_weights=dummy_weights,
-        use_focal_loss=True,
+        num_head=TrainConfig.num_head,       
         device=DEVICE,
+        dropout=0.0,                         # Eval mode không cần dropout
+        class_weights=None,                  # Eval không cần tính loss
+        use_focal_loss=False,                # Eval không cần Focal
+        use_gnn=True,                        # BẬT GNN cho V2
+        gnn_type="gat",                      
+        gnn_hidden_dim=512,                  # 🟢 SỬA TỪ 256 THÀNH 512
+        gnn_num_layers=3,                    # 🟢 SỬA TỪ 2 THÀNH 3
     ).to(DEVICE)
+    
+    try:
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+        print("✅ Weights loaded successfully!")
+    except Exception as e:
+        print(f"❌ Error loading weights: {e}")
+        return
 
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-    model.eval()
-    print("🔧 Loss Strategy: FOCAL LOSS (γ=2.0) + ALPHA BALANCING ✅")
-    print("   ► Alpha weights: [1. 1. 1.]")
-    print("✅ Model Loaded Successfully.")
+    # 2. Load Data
+    print_header("2. LOADING DATA")
+    target_tickers = ["TSLA", "AMZN", "MSFT", "NFLX"] 
+    datasets = load_data_per_ticker(target_tickers)
+    
+    if not datasets:
+        print("❌ No datasets loaded.")
+        return
 
-    # 3. DEFINE ABLATION EXPERIMENTS
-    experiments = [
-        {"name": "BASELINE (Full Info)", "mask_price": False, "mask_macro": False, "mask_news": False},
-        {"name": "NO MACRO (Price+News)", "mask_price": False, "mask_macro": True, "mask_news": False},
-        {"name": "NO NEWS  (Price+Macro)", "mask_price": False, "mask_macro": False, "mask_news": True},
-        {"name": "PRICE ONLY", "mask_price": True, "mask_macro": True, "mask_news": True},
-        {
-            "name": "NEWS ONLY (KG branch)",
-            "mask_price": True,
-            "mask_macro": True,
-            "mask_news": False,
-            "is_news_only": True,
-        },
-    ]
+    # 3. Deep Dive Analysis
+    print_header("3. DEEP DIVE ANALYSIS PER TICKER")
+    
+    all_preds = []
+    all_labels = []
+    
+    print(f"{'TICKER':<10} | {'SAMPLES':<8} | {'ACTUAL DIST (0/1/2)':<25} | {'PRED DIST (0/1/2)':<25} | {'ACC':<8} | {'MCC':<8}")
+    print("-" * 110)
 
-    results = []
+    for ticker, data in datasets.items():
+        preds, labels, probs = run_prediction(model, data)
+        
+        all_preds.extend(preds)
+        all_labels.extend(labels)
+        
+        acc = accuracy_score(labels, preds)
+        mcc = matthews_corrcoef(labels, preds)
+        
+        # Count distributions
+        act_counts = Counter(labels)
+        pred_counts = Counter(preds)
+        
+        act_dist = f"{act_counts.get(0,0)}/{act_counts.get(1,0)}/{act_counts.get(2,0)}"
+        pred_dist = f"{pred_counts.get(0,0)}/{pred_counts.get(1,0)}/{pred_counts.get(2,0)}"
+        
+        print(f"{ticker:<10} | {len(labels):<8} | {act_dist:<25} | {pred_dist:<25} | {acc:.4f}   | {mcc:.4f}")
 
-    print("\n🚀 Running Inference Tests...")
-
-    news_only_y_true = None
-    news_only_y_pred = None
-
-    for exp in experiments:
-        exp_name = exp["name"]
-        print(f"   Running: {exp_name}...", end="")
-
-        is_news_only = exp.get("is_news_only", False)
-
-        acc, mcc, y_true, y_pred = evaluate_with_masking(
-            model,
-            final_test,
-            mask_price=exp["mask_price"],
-            mask_macro=exp["mask_macro"],
-            mask_news=exp["mask_news"],
-            return_preds=is_news_only,
-        )
-
-        results.append(
-            {
-                "Scenario": exp_name,
-                "ACC": acc,
-                "MCC": mcc,
-                "Diff MCC": 0.0,
-            }
-        )
-        print(f" Done. (MCC: {mcc:.4f})")
-
-        if is_news_only and y_true is not None and y_pred is not None:
-            news_only_y_true = y_true
-            news_only_y_pred = y_pred
-
-    print("\n" + "=" * 60)
-    print("📊 CONTRIBUTION REPORT")
-    print("=" * 60)
-
-    baseline_mcc = results[0]["MCC"]
-
-    df_res = pd.DataFrame(results)
-    df_res["Diff MCC"] = df_res["MCC"] - baseline_mcc
-    df_res["Impact"] = df_res["Diff MCC"].apply(
-        lambda x: "🔻 HURT" if x < -0.01 else ("✅ HELP" if x > 0.01 else "⚪ NEUTRAL")
-    )
-
-    print(
-        df_res.to_string(
-            index=False,
-            formatters={
-                "ACC": "{:.4f}".format,
-                "MCC": "{:.4f}".format,
-                "Diff MCC": "{:+.4f}".format,
-            },
-        )
-    )
-
-    print("\n📝 INTERPRETATION:")
-    print("   - Nếu 'Diff MCC' ÂM LỚN (vd: -0.05): Module đó QUAN TRỌNG (bỏ đi làm model ngu đi).")
-    print("   - Nếu 'Diff MCC' GẦN 0 (vd: -0.00): Module đó ÍT ĐƯỢC DÙNG (model gần như ignore).")
-    print("   - Nếu 'Diff MCC' DƯƠNG (vd: +0.02): Module đó CÓ THỂ GÂY NHIỄU (bỏ đi model lại chạy tốt hơn).")
-
-    # 6. PHÂN TÍCH RIÊNG CASE NEWS ONLY
-    if news_only_y_true is not None and news_only_y_pred is not None:
-        print("\n" + "=" * 60)
-        print("🔍 DEEP DIVE: NEWS ONLY (KG branch)")
-        print("=" * 60)
-
-        unique_act, counts_act = np.unique(news_only_y_true, return_counts=True)
-        unique_pred, counts_pred = np.unique(news_only_y_pred, return_counts=True)
-
-        print("📉 ACTUAL label distribution (0=DOWN,1=FLAT,2=UP):")
-        print(f"   {dict(zip(unique_act, counts_act))}")
-
-        print("\n🔮 PREDICTED label distribution (NEWS ONLY):")
-        print(f"   {dict(zip(unique_pred, counts_pred))}")
-
-        print("\n📊 Confusion Matrix (NEWS ONLY):")
-        from sklearn.metrics import confusion_matrix
-
-        cm = confusion_matrix(news_only_y_true, news_only_y_pred, labels=[0, 1, 2])
-        print(f"      Pred 0  Pred 1  Pred 2")
-        print(f"Act 0   {cm[0][0]:<7} {cm[0][1]:<7} {cm[0][2]:<7}")
-        print(f"Act 1   {cm[1][0]:<7} {cm[1][1]:<7} {cm[1][2]:<7}")
-        print(f"Act 2   {cm[2][0]:<7} {cm[2][1]:<7} {cm[2][2]:<7}")
-
-        print("\n📋 Classification Report (NEWS ONLY):")
-        print(
-            classification_report(
-                news_only_y_true,
-                news_only_y_pred,
-                target_names=["DOWN", "FLAT", "UP"],
-                zero_division=0,
-            )
-        )
-
-
-def evaluate_with_masking(
-    model,
-    data_dict,
-    mask_price: bool = False,
-    mask_macro: bool = False,
-    mask_news: bool = False,
-    return_preds: bool = False,
-):
-    """
-    Evaluate với khả năng 'tắt' (mask) các nguồn dữ liệu bằng cách đưa về 0.
-    """
-
-    # Price
-    s_o = data_dict["s_o"].to(DEVICE)
-    s_h = data_dict["s_h"].to(DEVICE)
-    s_c = data_dict["s_c"].to(DEVICE)
-
-    if mask_price:
-        s_o = torch.zeros_like(s_o).to(DEVICE)
-        s_h = torch.zeros_like(s_h).to(DEVICE)
-        s_c = torch.zeros_like(s_c).to(DEVICE)
-
-    # Macro
-    if mask_macro:
-        s_m = torch.zeros_like(data_dict["s_m"]).to(DEVICE)
-    else:
-        s_m = data_dict["s_m"].to(DEVICE)
-
-    # News / KG
-    if mask_news:
-        s_n = torch.zeros_like(data_dict["s_n"]).to(DEVICE)
-    else:
-        s_n = data_dict["s_n"].to(DEVICE)
-
-    label = data_dict["label"].to(DEVICE)
-
-    with torch.no_grad():
-        v_m, v_i, v_n = model.multimodal_encoder(s_o, s_h, s_c, s_m, s_n)
-
-        fused_news = model.fusion_news(primary=v_i, aux=v_n)
-        fused_macro = model.fusion_macro(primary=v_i, aux=v_m)
-
-        v_fused_total = (fused_news + fused_macro) / 2.0
-
-        logits = model.movement_predictor(fused_seq=v_fused_total, orig_seq=v_i)
-        probs = torch.softmax(logits, dim=1)
-        preds = torch.argmax(probs, dim=1)
-
-    y_true = label.cpu().numpy()
-    y_pred = preds.cpu().numpy()
-
-    acc = accuracy_score(y_true, y_pred)
-    mcc = matthews_corrcoef(y_true, y_pred)
-
-    if return_preds:
-        return acc, mcc, y_true, y_pred
-    else:
-        return acc, mcc, None, None
-
+    # 4. Global Analysis
+    print_header("4. GLOBAL SUMMARY (ALL TICKERS COMBINED)")
+    
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    
+    unique_act, counts_act = np.unique(all_labels, return_counts=True)
+    unique_pred, counts_pred = np.unique(all_preds, return_counts=True)
+    
+    print("📉 ACTUAL Labels Distribution (Ground Truth):")
+    act_dist_dict = dict(zip(unique_act, counts_act))
+    print(f"   {act_dist_dict}")
+    
+    # Tính toán tỷ lệ phần trăm
+    total_act = sum(counts_act)
+    if total_act > 0:
+        p0 = act_dist_dict.get(0,0)/total_act*100
+        p1 = act_dist_dict.get(1,0)/total_act*100
+        p2 = act_dist_dict.get(2,0)/total_act*100
+        print(f"   (Down: {p0:.1f}%, Flat: {p1:.1f}%, Up: {p2:.1f}%)")
+    
+    print("\n🔮 PREDICTED Labels Distribution:")
+    print(f"   {dict(zip(unique_pred, counts_pred))}")
+    
+    # Check Mode Collapse
+    if len(unique_pred) == 1:
+        print("\n⚠️  CRITICAL WARNING: MODE COLLAPSE DETECTED!")
+        print(f"   Mô hình chỉ dự đoán duy nhất lớp {unique_pred[0]} cho toàn bộ dữ liệu.")
+    
+    print("\n📊 Confusion Matrix:")
+    cm = confusion_matrix(all_labels, all_preds, labels=[0, 1, 2])
+    print(f"      Pred 0  Pred 1  Pred 2")
+    print(f"Act 0   {cm[0][0]:<7} {cm[0][1]:<7} {cm[0][2]:<7}")
+    print(f"Act 1   {cm[1][0]:<7} {cm[1][1]:<7} {cm[1][2]:<7}")
+    print(f"Act 2   {cm[2][0]:<7} {cm[2][1]:<7} {cm[2][2]:<7}")
+    
+    print("\n📋 Classification Report:")
+    print(classification_report(all_labels, all_preds, target_names=['DOWN', 'FLAT', 'UP'], zero_division=0))
 
 if __name__ == "__main__":
-    set_seed(42)
-    run_ablation_test()
+    analyze_performance()

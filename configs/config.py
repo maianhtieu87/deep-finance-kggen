@@ -70,10 +70,10 @@ class TrainConfig:
     # === Basic Training ===
     seed = 42
     use_cuda = True
-    batch_size = 64
+    batch_size = 32
     epoch_num = 200
     learning_rate = 1e-4
-    weight_decay = 1e-5
+    weight_decay = 1e-4
     
     # === Data Splits ===
     train_ratio = 0.7
@@ -82,7 +82,7 @@ class TrainConfig:
     
     # === Model Architecture ===
     window_size = 20        # Temporal window (days)
-    dim = 128               # Hidden dimension
+    dim = 256               # Hidden dimension
     output_dim = 3          # Classes: DOWN, FLAT, UP
     num_head = 4            # Attention heads
     
@@ -92,8 +92,8 @@ class TrainConfig:
     # ===== GNN PARAMETERS (NEW) =====
     use_gnn = True                  # Enable Graph Neural Network
     gnn_type = "gat"               # Options: "sage", "gat"
-    gnn_hidden_dim = 256            # GNN hidden layer dimension
-    gnn_num_layers = 2              # Number of GNN layers
+    gnn_hidden_dim = 512            # GNN hidden layer dimension
+    gnn_num_layers = 3              # Number of GNN layers
     gnn_heads = 4                   # GAT attention heads (if gnn_type="gat")
     gnn_pool = "attention"          # Pooling method: "mean", "max", "attention"
     gnn_dropout = 0.1               # Dropout in GNN layers
@@ -106,8 +106,8 @@ class TrainConfig:
     
     # ===== ENTITY RESOLUTION (KG) =====
     use_improved_resolver = True    # Use 2-step resolution
-    resolver_kmeans_k = 128         # KMeans clusters for entity resolution
-    resolver_min_cluster = 2        # Min entities per cluster
+    resolver_kmeans_k = 64         # KMeans clusters for entity resolution
+    resolver_min_cluster = 3        # Min entities per cluster
     
     # ===== KG PROCESSING =====
     kg_window_days = 20             # Days to aggregate for graph building
@@ -132,8 +132,8 @@ class ModelConfig:
     kg_node_dim = 128  # Should match TrainConfig.news_embed_dim
     
     # GNN architecture (overridden by TrainConfig if use_gnn=True)
-    kg_use_sage = True
-    kg_use_gat = False
+    kg_use_sage = False
+    kg_use_gat = True
     kg_sage_aggr = "mean"  # "mean", "max", "sum"
     
     # === Fusion ===

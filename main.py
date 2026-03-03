@@ -248,8 +248,8 @@ def train_model(train_data: dict, valid_data: dict, test_data: dict):
         num_head=TrainConfig.num_head,
         dropout=0.1,
         class_weights=class_weights,
-        use_focal_loss=True,
-        focal_gamma=1.0,  
+        use_focal_loss=TrainConfig.use_focal_loss,
+        focal_gamma=TrainConfig.focal_gamma,  
         device=device,
         # GNN params
         use_gnn=use_gnn,
