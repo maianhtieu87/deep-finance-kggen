@@ -1,229 +1,283 @@
-# configs/config.py - UPDATED WITH GNN PARAMETERS
+# configs/config.py
 """
-Configuration file with GNN support
+Configuration — 9-ticker universe + GNN/KG pipeline settings.
 
-CHANGES:
-- Added GNN-specific parameters to TrainConfig
-- Updated documentation
+Tickers: TSLA  AAPL  AMZN  MSFT  GOOGL  META  BA  JPM  WMT
 """
 
 import os
 from datetime import datetime
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# GLOBAL
+# ─────────────────────────────────────────────────────────────────────────────
+
 class GlobalConfig:
-    """Global configuration for data paths and processing."""
-    
-    # === Project Paths ===
-    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    DATA_DIR = os.path.join(BASE_DIR, "data")
-    
-    RAW_PATH = os.path.join(DATA_DIR, "raw")
-    RAW_PRICE_PATH = os.path.join(RAW_PATH, "price")
-    RAW_MACRO_PATH = os.path.join(RAW_PATH, "macro")
-    RAW_NEWS_PATH = os.path.join(RAW_PATH, "news")
+
+    # Paths
+    BASE_DIR         = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    DATA_DIR         = os.path.join(BASE_DIR, "data")
+    RAW_PATH         = os.path.join(DATA_DIR, "raw")
+    RAW_PRICE_PATH   = os.path.join(RAW_PATH, "price")
+    RAW_MACRO_PATH   = os.path.join(RAW_PATH, "macro")
+    RAW_NEWS_PATH    = os.path.join(RAW_PATH, "news")
     RAW_FILINGS_PATH = os.path.join(RAW_PATH, "filings")
-    
-    INTERIM_PATH = os.path.join(DATA_DIR, "interim")
-    PROCESSED_PATH = os.path.join(DATA_DIR, "processed")
-    
-    # === Data Collection Config ===
+    INTERIM_PATH     = os.path.join(DATA_DIR, "interim")
+    PROCESSED_PATH   = os.path.join(DATA_DIR, "processed")
+
+    # Date range
     START_DATE = "2022-01-01"
-    END_DATE = "2024-12-31"
-    
-    # Target stocks
-    TICKERS = ["TSLA", "AMZN", "MSFT", "NFLX"]
-    
+    END_DATE   = "2025-06-23"
+
+    # ── Target universe (9 tickers) ──────────────────────────────────────────
+    TICKERS = ["TSLA", "AAPL", "AMZN", "MSFT", "GOOGL", "META", "BA", "JPM", "WMT"]
+
+    # Sectors for reference (used by any downstream analysis, not by extractor)
+    TICKER_SECTOR = {
+        "TSLA":  "Consumer Discretionary",
+        "AAPL":  "Technology",
+        "AMZN":  "Consumer Discretionary",
+        "MSFT":  "Technology",
+        "GOOGL": "Technology",
+        "META":  "Technology",
+        "BA":    "Industrials",
+        "JPM":   "Financials",
+        "WMT":   "Consumer Staples",
+    }
+
+    # Raw → canonical ticker mapping (identity for clean symbols)
+    TICKER_MAPPING = {t: t for t in TICKERS}
+
     # Macro indicators
     MACRO_SYMBOLS = [
-        "^GSPC",    # S&P 500
-        "^DJI",     # Dow Jones
-        "^IXIC",    # NASDAQ
-        "^VIX",     # Volatility Index
-        "^TNX",     # 10-Year Treasury Yield
+        "^GSPC",   # S&P 500
+        "^DJI",    # Dow Jones
+        "^IXIC",   # NASDAQ
+        "^VIX",    # Volatility Index
+        "^TNX",    # 10-Year Treasury Yield
     ]
-    
-    # Ticker mapping (raw -> clean)
-    TICKER_MAPPING = {
-        "TSLA": "TSLA",
-        "AMZN": "AMZN",
-        "MSFT": "MSFT",
-        "NFLX": "NFLX",
-    }
-        # --- Voyage Embedding Settings (nếu dùng lại text-embedding) ---
-    EMBED_MODEL = "voyage-3-large"
-    MAX_RETRIES = 6
-    BACKOFF_BASE = 30
+
+    # ── Voyage Embedding ─────────────────────────────────────────────────────
+    EMBED_MODEL      = "voyage-3-large"
+    MAX_RETRIES      = 6
+    BACKOFF_BASE     = 30
     MAX_TEXTS_PER_REQ = 40
-
-    PAYMENT_ADDED = True 
-
+    PAYMENT_ADDED    = True
     VOYAGE_RATE_LIMITS = {
-        True:  {"RPM": 50, "TPM": 400_000, "SLEEP": 1.0},
-        False: {"RPM": 3,  "TPM": 10_000,  "SLEEP": 20.0}
+        True:  {"RPM": 50,  "TPM": 400_000, "SLEEP": 1.0},
+        False: {"RPM": 3,   "TPM": 10_000,  "SLEEP": 20.0},
     }
-    VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY", "")
+    VOYAGE_API_KEY   = os.getenv("VOYAGE_API_KEY", "")
+
+    # ── KG / Cache paths ─────────────────────────────────────────────────────
+    # These match the defaults in KGGenNewsEmbedder so test scripts and
+    # production runs share the same disk cache automatically.
+    KG_CACHE_DIRNAME        = "kg_article_cache"
+    KG_VOYAGE_CACHE_DIRNAME = "kg_voyage_emb_cache"
+
+    @classmethod
+    def kg_cache_dir(cls) -> str:
+        return os.path.join(cls.INTERIM_PATH, cls.KG_CACHE_DIRNAME)
+
+    @classmethod
+    def kg_voyage_cache_dir(cls) -> str:
+        return os.path.join(cls.INTERIM_PATH, cls.KG_VOYAGE_CACHE_DIRNAME)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRAINING
+# ─────────────────────────────────────────────────────────────────────────────
 
 class TrainConfig:
-    """Training configuration with GNN parameters."""
-    
-    # === Basic Training ===
-    seed = 42
-    use_cuda = True
-    batch_size = 32
-    epoch_num = 200
+
+    # Basic
+    seed          = 42
+    use_cuda      = True
+    batch_size    = 32
+    epoch_num     = 200
     learning_rate = 1e-4
-    weight_decay = 1e-4
-    
-    # === Data Splits ===
+    weight_decay  = 1e-4
+
+    # Data splits
     train_ratio = 0.7
     valid_ratio = 0.15
     # test_ratio = 0.15 (implicit)
-    
-    # === Model Architecture ===
-    window_size = 20        # Temporal window (days)
-    dim = 256               # Hidden dimension
-    output_dim = 3          # Classes: DOWN, FLAT, UP
-    num_head = 4            # Attention heads
-    
-    # === Feature Dimensions ===
-    news_embed_dim = 128    # Node feature dimension from KG
-    
-    # ===== GNN PARAMETERS (NEW) =====
-    use_gnn = True                  # Enable Graph Neural Network
-    gnn_type = "gat"               # Options: "sage", "gat"
-    gnn_hidden_dim = 512            # GNN hidden layer dimension
-    gnn_num_layers = 3              # Number of GNN layers
-    gnn_heads = 4                   # GAT attention heads (if gnn_type="gat")
-    gnn_pool = "attention"          # Pooling method: "mean", "max", "attention"
-    gnn_dropout = 0.1               # Dropout in GNN layers
-    
-    # ===== LOSS FUNCTION =====
-    use_focal_loss = True           # Use Focal Loss for imbalanced data
-    focal_gamma = 2.0               # Focal loss gamma parameter
-    use_label_smoothing = False     # Alternative: Label smoothing
-    label_smoothing = 0.1           # Smoothing factor if enabled
-    
-    # ===== ENTITY RESOLUTION (KG) =====
-    use_improved_resolver = True    # Use 2-step resolution
-    resolver_kmeans_k = 64         # KMeans clusters for entity resolution
-    resolver_min_cluster = 3        # Min entities per cluster
-    
-    # ===== KG PROCESSING =====
-    kg_window_days = 20             # Days to aggregate for graph building
-    kg_top_triples = 5              # Top triples per article
-    kg_use_voyage = True            # Use Voyage AI for embeddings
-    kg_allow_llm = False            # Allow LLM calls for missing data
 
+    # Architecture
+    window_size = 20    # Temporal window (trading days)
+    dim         = 256   # Hidden dimension throughout fusion layers
+    output_dim  = 3     # Classes: DOWN(0) FLAT(1) UP(2)
+    num_head    = 4     # Cross-attention heads
+
+    # Feature dimensions
+    # news_embed_dim = GATv2 graph_out_dim — must match KGGraphEncoderGATv2.output_dim
+    news_embed_dim  = 128
+
+    # ── GNN ──────────────────────────────────────────────────────────────────
+    use_gnn        = True
+    gnn_type       = "gat"       # "gat" | "sage"
+    gnn_hidden_dim = 128
+    gnn_num_layers = 2
+    gnn_heads      = 4           # 128 / 4 = 32 per head
+    gnn_pool       = "mean"      # "mean" | "max" | "attention"
+
+    # Node feature dim: 1024 (Voyage) + 8 (entity_type one-hot) + 1 (target_flag)
+    kg_node_dim      = 1033
+    # Edge attr dim: 14 (relation one-hot) + 1 (confidence) + 1 (price_impact) + 1 (relevance)
+    kg_edge_attr_dim = 17
+
+    # ── Loss ─────────────────────────────────────────────────────────────────
+    use_focal_loss      = True
+    focal_gamma         = 2.0
+    use_label_smoothing = False
+    label_smoothing     = 0.1
+
+    # ── KG Processing ────────────────────────────────────────────────────────
+    kg_window_days  = 20     # Rolling window for graph aggregation
+    kg_top_triples  = 5      # Max triples per article (soft cap)
+    kg_use_voyage   = True
+    kg_allow_llm    = False  # Allow LLM calls for cache-missing articles during graph rebuild
+
+    # ── Entity Resolution ────────────────────────────────────────────────────
+    use_improved_resolver  = True
+    resolver_kmeans_k      = 64
+    resolver_min_cluster   = 3
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODEL
+# ─────────────────────────────────────────────────────────────────────────────
 
 class ModelConfig:
-    """Model-specific hyperparameters."""
-    
-    # === Price Encoder ===
+
+    # Price encoder
     price_lstm_hidden = 64
     price_lstm_layers = 2
-    
-    # === Macro Encoder ===
+
+    # Macro encoder
     macro_lstm_hidden = 64
     macro_lstm_layers = 2
-    
-    # === News/KG Encoder (GNN) ===
-    # Node feature input dimension
-    kg_node_dim = 128  # Should match TrainConfig.news_embed_dim
-    
-    # GNN architecture (overridden by TrainConfig if use_gnn=True)
-    kg_use_sage = False
-    kg_use_gat = True
-    kg_sage_aggr = "mean"  # "mean", "max", "sum"
-    
-    # === Fusion ===
-    fusion_num_heads = 4
-    fusion_dropout = 0.1
-    
-    # === Predictor ===
-    predictor_hidden_dim = 256
-    predictor_dropout = 0.1
 
+    # KG / GNN encoder
+    # Must match TrainConfig.kg_node_dim — node features fed into KGGraphEncoderGATv2
+    kg_node_dim      = 1033   # 1024 (Voyage) + 8 (entity_type) + 1 (target_flag)
+    kg_edge_attr_dim = 17     # 14 (relation) + 3 (conf + impact + relevance)
+
+    kg_use_gat  = True
+    kg_use_sage = False
+
+    # Fusion
+    fusion_num_heads = 4
+    fusion_dropout   = 0.1
+
+    # Predictor
+    predictor_hidden_dim = 256
+    predictor_dropout    = 0.1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PATHS
+# ─────────────────────────────────────────────────────────────────────────────
 
 class PathConfig:
-    """Specific file paths for outputs."""
-    
+
     @staticmethod
     def get_model_save_path(experiment_name: str = None) -> str:
-        """Generate model save path with timestamp."""
         if experiment_name is None:
             experiment_name = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
         save_dir = os.path.join(GlobalConfig.BASE_DIR, "output", "models")
         os.makedirs(save_dir, exist_ok=True)
-        
         return os.path.join(save_dir, f"{experiment_name}.pt")
-    
+
     @staticmethod
     def get_log_path(experiment_name: str = None) -> str:
-        """Generate log file path."""
         if experiment_name is None:
             experiment_name = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
         log_dir = os.path.join(GlobalConfig.BASE_DIR, "output", "logs")
         os.makedirs(log_dir, exist_ok=True)
-        
         return os.path.join(log_dir, f"{experiment_name}.log")
 
 
-# === VALIDATION ===
-def validate_config():
-    """Validate configuration parameters."""
+# ─────────────────────────────────────────────────────────────────────────────
+# VALIDATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def validate_config() -> bool:
     errors = []
-    
-    # Check paths exist
+
+    # Paths
     for path in [GlobalConfig.DATA_DIR, GlobalConfig.RAW_PATH, GlobalConfig.INTERIM_PATH]:
         if not os.path.exists(path):
             errors.append(f"Path does not exist: {path}")
-    
-    # Check GNN config consistency
+
+    # Ticker universe
+    expected = {"TSLA", "AAPL", "AMZN", "MSFT", "GOOGL", "META", "BA", "JPM", "WMT"}
+    actual   = set(GlobalConfig.TICKERS)
+    if actual != expected:
+        errors.append(f"TICKERS mismatch. Expected {sorted(expected)}, got {sorted(actual)}")
+    if set(GlobalConfig.TICKER_MAPPING.keys()) != actual:
+        errors.append("TICKER_MAPPING keys do not match TICKERS")
+
+    # GNN config
     if TrainConfig.use_gnn:
-        if TrainConfig.gnn_type not in ["sage", "gat"]:
+        if TrainConfig.gnn_type not in ("sage", "gat"):
             errors.append(f"Invalid gnn_type: {TrainConfig.gnn_type}")
-        
-        if TrainConfig.gnn_pool not in ["mean", "max", "attention"]:
+        if TrainConfig.gnn_pool not in ("mean", "max", "attention"):
             errors.append(f"Invalid gnn_pool: {TrainConfig.gnn_pool}")
-    
-    # Check dimensions
-    if TrainConfig.news_embed_dim != ModelConfig.kg_node_dim:
-        errors.append(f"Dimension mismatch: news_embed_dim={TrainConfig.news_embed_dim}, kg_node_dim={ModelConfig.kg_node_dim}")
-    
+
+    # Dimension consistency
+    if TrainConfig.kg_node_dim != ModelConfig.kg_node_dim:
+        errors.append(
+            f"kg_node_dim mismatch: TrainConfig={TrainConfig.kg_node_dim}, "
+            f"ModelConfig={ModelConfig.kg_node_dim}"
+        )
+    if TrainConfig.kg_edge_attr_dim != ModelConfig.kg_edge_attr_dim:
+        errors.append(
+            f"kg_edge_attr_dim mismatch: TrainConfig={TrainConfig.kg_edge_attr_dim}, "
+            f"ModelConfig={ModelConfig.kg_edge_attr_dim}"
+        )
+    if TrainConfig.gnn_hidden_dim % TrainConfig.gnn_heads != 0:
+        errors.append(
+            f"gnn_hidden_dim ({TrainConfig.gnn_hidden_dim}) must be divisible "
+            f"by gnn_heads ({TrainConfig.gnn_heads})"
+        )
+
     if errors:
-        print("⚠️ Configuration Errors:")
-        for err in errors:
-            print(f"   - {err}")
+        print("Configuration errors:")
+        for e in errors:
+            print(f"  - {e}")
         return False
-    
-    print("✅ Configuration validated successfully")
+
+    print("✅ Configuration validated")
     return True
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# QUICK SUMMARY
+# ─────────────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     print("=== Configuration Summary ===\n")
-    
-    print("📁 Global Config:")
-    print(f"   Data Dir: {GlobalConfig.DATA_DIR}")
-    print(f"   Tickers: {GlobalConfig.TICKERS}")
-    print(f"   Date Range: {GlobalConfig.START_DATE} to {GlobalConfig.END_DATE}")
-    
-    print("\n🎯 Training Config:")
-    print(f"   Batch Size: {TrainConfig.batch_size}")
-    print(f"   Epochs: {TrainConfig.epoch_num}")
-    print(f"   Learning Rate: {TrainConfig.learning_rate}")
-    print(f"   Window Size: {TrainConfig.window_size}")
-    
-    print("\n🧠 GNN Config:")
-    print(f"   Use GNN: {TrainConfig.use_gnn}")
-    if TrainConfig.use_gnn:
-        print(f"   GNN Type: {TrainConfig.gnn_type.upper()}")
-        print(f"   Hidden Dim: {TrainConfig.gnn_hidden_dim}")
-        print(f"   Num Layers: {TrainConfig.gnn_num_layers}")
-        print(f"   Pooling: {TrainConfig.gnn_pool}")
-    
-    print("\n🔍 Validating...")
+
+    print("Tickers :", GlobalConfig.TICKERS)
+    print("Sectors :")
+    for t, s in GlobalConfig.TICKER_SECTOR.items():
+        print(f"  {t:<6} {s}")
+
+    print(f"\nDate range : {GlobalConfig.START_DATE} → {GlobalConfig.END_DATE}")
+    print(f"Data dir   : {GlobalConfig.DATA_DIR}")
+
+    print("\nGNN:")
+    print(f"  type={TrainConfig.gnn_type}  layers={TrainConfig.gnn_num_layers}"
+          f"  hidden={TrainConfig.gnn_hidden_dim}  heads={TrainConfig.gnn_heads}"
+          f"  pool={TrainConfig.gnn_pool}")
+    print(f"  node_dim={TrainConfig.kg_node_dim}  edge_dim={TrainConfig.kg_edge_attr_dim}")
+    print(f"  graph_out → news_embed_dim={TrainConfig.news_embed_dim}")
+
+    print("\nKG cache paths:")
+    print(f"  article  : {GlobalConfig.kg_cache_dir()}")
+    print(f"  voyage   : {GlobalConfig.kg_voyage_cache_dir()}")
+
+    print()
     validate_config()
