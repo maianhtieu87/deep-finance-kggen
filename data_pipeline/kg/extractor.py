@@ -5,8 +5,6 @@ import time
 import random
 from typing import List, Dict, Any, Optional
 
-# ── NEW SDK ──────────────────────────────────────────────────────────────────
-# pip install google-genai  (NOT google-generativeai)
 from google import genai
 from google.genai import types
 
@@ -16,7 +14,6 @@ from .prompts import (
     FEW_SHOT_EXAMPLES,
     VALID_ENTITY_TYPES,
     VALID_RELATIONS,
-    TICKER_SECTOR_MAP,
 )
 
 _ENTITY_SCHEMA = {
@@ -50,16 +47,14 @@ RESPONSE_SCHEMA = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN EXTRACTOR — Sequential (1 article per call)
+# SEQUENTIAL EXTRACTOR  (1 article per call — fallback / unit test only)
+# For production use AsyncConcurrentExtractor or GeminiBatchAPIExtractor.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FinDKGLiteExtractor:
     """
-    Structured KG Extractor dùng google-genai SDK (mới).
-
-    Sử dụng:
-        extractor = FinDKGLiteExtractor(api_key=os.getenv("GEMINI_API_KEY"))
-        triples = extractor.extract(text, ticker="TSLA", news_date="2024-03-15")
+    Sequential KG extractor. 1 API call per article.
+    Prefer AsyncConcurrentExtractor for batches.
     """
 
     def __init__(
@@ -85,10 +80,7 @@ class FinDKGLiteExtractor:
                 "Set environment variable: export GEMINI_API_KEY='your_key'"
             )
 
-        # ── NEW SDK pattern ────────────────────────────────────────────────
         self.client = genai.Client(api_key=_api_key)
-
-        # GenerateContentConfig — built once, reused per call
         self._gen_config = types.GenerateContentConfig(
             system_instruction=FINDKG_LITE_SYSTEM_PROMPT,
             response_mime_type="application/json",
@@ -109,14 +101,17 @@ class FinDKGLiteExtractor:
             )
         return "\n\n---\n\n".join(parts)
 
-    def _build_prompt(self, text: str, ticker: str, sector: str, news_date: str) -> str:
+    def _build_prompt(self, text: str, ticker: str, news_date: str) -> str:
+        """Build complete prompt. sector removed — no longer in USER_PROMPT template."""
         few_shot = self._build_few_shot_str()
-        user_part = FINDKG_LITE_USER_PROMPT.format(
+        class _SafeDict(dict):
+            def __missing__(self, key): return ""
+        user_part = FINDKG_LITE_USER_PROMPT.format_map(_SafeDict(
             ticker=ticker,
-            sector=sector,
             news_date=news_date,
             news_text=text[:3500],
-        )
+            sector="",
+        ))
         return (
             f"EXAMPLES (study these carefully):\n\n{few_shot}\n\n"
             f"{'='*60}\n\n"
@@ -130,41 +125,30 @@ class FinDKGLiteExtractor:
         text: str,
         ticker: str,
         news_date: str = "",
-        sector: Optional[str] = None,
+        sector: Optional[str] = None,   # kept for backward compat, ignored
     ) -> List[Dict[str, Any]]:
-        """
-        Extract all relevant triples from a single article.
-
-        Returns:
-            List[Dict] — rich triple dicts, filtered by thresholds.
-            Returns [] if no relevant events or on error.
-        """
         if not text or not text.strip():
             return []
 
-        _sector = sector or TICKER_SECTOR_MAP.get(ticker, "Technology")
-        prompt  = self._build_prompt(text, ticker, _sector, news_date)
+        prompt = self._build_prompt(text, ticker, news_date)
 
         last_err = None
         for attempt in range(self.max_retries):
             try:
-                # ── NEW SDK call ───────────────────────────────────────────
                 response = self.client.models.generate_content(
                     model=self.model_name,
                     contents=prompt,
                     config=self._gen_config,
                 )
                 raw = json.loads(response.text)
-
                 if not isinstance(raw, list):
                     return []
-
                 return self._filter_and_clamp(raw)
 
             except Exception as e:
                 last_err = e
                 wait = self.backoff_base * (2 ** attempt) + random.uniform(0, 2)
-                print(f"⚠️  Gemini extraction error (attempt {attempt+1}/{self.max_retries}): {e}")
+                print(f"⚠️  Gemini error (attempt {attempt+1}/{self.max_retries}): {e}")
                 print(f"    Retry in {wait:.1f}s ...")
                 time.sleep(wait)
 
@@ -172,7 +156,6 @@ class FinDKGLiteExtractor:
         return []
 
     def _filter_and_clamp(self, raw: list) -> List[Dict]:
-        """Apply threshold filter and clamp numeric fields."""
         filtered = []
         for t in raw:
             if not isinstance(t, dict):
@@ -189,11 +172,10 @@ class FinDKGLiteExtractor:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BACKWARD COMPAT — migrate cache cũ
+# BACKWARD COMPAT — legacy cache migration
 # ─────────────────────────────────────────────────────────────────────────────
 
 def upgrade_legacy_triple(t: Any) -> Dict[str, Any]:
-    """Convert old-format tuple/list triple sang rich dict format."""
     if isinstance(t, dict):
         return t
     if isinstance(t, (list, tuple)) and len(t) == 3:
@@ -211,7 +193,6 @@ def upgrade_legacy_triple(t: Any) -> Dict[str, Any]:
 
 
 def upgrade_legacy_cache_file(cache_path: str) -> bool:
-    """In-place migration của một cache file từ old format sang new format."""
     try:
         with open(cache_path, "r", encoding="utf-8") as f:
             obj = json.load(f)

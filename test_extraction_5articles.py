@@ -214,23 +214,50 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
 
+
+# Ticker → company name variants for content-based primary detection
+# Both the symbol ("TSLA") and common names ("Tesla") are counted
+TICKER_NAME_MAP: Dict[str, List[str]] = {
+    "TSLA":  ["Tesla", "TSLA"],
+    "AAPL":  ["Apple", "AAPL"],
+    "AMZN":  ["Amazon", "AMZN"],
+    "MSFT":  ["Microsoft", "MSFT"],
+    "GOOGL": ["Google", "Alphabet", "GOOGL"],
+    "GOOG":  ["Google", "Alphabet", "GOOG"],
+    "META":  ["Meta", "Facebook", "META"],
+    "BA":    ["Boeing", "BA"],
+    "JPM":   ["JPMorgan", "JP Morgan", "JPM"],
+    "WMT":   ["Walmart", "WMT"],
+    "NVDA":  ["Nvidia", "NVDA"],
+    "NFLX":  ["Netflix", "NFLX"],
+    "INTC":  ["Intel", "INTC"],
+    "AMD":   ["AMD"],
+    "RIVN":  ["Rivian", "RIVN"],
+    "CATL":  ["CATL"],
+}
+
 def detect_primary_ticker(text: str, tickers: List[str]) -> str:
     """
-    Pick the ticker mentioned most often in article text.
-    Falls back to first ticker if none are explicitly mentioned.
-    Ensures extract() uses the right TARGET_STOCK context.
+    Pick the ticker most prominently featured in article text.
+    Counts both ticker symbol ("TSLA") AND company name variants ("Tesla").
+    Falls back to first ticker if none are found.
     """
     if not tickers:
         return ""
     if len(tickers) == 1:
         return tickers[0]
     text_upper = text.upper()
-    counts = {t: text_upper.count(t.upper()) for t in tickers}
-    best_count = max(counts.values())
-    if best_count == 0:
-        return tickers[0]
-    for t in tickers:       # preserve list order for ties
-        if counts[t] == best_count:
+    counts = {}
+    for t in tickers:
+        score = 0
+        for name in TICKER_NAME_MAP.get(t, [t]):
+            score += text_upper.count(name.upper())
+        counts[t] = score
+    best = max(counts.values())
+    if best == 0:
+        return tickers[0]           # none found → keep first
+    for t in tickers:               # preserve list order for ties
+        if counts[t] == best:
             return t
 
 
@@ -407,7 +434,9 @@ def collect_triples_pipeline_faithful(
         for target_ticker in meta["tickers"]:
             # rescore_triples_for_ticker handles primary == target case (no-op)
             rescored = rescore_fn(
-                raw_triples, primary, target_ticker, min_relevance
+                raw_triples, primary, target_ticker, min_relevance,
+                article_text=meta.get("text", ""),
+                all_article_tickers=meta.get("tickers", []),
             )
             # Apply confidence filter after rescore
             rescored = [
@@ -445,7 +474,7 @@ DEFAULT_PARQUET = r"D:\ProjectNCKH\deep_finance\data\interim\concatenated_news_f
 
 COLUMN_CANDIDATES = {
     "text":    ["content", "text", "body", "article", "extracted_summary"],
-    "date":    ["date", "datetime", "published_date", "publish_date", "timestamp"],
+    "date":    ["date", "datetime", "published_date", "publish_date", "timestamp", "created_at"],
     "ticker":  ["symbols", "equity", "ticker", "symbol"],
     "title":   ["title", "headline"],
 }
@@ -469,6 +498,8 @@ def load_and_build_articles(
     n: int = 5,
     ticker_filter: Optional[str] = None,
     use_summary: bool = False,
+    head: Optional[int] = None,
+    # head: take first N rows by index order, bypasses ticker-diversity sampling
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Optional[str]]]:
     """
     Load parquet and build article dicts with multi-ticker support.
@@ -529,6 +560,28 @@ def load_and_build_articles(
             df = df[df["_tickers_parsed"].map(len) > 0]
         else:
             print(f"   Filtered to ticker={tf}: {len(df):,} rows")
+
+    # --head: take first N rows strictly by index order, no sampling
+    if head is not None:
+        df = df.head(head).reset_index(drop=True)
+        print(f"   Taking first {len(df)} rows by index order (--head {head})")
+        # Build article dicts and return early
+        articles = []
+        for _, row in df.iterrows():
+            tickers = list(row["_tickers_parsed"])
+            text_content = _norm(str(row.get(text_col, "")))
+            articles.append({
+                "text":           text_content,
+                "tickers":        tickers,
+                "primary_ticker": detect_primary_ticker(text_content, tickers),
+                "date":           str(row[cols["date"]])[:10] if cols["date"] else "",
+                "title":          str(row.get(cols["title"], ""))[:120] if cols["title"] else "",
+            })
+        print(f"\n✅ Loaded {len(articles)} articles (head mode)")
+        multi = sum(1 for a in articles if len(a["tickers"]) > 1)
+        if multi:
+            print(f"   Multi-ticker articles: {multi}")
+        return articles, cols
 
     # Sample n rows (diverse tickers preferred)
     df = df.reset_index(drop=True)
@@ -647,6 +700,7 @@ def print_summary(
     debug_info: Dict,
     use_batch: bool,
     elapsed_total: float,
+    extractor=None,
 ):
     sha1_to_meta = debug_info["sha1_to_meta"]
     sha1_to_raw  = debug_info["sha1_to_raw"]
@@ -661,7 +715,8 @@ def print_summary(
     print(f"\n{'━'*68}")
     print(f"  PIPELINE-FAITHFUL SUMMARY")
     print(f"{'━'*68}")
-    print(f"  Mode          : {'Batch API (50% cost)' if use_batch else 'Sequential'}")
+    mode_label = type(extractor).__name__ if extractor is not None else ("GeminiBatch" if use_batch else "AsyncConcurrent")
+    print(f"  Mode          : {mode_label}")
     print(f"  Input rows    : {len(articles)}")
     print(f"  Unique texts  : {unique_count}  (SHA-1 dedup)")
     print(f"  Raw triples   : {total_raw}  (before rescore/filter)")
@@ -728,6 +783,9 @@ def parse_args() -> argparse.Namespace:
                    help="Path to parquet file")
     p.add_argument("--n",           type=int, default=5,
                    help="Number of articles to test (default=5)")
+    p.add_argument("--head",        type=int, default=None,
+                   help="Take the first N rows by index order (e.g. --head 3). "
+                        "Bypasses ticker-diversity sampling.")
     p.add_argument("--ticker",      default=None,
                    help="Filter articles containing this ticker (e.g. AMZN)")
     p.add_argument("--gemini-batch", action="store_true",
@@ -769,7 +827,7 @@ def main():
     print("=" * 68)
     print("  KG Extraction Test — Pipeline-Faithful Mode")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  Mode    : {'Batch API' if args.batch else 'Sequential'}")
+    print(f"  Mode    : {'GeminiBatch' if args.gemini_batch else 'AsyncConcurrent'}")
     print(f"  Mirrors : KGGenNewsEmbedder._collect_day_triples_batch()")
     print("=" * 68)
 
@@ -793,6 +851,7 @@ def main():
             args.data, n=args.n,
             ticker_filter=args.ticker,
             use_summary=args.use_summary,
+            head=args.head,
         )
     except FileNotFoundError:
         print(f"\n❌ File not found: {args.data}")
@@ -921,7 +980,7 @@ def main():
         print_ticker_results(ticker, triples, ticker, rescored=is_rescored)
 
     # ── 9. Summary ────────────────────────────────────────────────────────────
-    print_summary(articles, results_by_ticker, debug_info, use_batch, elapsed_total)
+    print_summary(articles, results_by_ticker, debug_info, use_batch, elapsed_total, extractor)
 
     # ── 10. Save ──────────────────────────────────────────────────────────────
     if args.save:

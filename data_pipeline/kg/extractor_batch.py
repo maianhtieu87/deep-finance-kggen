@@ -123,11 +123,16 @@ _FEW_SHOT_STR = _build_few_shot_str()   # built once at import time
 def build_user_prompt(text: str, ticker: str, news_date: str,
                       sector: Optional[str] = None) -> str:
     """Build complete user prompt for 1 article. sector param kept for compat, unused."""
-    user_part = FINDKG_LITE_USER_PROMPT.format(
+    # format_map with fallback default so missing keys (e.g. {sector} in old prompts.py)
+    # are silently replaced with empty string instead of raising KeyError.
+    class _SafeDict(dict):
+        def __missing__(self, key): return ""
+    user_part = FINDKG_LITE_USER_PROMPT.format_map(_SafeDict(
         ticker=ticker,
         news_date=news_date,
         news_text=text[:3500],
-    )
+        sector="",
+    ))
     return (
         f"EXAMPLES (study these carefully):\n\n{_FEW_SHOT_STR}\n\n"
         f"{'='*60}\n\n"
@@ -160,24 +165,76 @@ def _filter_and_clamp(raw: Any, min_relevance: float,
 # MULTI-TICKER RESCORE
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Company name variants for mention detection in rescore
+_TICKER_NAME_MAP: Dict[str, List[str]] = {
+    "TSLA":  ["Tesla", "TSLA"],
+    "AAPL":  ["Apple", "AAPL"],
+    "AMZN":  ["Amazon", "AMZN"],
+    "MSFT":  ["Microsoft", "MSFT"],
+    "GOOGL": ["Google", "Alphabet", "GOOGL"],
+    "GOOG":  ["Google", "Alphabet", "GOOG"],
+    "META":  ["Meta", "Facebook", "META"],
+    "BA":    ["Boeing", "BA"],
+    "JPM":   ["JPMorgan", "JP Morgan", "JPM"],
+    "WMT":   ["Walmart", "WMT"],
+    "NVDA":  ["Nvidia", "NVDA"],
+    "NFLX":  ["Netflix", "NFLX"],
+    "INTC":  ["Intel", "INTC"],
+    "AMD":   ["AMD"],
+    "RIVN":  ["Rivian", "RIVN"],
+}
+
+
+def _ticker_mentioned(ticker: str, text_upper: str) -> bool:
+    """Check if ticker or any of its company name variants appear in text."""
+    for name in _TICKER_NAME_MAP.get(ticker, [ticker]):
+        if name.upper() in text_upper:
+            return True
+    return False
+
+
 def rescore_triples_for_ticker(
     triples: List[Dict],
     primary_ticker: str,
     target_ticker: str,
     min_relevance: float = 0.30,
+    article_text: str = "",
+    all_article_tickers: Optional[List[str]] = None,
 ) -> List[Dict]:
     """
-    Điều chỉnh relevance_to_ticker khi fan-out bài báo sang ticker khác.
+    Adjust relevance_to_ticker when fan-out to a different ticker.
 
-    - primary == target : no-op
-    - triple mentions target : boost × 1.1
-    - triple does NOT mention target : decay × 0.4
-    Then re-filter at min_relevance.
+    2-tier logic:
+      Tier 1 — target ticker IS mentioned in article text:
+               → boost × 1.1 for triples mentioning it in subj/obj
+               → decay × 0.4 for others (macro context still relevant)
+
+      Tier 2 — target ticker NOT mentioned, but OTHER tickers ARE:
+               → strict mode: only keep triples that explicitly mention target
+               → raises effective min_relevance to 0.60 to block noise
+               → Example: GOOGL/MSFT in an Apple+Tesla article get dropped
+
+      Tier 3 — no ticker mentioned at all (pure macro article):
+               → normal × 0.4 decay (sector-level relevance)
     """
     if primary_ticker.upper() == target_ticker.upper():
         return triples
 
     target_lower = target_ticker.lower()
+    text_upper   = (article_text or "").upper()
+
+    # Determine context
+    target_in_text = _ticker_mentioned(target_ticker, text_upper)
+    others_in_text = any(
+        _ticker_mentioned(t, text_upper)
+        for t in (all_article_tickers or [])
+        if t.upper() != target_ticker.upper()
+    )
+
+    # Strict mode: other tickers explicitly present but NOT this target
+    strict_mode     = others_in_text and not target_in_text
+    effective_min   = 0.60 if strict_mode else min_relevance
+
     out = []
     for t in triples:
         t2        = dict(t)
@@ -189,7 +246,7 @@ def rescore_triples_for_ticker(
         t2["relevance_to_ticker"] = (
             min(1.0, orig_rel * 1.1) if mentions else orig_rel * 0.4
         )
-        if t2["relevance_to_ticker"] >= min_relevance:
+        if t2["relevance_to_ticker"] >= effective_min:
             out.append(t2)
     return out
 
