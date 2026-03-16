@@ -1,4 +1,17 @@
-# D:\ProjectNCKH\deep_finance\data_pipeline\builder.py
+# data_pipeline/builder.py
+"""
+V4 — DatasetBuilder
+
+Thay đổi so với V3:
+  - Đọc news_embeddings.json (output của embed_news.py) thay vì embedded_kg.json
+  - "news_embedding" key chứa 1024D Voyage vector — đây là gì data_loader sẽ dùng
+  - "kg_tensor" key không còn được dùng nữa (bỏ GATv2 pipeline)
+  - Fusion order: price → news_embedding (1024D) → macro → filing
+
+Format news_embeddings.json:
+  {"YYYY-MM-DD": {"TSLA": [0.12, -0.34, ...], "AAPL": [...]}}
+"""
+
 import os
 import json
 import pickle
@@ -7,32 +20,33 @@ from configs.config import GlobalConfig as Config
 
 
 class DatasetBuilder:
-    def create_synchronized_data(self, price_macro_dict, news_df, filing_path, embedding_path):
+    def create_synchronized_data(
+        self,
+        price_macro_dict,
+        news_df,
+        filing_path,
+        embedding_path,       # path to news_embeddings.json (from embed_news.py)
+    ):
         """
-        Final Union Logic.
+        Sync price + macro + news_embedding (1024D) + filings.
 
-        ✅ FIXED for KGGen:
-          - Ensure news_df['date'] is datetime-like before using .dt
-          - Handle missing filing_path gracefully
-          - Keep full news object (title, content, summary, source, url)
-          - ✅ Write news embeddings into key: "news_embedding" (expected by src/data_loader.py)
-          - ✅ Optionally keep kg_tensor_path under key: "kg_tensor" for debugging
+        embedding_path: path to news_embeddings.json
+          Format: {"YYYY-MM-DD": {"TSLA": [1024D vector]}}
         """
 
-        # -------------------------
         # 0) Filings (optional)
-        # -------------------------
-        filing_df = None
         if filing_path and os.path.exists(filing_path):
             filing_df = pd.read_parquet(filing_path)
-            filing_df["filedAt"] = pd.to_datetime(filing_df["filedAt"], errors="coerce").dt.normalize()
+            filing_df["filedAt"] = (
+                pd.to_datetime(filing_df["filedAt"], errors="coerce").dt.normalize()
+            )
             filing_df = filing_df.dropna(subset=["filedAt"])
         else:
-            filing_df = pd.DataFrame(columns=["filedAt", "ticker", "formType", "content_summary"])
+            filing_df = pd.DataFrame(
+                columns=["filedAt", "ticker", "formType", "content_summary"]
+            )
 
-        # -------------------------
         # 0.1) News dtype fix
-        # -------------------------
         if news_df is None:
             news_df = pd.DataFrame(columns=["date", "equity"])
         else:
@@ -47,29 +61,26 @@ class DatasetBuilder:
             if c not in news_df.columns:
                 news_df[c] = None
 
-        # -------------------------
-        # 1) Load KG index JSON
-        # -------------------------
-        embedding_data = {}
+        # 1) Load news_embeddings.json
+        embedding_data: dict = {}
         if embedding_path and os.path.exists(embedding_path):
-            print(f"Loading KG index from {embedding_path}...")
+            print(f"Loading news embeddings from {embedding_path}...")
             with open(embedding_path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
             for k, v in raw.items():
-                clean_key = str(k)[:10]  # YYYY-MM-DD
-                embedding_data[clean_key] = v
+                embedding_data[str(k)[:10]] = v  # key = "YYYY-MM-DD"
+            print(f"  Loaded {len(embedding_data)} dates")
         else:
-            print("⚠️ embedding_path not found. Continue without KG embeddings.")
+            print(f"  news_embeddings.json not found at {embedding_path}")
+            print("  Run embed_news.py first: python embed_news.py")
 
         synchronized_data = {}
         mapping = Config.TICKER_MAPPING
 
-        # -------------------------
         # 2) Iterate trading dates
-        # -------------------------
         for date_obj, data in price_macro_dict.items():
-            date_dt = pd.to_datetime(date_obj).normalize()
-            date_str = str(date_obj)[:10]  # YYYY-MM-DD
+            date_dt  = pd.to_datetime(date_obj).normalize()
+            date_str = str(date_obj)[:10]
 
             synchronized_data[date_obj] = {}
 
@@ -82,7 +93,7 @@ class DatasetBuilder:
             # 2.2 Macro
             synchronized_data[date_obj]["macro"] = data.get("macro", {})
 
-            # 2.3 News (full object)
+            # 2.3 News objects (for reference only — not fed to model directly)
             synchronized_data[date_obj]["news"] = {}
             if len(news_df) > 0:
                 date_news = news_df[news_df["date"] == date_dt]
@@ -93,35 +104,27 @@ class DatasetBuilder:
                             ["title", "content", "summary", "source", "url"]
                         ].to_dict(orient="records")
                         synchronized_data[date_obj]["news"].setdefault(clean_ticker, [])
-                        synchronized_data[date_obj]["news"][clean_ticker].extend(news_records)
+                        synchronized_data[date_obj]["news"][clean_ticker].extend(
+                            news_records
+                        )
 
-            # 2.4 ✅ News Embedding vector expected by src/data_loader.py
-            #     key MUST be "news_embedding"
+            # 2.4 News embeddings (1024D Voyage vectors — fed to model via NewsEncoder)
             synchronized_data[date_obj]["news_embedding"] = {}
 
-            # 2.4b Optional: keep kg tensor path for debugging
+            if date_str in embedding_data:
+                day_embs = embedding_data[date_str]
+                for raw_ticker, emb in day_embs.items():
+                    if raw_ticker in mapping:
+                        clean_ticker = mapping[raw_ticker]
+                        if isinstance(emb, list) and len(emb) > 0:
+                            synchronized_data[date_obj]["news_embedding"][clean_ticker] = emb
+                        else:
+                            synchronized_data[date_obj]["news_embedding"][clean_ticker] = []
+
+            # 2.5 kg_tensor: kept as empty dict (GATv2 pipeline removed)
             synchronized_data[date_obj]["kg_tensor"] = {}
 
-            if date_str in embedding_data:
-                for rec in embedding_data[date_str]:
-                    raw_ticker = rec.get("equity")
-                    if raw_ticker not in mapping:
-                        continue
-                    clean_ticker = mapping[raw_ticker]
-
-                    # ✅ Prefer embedding vector if present
-                    emb = rec.get("embedding", None)
-                    if isinstance(emb, list) and len(emb) > 0:
-                        synchronized_data[date_obj]["news_embedding"][clean_ticker] = emb
-                    else:
-                        # if embedding missing, still set empty list (data_loader will replace with zeros)
-                        synchronized_data[date_obj]["news_embedding"][clean_ticker] = []
-
-                    # optional tensor path
-                    if "kg_tensor_path" in rec:
-                        synchronized_data[date_obj]["kg_tensor"][clean_ticker] = rec["kg_tensor_path"]
-
-            # 2.5 Filings
+            # 2.6 Filings
             date_filings = filing_df[filing_df["filedAt"] == date_dt]
             synchronized_data[date_obj]["filing_q"] = {}
             synchronized_data[date_obj]["filing_k"] = {}
@@ -130,15 +133,15 @@ class DatasetBuilder:
                 for ticker in date_filings["ticker"].unique():
                     if ticker in mapping:
                         clean_ticker = mapping[ticker]
-                        tf = date_filings[date_filings["ticker"] == ticker]
-
+                        tf    = date_filings[date_filings["ticker"] == ticker]
                         q_txt = tf[tf["formType"] == "10-Q"]["content_summary"].tolist()
                         k_txt = tf[tf["formType"] == "10-K"]["content_summary"].tolist()
-
                         if q_txt:
-                            synchronized_data[date_obj]["filing_q"][clean_ticker] = " ".join(q_txt)
+                            synchronized_data[date_obj]["filing_q"][clean_ticker] = \
+                                " ".join(q_txt)
                         if k_txt:
-                            synchronized_data[date_obj]["filing_k"][clean_ticker] = " ".join(k_txt)
+                            synchronized_data[date_obj]["filing_k"][clean_ticker] = \
+                                " ".join(k_txt)
 
         return synchronized_data
 
@@ -147,4 +150,4 @@ class DatasetBuilder:
         path = os.path.join(Config.PROCESSED_PATH, filename)
         with open(path, "wb") as f:
             pickle.dump(data, f)
-        print(f"Data saved to {path}")
+        print(f"Dataset saved: {path}")

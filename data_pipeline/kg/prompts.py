@@ -63,39 +63,45 @@ TICKER_SECTOR_MAP = {
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SYSTEM PROMPT
-# Design: FinDKG-inspired conciseness — every rule in ≤2 lines.
-# Key additions over FinDKG:
-#   • price_impact_score anchored to expected % price move
-#   • SUPPLIES_TO direction rule with concrete examples
-#   • Entity disambiguation + <4-word cap (from FinDKG)
-#   • CONCEPT gated explicitly
+#
+# Changes vs previous version:
+#   • CONCEPT: explicit ✗ patterns + decision rule to prevent over-use
+#   • INVESTS_IN: object-type constraint (COMP/PRODUCT/ECON_IND only, NOT CONCEPT)
+#   • SCORING: compressed to ~8 lines (-~100 tokens); threshold raised to 0.50
 # ─────────────────────────────────────────────────────────────────────────────
 
 FINDKG_LITE_SYSTEM_PROMPT = """You are a financial knowledge graph extractor. From financial news, extract structured triples that predict TARGET TICKER stock price movement within 1-5 trading days.
 
 ━━ ENTITY TYPES ━━  (EXACT codes only)
-COMP      Company — short canonical name ≤4 words: "AWS", "Apple", "Rivian"
-PERSON    Named individual — full name ≤4 words: "Andy Jassy", "Jerome Powell"
+COMP      Company — short canonical name ≤4 words: "Apple", "Rivian", "CATL"
+PERSON    Named individual ≤4 words: "Andy Jassy", "Jerome Powell"
 ORG_GOV   Government body or central bank: "Federal Reserve", "White House"
 ORG_REG   Regulatory/legal body: "FTC", "SEC", "EU Commission"
 PRODUCT   Named product/service/platform/chip: "AWS", "iPhone 16", "HarmonyOS"
 ECON_IND  Economic metric WITH value: "Q1 revenue $143B", "rate 5.5%", "loss $1.5B"
 FIN_ASSET Financial instrument: "AMZN stock", "S&P 500", "10-year Treasury"
-CONCEPT   Abstract theme only — NEVER for named entities or metrics with numbers.
-          Valid: "AI adoption", "tariff risk", "ESG investment"
-          Invalid: "AWS growth potential", "earnings beat", "rate hike pressure"
+CONCEPT   Abstract market theme or strategic narrative — ONLY as last resort.
+          ✓ "AI adoption", "tariff risk", "supply chain disruption"
+          ✓ "AMZN AI capex 2024" — strategic narrative anchored to a ticker for clarity
+          ✗ "[Product] + vague outcome": "AWS opportunity", "iPhone growth potential"
+             → These hide a real entity: make AWS/iPhone the SUBJECT instead.
+          ✗ Any name that is itself a company, person, product, or numbered metric.
+          Decision rule: Can you express this as COMP/PRODUCT/ECON_IND? → do that. Only
+          use CONCEPT when the meaning is truly a macro theme or unnamed strategic idea.
 
-Entity rules (apply to every triple before writing):
-  1. Disambiguate: "Amazon CEO", "Jassy", "Andy Jassy" → always "Andy Jassy" (PERSON)
-  2. Simplify: entity names ≤4 words; include key number in ECON_IND names
+Entity rules:
+  1. Disambiguate: "Amazon CEO", "Jassy" → always "Andy Jassy" (PERSON)
+  2. ≤4 words per name; include key number in ECON_IND names
   3. No self-loops: subject.name ≠ object.name
 
-━━ RELATION TYPES ━━  (EXACT codes — prefer Group A/B over C)
+━━ RELATION TYPES ━━  (prefer Group A/B over C)
 Group A — Direct Action:
   ANNOUNCES  Earnings, product launch, M&A, guidance, official statement
   RAISES     Increase: price, capex, guidance, output, rating
   CUTS       Decrease: workforce, cost, price, guidance, dividend
   INVESTS_IN Capital deployment: acquisition, capex, partnership
+             Object must be COMP (target of acquisition), PRODUCT (infrastructure),
+             or ECON_IND (with dollar amount). NEVER CONCEPT.
   DIVESTS    Exit: sells stake, spins off, withdraws
   APPOINTS   Leadership appointment or removal
 
@@ -104,7 +110,7 @@ Group B — Causal Impact:
   NEG_IMPACTS   Entity A worsens Entity B's financials or outlook
   COMPETES_WITH Direct market competition for same revenue/customers
   REGULATES     Regulatory investigation, fine, or restriction
-  SUPPLIES_TO   [seller/maker] SUPPLIES_TO [buyer] — direction is critical:
+  SUPPLIES_TO   [seller/maker] SUPPLIES_TO [buyer] — direction critical:
                 "Rivian builds vans for Amazon" → Rivian SUPPLIES_TO Amazon ✓
                 "Amazon SUPPLIES_TO Rivian" → WRONG ✗
 
@@ -114,29 +120,25 @@ Group C — Context (only when A/B do not apply):
   RELATES_TO  Thematic link — absolute last resort
 
 ━━ SCORING ━━
-confidence (0.50–1.0):
-  0.95+ explicit with numbers | 0.80–0.94 clearly stated | 0.65–0.79 implied | <0.65 skip
+confidence: 0.95+=explicit+numbers | 0.80–0.94=clearly stated | 0.65–0.79=implied | <0.65→skip
 
-price_impact_score for TARGET TICKER (-1.0 to +1.0):
-  +0.7→+1.0  Major beat / transformative event  (>+5% expected move)
-  +0.4→+0.7  Beat / strong product / key win    (+2–5%)
-  +0.1→+0.4  Moderate positive / indirect        (+0.5–2%)
-   0.0→+0.1  Weakly positive
-  -0.1→ 0.0  Weakly negative
-  -0.4→-0.1  Moderate negative: miss/delay/cost  (-0.5–2%)
-  -0.7→-0.4  Significant: major miss/regulatory  (-2–5%)
-  -1.0→-0.7  Severe: fraud/shutdown/catastrophic (>-5%)
+price_impact_score (-1.0→+1.0 for TARGET TICKER):
+  ±0.7–1.0 Severe/major (>±5%) | ±0.4–0.7 Significant (±2–5%)
+  ±0.1–0.4 Moderate (±0.5–2%)  | 0–±0.1 Weak
+  Positive = bullish for target ticker; Negative = bearish for target ticker.
 
-relevance_to_ticker (0.30–1.0):
-  1.0   directly about target | 0.80–0.99 key supplier/customer/shareholder
-  0.60–0.79 direct competitor | 0.40–0.59 same sector | 0.30–0.39 macro
-  <0.30 do NOT extract"""
+relevance_to_ticker — skip triple if <0.50:
+  1.0=direct | 0.80–0.99=key supplier/customer/shareholder
+  0.65–0.79=direct competitor  | 0.50–0.64=sector/macro | <0.50→do NOT extract"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # USER PROMPT
-# Design: FinDKG two-step structure (classify → extract) eliminates
-# over/under-extraction by anchoring expected triple count per article type.
+#
+# Changes vs previous version:
+#   • Noise filter: simplified to absolute thresholds (rel<0.50 OR conf<0.65)
+#   • Final check: added INVESTS_IN object type guard
+#   • relevance range in JSON template: updated to 0.50–1.0
 # ─────────────────────────────────────────────────────────────────────────────
 
 FINDKG_LITE_USER_PROMPT = """TARGET_STOCK: {ticker}
@@ -176,7 +178,7 @@ For each event, output one triple:
   "object":  {{"name": "<≤4 words, include key number if metric>", "type": "<CODE>"}},
   "confidence":          <0.65–1.0>,
   "price_impact_score":  <-1.0 to +1.0 for {ticker}>,
-  "relevance_to_ticker": <0.30–1.0>,
+  "relevance_to_ticker": <0.50–1.0>,
   "reasoning": "<15 words max: event + direct price mechanism for {ticker}>"
 }}
 
@@ -184,7 +186,7 @@ For each event, output one triple:
 Coverage — every paragraph with a number needs ≥1 triple:
   ✓ Revenue / EPS / margin / guidance numbers → ECON_IND with value in name
   ✓ Named product / service / chip → PRODUCT
-  ✓ Named exec statement with financial content → PERSON + SIGNALS or ANNOUNCES
+  ✓ Named exec statement with financial content → PERSON SIGNALS or ANNOUNCES
   ✓ Workforce cut (even if framed as "streamlining") → CUTS
   ✓ Supply/ownership/competitor relationships → structural triple
 
@@ -192,13 +194,15 @@ Deduplication — same person, same event context:
   Max 2 triples: best quantitative claim + best forward-looking statement
   Do NOT create 3+ SIGNALS triples for one executive in one call/event
 
-Noise filter — skip if ALL of the following are true:
-  • Operational detail with no stated dollar/revenue impact
-  • confidence < 0.75  AND  relevance_to_ticker < 0.60
+Noise filter — always skip triple if EITHER condition is true:
+  • relevance_to_ticker < 0.50
+  • confidence < 0.65
 
 Final check before returning:
   ☑ No self-loops (subject ≠ object)
   ☑ SUPPLIES_TO direction: [maker] → [buyer]
+  ☑ INVESTS_IN object is COMP/PRODUCT/ECON_IND — if you wrote CONCEPT, change to SIGNALS
+  ☑ CONCEPT name is not "[Product/Company] + vague word" — if so, use that entity as SUBJECT
   ☑ Negative events extracted even if article frames them positively
   ☑ No duplicate (subject, relation, object) triples
   ☑ TYPE D with no financial content → return []"""
@@ -206,7 +210,12 @@ Final check before returning:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FEW-SHOT EXAMPLES
-# One example per article type to anchor expected behavior.
+#
+# Changes vs previous version:
+#   • Removed example 4 (TYPE C Azure dedup) — dedup rule is sufficient in text
+#   • Removed example 7 (TYPE D edge-case TSLA/CATL) — covered by TYPE B + TYPE D
+#   • 5 examples remain: TYPE A, TYPE B, TYPE C, TYPE A-mixed, TYPE D-empty
+#   • All examples comply with new CONCEPT and threshold rules
 # ─────────────────────────────────────────────────────────────────────────────
 
 FEW_SHOT_EXAMPLES = [
@@ -238,7 +247,7 @@ FEW_SHOT_EXAMPLES = [
                 "confidence":          0.97,
                 "price_impact_score":  0.55,
                 "relevance_to_ticker": 1.0,
-                "reasoning":           "iPhone 50% of AAPL revenue; 18% growth above consensus signals strong cycle.",
+                "reasoning":           "iPhone 50% of AAPL revenue; 18% growth above consensus.",
             },
             {
                 "subject":             {"name": "Apple Services", "type": "PRODUCT"},
@@ -261,8 +270,8 @@ FEW_SHOT_EXAMPLES = [
         ],
     },
 
-    # ── TYPE B: Supply chain — correct SUPPLIES_TO direction ─────────────────
-    # DIRECTION RULE: Rivian manufactures → Rivian SUPPLIES_TO Amazon (not reverse)
+    # ── TYPE B: Supply chain — SUPPLIES_TO direction + INVESTS_IN with COMP object ─
+    # NOTE: INVESTS_IN object = COMP (Amazon, the acquisition target of stake), not CONCEPT
     {
         "input": (
             "Rivian cut 35% material cost on vans built for major shareholder Amazon. "
@@ -279,7 +288,7 @@ FEW_SHOT_EXAMPLES = [
                 "confidence":          0.97,
                 "price_impact_score":  0.20,
                 "relevance_to_ticker": 0.85,
-                "reasoning":           "Rivian is key AMZN van supplier; stability affects AMZN logistics.",
+                "reasoning":           "Rivian is key AMZN van supplier; stability affects logistics.",
             },
             {
                 "subject":             {"name": "Rivian", "type": "COMP"},
@@ -306,7 +315,7 @@ FEW_SHOT_EXAMPLES = [
                 "confidence":          0.90,
                 "price_impact_score":  -0.15,
                 "relevance_to_ticker": 0.85,
-                "reasoning":           "AMZN major shareholder; Rivian distress is contingent AMZN liability.",
+                "reasoning":           "AMZN major shareholder; Rivian distress is contingent liability.",
             },
             {
                 "subject":             {"name": "Tesla", "type": "COMP"},
@@ -315,12 +324,13 @@ FEW_SHOT_EXAMPLES = [
                 "confidence":          0.85,
                 "price_impact_score":  -0.20,
                 "relevance_to_ticker": 0.65,
-                "reasoning":           "Tesla price cuts raise Rivian failure risk, threatening AMZN investment.",
+                "reasoning":           "Tesla price cuts raise Rivian failure risk, threatening AMZN stake.",
             },
         ],
     },
 
-    # ── TYPE C: Competitive/Geopolitical — threat signals with context ────────
+    # ── TYPE C: Competitive/Geopolitical — impact is NEGATIVE for MSFT ───────
+    # NOTE: relevance 0.40 triples are NOT extracted (threshold 0.50)
     {
         "input": (
             "Huawei's HarmonyOS surpassed iOS in China; PC version launching soon. "
@@ -337,7 +347,7 @@ FEW_SHOT_EXAMPLES = [
                 "confidence":          0.90,
                 "price_impact_score":  -0.35,
                 "relevance_to_ticker": 0.75,
-                "reasoning":           "HarmonyOS PC launch directly threatens Windows China market share.",
+                "reasoning":           "HarmonyOS PC launch directly threatens Windows China share.",
             },
             {
                 "subject":             {"name": "China", "type": "ORG_GOV"},
@@ -360,39 +370,10 @@ FEW_SHOT_EXAMPLES = [
         ],
     },
 
-    # ── TYPE C: DEDUP rule — multiple CEO statements → max 2 triples ─────────
-    {
-        "input": (
-            "Microsoft CEO Satya Nadella: Azure grew 31%, AI contributing 7pp. "
-            "He expects AI revenue to accelerate through FY2025. "
-            "He noted competitive dynamics with AWS remain intense."
-        ),
-        "ticker": "MSFT",
-        "article_type": "TYPE C — Competitive (with earnings signal)",
-        "output": [
-            {
-                "subject":             {"name": "Azure", "type": "PRODUCT"},
-                "relation":            "RAISES",
-                "object":              {"name": "revenue +31% AI 7pp", "type": "ECON_IND"},
-                "confidence":          0.97,
-                "price_impact_score":  0.65,
-                "relevance_to_ticker": 1.0,
-                "reasoning":           "Azure 31% growth with 7pp AI exceeds estimates; drives MSFT re-rating.",
-            },
-            {
-                "subject":             {"name": "Satya Nadella", "type": "PERSON"},
-                "relation":            "SIGNALS",
-                "object":              {"name": "MSFT AI revenue FY2025", "type": "CONCEPT"},
-                "confidence":          0.85,
-                "price_impact_score":  0.50,
-                "relevance_to_ticker": 1.0,
-                "reasoning":           "CEO FY2025 AI acceleration guidance sustains MSFT growth premium.",
-            },
-            # Competitive comment subsumed by Azure growth number — no 3rd triple
-        ],
-    },
-
-    # ── TYPE A: Mixed — negative events must be extracted alongside positive ──
+    # ── TYPE A: Mixed — negative events alongside positive; CONCEPT used correctly ──
+    # NOTE: "AMZN AI capex 2024" is valid CONCEPT (strategic narrative with ticker)
+    #       "AWS workforce 200 jobs" is ECON_IND not CONCEPT (it has a number)
+    #       INVESTS_IN is NOT used here — capex guidance → PERSON SIGNALS CONCEPT
     {
         "input": (
             "Amazon Q1 net sales $143.3B beat $142.5B estimate, +13% YoY. "
@@ -424,7 +405,7 @@ FEW_SHOT_EXAMPLES = [
             {
                 "subject":             {"name": "Andy Jassy", "type": "PERSON"},
                 "relation":            "SIGNALS",
-                "object":              {"name": "AMZN AI capex increase 2024", "type": "CONCEPT"},
+                "object":              {"name": "AMZN AI capex 2024", "type": "CONCEPT"},
                 "confidence":          0.90,
                 "price_impact_score":  0.45,
                 "relevance_to_ticker": 1.0,
@@ -442,7 +423,7 @@ FEW_SHOT_EXAMPLES = [
         ],
     },
 
-    # ── TYPE D: Opinion/Soft news → return [] ────────────────────────────────
+    # ── TYPE D: Opinion/soft news → always return [] ─────────────────────────
     {
         "input": (
             "Netflix CEO Reed Hastings praised Jeff Bezos' business philosophy. "
@@ -452,46 +433,6 @@ FEW_SHOT_EXAMPLES = [
         "ticker": "NFLX",
         "article_type": "TYPE D — Opinion/Interview",
         "output": [],
-        # Reasoning: No direct financial statement, no quantifiable event.
-        # TYPE D rule → return []
-    },
-
-    # ── TYPE D edge case: soft article WITH one financial statement ───────────
-    {
-        "input": (
-            "The Federal Reserve raised interest rates 25bps to 5.50%. "
-            "Tesla's key battery supplier CATL raised cell prices 8%."
-        ),
-        "ticker": "TSLA",
-        "article_type": "TYPE A — Macro + Supply Chain",
-        "output": [
-            {
-                "subject":             {"name": "Federal Reserve", "type": "ORG_GOV"},
-                "relation":            "RAISES",
-                "object":              {"name": "fed funds rate 5.50%", "type": "ECON_IND"},
-                "confidence":          1.0,
-                "price_impact_score":  -0.45,
-                "relevance_to_ticker": 0.65,
-                "reasoning":           "Rate hike raises EV loan costs, reducing TSLA demand.",
-            },
-            {
-                "subject":             {"name": "CATL", "type": "COMP"},
-                "relation":            "RAISES",
-                "object":              {"name": "battery cell price +8%", "type": "ECON_IND"},
-                "confidence":          0.90,
-                "price_impact_score":  -0.55,
-                "relevance_to_ticker": 0.90,
-                "reasoning":           "CATL 8% price hike compresses TSLA gross margin ~150bps.",
-            },
-            {
-                "subject":             {"name": "CATL", "type": "COMP"},
-                "relation":            "SUPPLIES_TO",
-                "object":              {"name": "Tesla", "type": "COMP"},
-                "confidence":          0.95,
-                "price_impact_score":  -0.15,
-                "relevance_to_ticker": 0.90,
-                "reasoning":           "CATL supply dependency means price changes directly hit TSLA P&L.",
-            },
-        ],
+        # No quantifiable financial statement → TYPE D rule → return []
     },
 ]

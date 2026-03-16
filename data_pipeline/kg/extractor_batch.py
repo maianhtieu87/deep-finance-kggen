@@ -1,27 +1,20 @@
 # data_pipeline/kg/extractor_batch.py
 """
-FinDKG-Lite Batch Extractors
+FinDKG-Lite Batch Extractors — V3
 
-Hai extractor, dùng cho hai use case khác nhau:
+Thay đổi chính so với V2:
+  - Chunk-based text: gộp headlines + content cho mỗi (ticker, date), chia chunk
+    3000 chars với overlap 200 chars, extract từng chunk rồi merge+dedup triples
+  - Fix lỗi 2: _all_tickers được truyền đúng qua cột _all_tickers sau explode
+  - Fix lỗi 7: detect_primary_ticker dùng title weight × 3 so với body weight × 1
+  - Fix lỗi strict-mode tier 2: effective_min nâng lên 0.75
+  - Bỏ KMeans entity resolution khỏi pipeline này (sẽ dùng alias dict ở Stage B)
 
-AsyncConcurrentExtractor  — N articles gửi đồng thời qua asyncio.gather()
-  - Cost  : standard rate (1.0x)
-  - Latency: ~max(single_call_latency)  ← phù hợp test / corpus nhỏ
-  - Dùng khi: test, corpus < 500 articles, cần kết quả ngay
-
-GeminiBatchAPIExtractor   — 1 job submit, Gemini server xử lý async
-  - Cost  : 50% off (standard × 0.5)
-  - Latency: 30s poll, thực tế 1–30 phút ← phù hợp production
-  - Dùng khi: corpus lớn (>500 articles), không cần kết quả ngay
-
-CHỌN EXTRACTOR:
-  n < 500   → AsyncConcurrentExtractor(max_concurrent=5~15)
-  n >= 500  → GeminiBatchAPIExtractor(display_name="...")
-
-MULTI-TICKER FLOW:
-  - Mỗi unique article chỉ được gọi 1 lần (key = sha1 của text)
-  - primary_ticker = ticker xuất hiện nhiều nhất trong content
-  - rescore_triples_for_ticker() điều chỉnh relevance khi fan-out
+Fixes từ prompts.py v2 (applied vào V3):
+  - min_relevance default: 0.30 → 0.50 (aligned với prompt threshold)
+  - min_confidence default: 0.35 → 0.65 (aligned với prompt threshold)
+  - rescore_triples_for_ticker: price_impact_score được zero-out cho cross-ticker triples
+    (Bug fix: score được tính cho primary_ticker; direction không đáng tin cho ticker khác)
 """
 
 from __future__ import annotations
@@ -29,10 +22,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 import hashlib
-import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from google import genai
 from google.genai import types
@@ -44,10 +37,6 @@ from .prompts import (
     VALID_ENTITY_TYPES,
     VALID_RELATIONS,
 )
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CONSTANTS
-# ─────────────────────────────────────────────────────────────────────────────
 
 MODEL_ID = "gemini-2.0-flash"
 
@@ -85,7 +74,6 @@ RESPONSE_SCHEMA = {
     },
 }
 
-# dict format for GeminiBatchAPIExtractor inline_requests
 _GEN_CONFIG_DICT = {
     "response_mime_type": "application/json",
     "response_schema":    RESPONSE_SCHEMA,
@@ -94,16 +82,21 @@ _GEN_CONFIG_DICT = {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
 
 def _sha1(s: str) -> str:
     return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
+
+
+def _parse_tickers(val: Any) -> List[str]:
+    """Parse ticker column into list. Supports "AAPL,GOOGL" | ["AAPL"] | "AAPL"."""
+    if isinstance(val, list):
+        return [t.strip().upper() for t in val if isinstance(t, str) and t.strip()]
+    if isinstance(val, str):
+        return [t.strip().upper() for t in val.split(",") if t.strip()]
+    return []
 
 
 def _build_few_shot_str() -> str:
@@ -117,20 +110,68 @@ def _build_few_shot_str() -> str:
     return "\n\n---\n\n".join(parts)
 
 
-_FEW_SHOT_STR = _build_few_shot_str()   # built once at import time
+_FEW_SHOT_STR = _build_few_shot_str()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHUNK-BASED TEXT SPLITTING
+# ─────────────────────────────────────────────────────────────────────────────
+
+CHUNK_SIZE    = 3000
+CHUNK_OVERLAP = 200
+
+
+def _split_at_sentence_boundary(text: str, max_chars: int) -> int:
+    if len(text) <= max_chars:
+        return len(text)
+    window = text[:max_chars]
+    for sep in (". ", "! ", "? ", "\n", " "):
+        pos = window.rfind(sep)
+        if pos > max_chars * 0.6:
+            return pos + len(sep)
+    return max_chars
+
+
+def split_text_chunks(text: str, chunk_size: int = CHUNK_SIZE,
+                      overlap: int = CHUNK_OVERLAP) -> List[str]:
+    text = text.strip()
+    if len(text) <= chunk_size:
+        return [text]
+
+    chunks = []
+    start  = 0
+    while start < len(text):
+        end   = _split_at_sentence_boundary(text[start:], chunk_size)
+        chunk = text[start: start + end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if start + end >= len(text):
+            break
+        start = start + end - overlap
+        if start < 0:
+            start = 0
+    return chunks if chunks else [text[:chunk_size]]
+
+
+def build_combined_text(titles: List[str], contents: List[str]) -> str:
+    headline_block = "\n".join(f"- {t}" for t in titles if t and t.strip())
+    content_block  = "\n\n---\n\n".join(c for c in contents if c and c.strip())
+    parts = []
+    if headline_block:
+        parts.append(f"HEADLINES:\n{headline_block}")
+    if content_block:
+        parts.append(f"ARTICLES:\n{content_block}")
+    return "\n\n".join(parts)
 
 
 def build_user_prompt(text: str, ticker: str, news_date: str,
                       sector: Optional[str] = None) -> str:
-    """Build complete user prompt for 1 article. sector param kept for compat, unused."""
-    # format_map with fallback default so missing keys (e.g. {sector} in old prompts.py)
-    # are silently replaced with empty string instead of raising KeyError.
     class _SafeDict(dict):
         def __missing__(self, key): return ""
     user_part = FINDKG_LITE_USER_PROMPT.format_map(_SafeDict(
         ticker=ticker,
         news_date=news_date,
-        news_text=text[:3500],
+        news_text=text,
         sector="",
     ))
     return (
@@ -142,7 +183,6 @@ def build_user_prompt(text: str, ticker: str, news_date: str,
 
 def _filter_and_clamp(raw: Any, min_relevance: float,
                       min_confidence: float) -> List[Dict]:
-    """Apply threshold filter + clamp numeric fields."""
     if not isinstance(raw, list):
         return []
     out = []
@@ -154,19 +194,31 @@ def _filter_and_clamp(raw: Any, min_relevance: float,
         if rel < min_relevance or conf < min_confidence:
             continue
         t["confidence"]          = max(0.0, min(1.0, conf))
-        t["price_impact_score"]  = max(-1.0, min(1.0,
-                                       float(t.get("price_impact_score", 0.0))))
+        t["price_impact_score"]  = max(-1.0, min(1.0, float(t.get("price_impact_score", 0.0))))
         t["relevance_to_ticker"] = max(0.0, min(1.0, rel))
         out.append(t)
     return out
 
 
+def dedup_triples(triples: List[Dict]) -> List[Dict]:
+    seen, out = set(), []
+    for t in triples:
+        key = (
+            t.get("subject", {}).get("name", ""),
+            t.get("relation", ""),
+            t.get("object",  {}).get("name", ""),
+        )
+        if key not in seen:
+            seen.add(key)
+            out.append(t)
+    return out
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# MULTI-TICKER RESCORE
+# PRIMARY TICKER DETECTION  (title weight × 3)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Company name variants for mention detection in rescore
-_TICKER_NAME_MAP: Dict[str, List[str]] = {
+TICKER_NAME_MAP: Dict[str, List[str]] = {
     "TSLA":  ["Tesla", "TSLA"],
     "AAPL":  ["Apple", "AAPL"],
     "AMZN":  ["Amazon", "AMZN"],
@@ -180,15 +232,68 @@ _TICKER_NAME_MAP: Dict[str, List[str]] = {
     "NVDA":  ["Nvidia", "NVDA"],
     "NFLX":  ["Netflix", "NFLX"],
     "INTC":  ["Intel", "INTC"],
-    "AMD":   ["AMD"],
+    "AMD":   ["AMD", "Advanced Micro"],
     "RIVN":  ["Rivian", "RIVN"],
+    "LCID":  ["Lucid", "LCID"],
+    "GM":    ["General Motors", "GM"],
+    "F":     ["Ford", "F Motor"],
 }
 
+TITLE_WEIGHT = 3
 
-def _ticker_mentioned(ticker: str, text_upper: str) -> bool:
-    """Check if ticker or any of its company name variants appear in text."""
-    for name in _TICKER_NAME_MAP.get(ticker, [ticker]):
-        if name.upper() in text_upper:
+
+def detect_primary_ticker(title: str, content: str, tickers: List[str]) -> str:
+    if not tickers:
+        return ""
+    if len(tickers) == 1:
+        return tickers[0]
+
+    title_upper   = (title   or "").upper()
+    content_upper = (content or "").upper()
+
+    counts = {}
+    for t in tickers:
+        score = 0
+        for name in TICKER_NAME_MAP.get(t, [t]):
+            n_up = name.upper()
+            score += title_upper.count(n_up) * TITLE_WEIGHT
+            score += content_upper.count(n_up)
+        counts[t] = score
+
+    best = max(counts.values())
+    if best == 0:
+        return tickers[0]
+    for t in tickers:
+        if counts[t] == best:
+            return t
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MULTI-TICKER RESCORE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ticker_mentioned_in_text(ticker: str, text_upper: str) -> bool:
+    for name in TICKER_NAME_MAP.get(ticker, [ticker]):
+        name_upper = name.upper()
+        if len(name) <= 3:
+            pattern = r'\b' + re.escape(name_upper) + r'\b'
+            if re.search(pattern, text_upper):
+                return True
+        else:
+            if name_upper in text_upper:
+                return True
+    return False
+
+
+def _ticker_mentioned_in_triple(ticker: str, triple: Dict) -> bool:
+    target_lower = ticker.lower()
+    subj_name    = triple.get("subject", {}).get("name", "").lower()
+    obj_name     = triple.get("object",  {}).get("name", "").lower()
+    if target_lower in subj_name or target_lower in obj_name:
+        return True
+    for name in TICKER_NAME_MAP.get(ticker.upper(), []):
+        name_lower = name.lower()
+        if name_lower in subj_name or name_lower in obj_name:
             return True
     return False
 
@@ -197,88 +302,91 @@ def rescore_triples_for_ticker(
     triples: List[Dict],
     primary_ticker: str,
     target_ticker: str,
-    min_relevance: float = 0.30,
+    min_relevance: float = 0.50,
     article_text: str = "",
     all_article_tickers: Optional[List[str]] = None,
 ) -> List[Dict]:
     """
-    Adjust relevance_to_ticker when fan-out to a different ticker.
+    3-tier rescore + price_impact zeroing cho cross-ticker triples.
 
-    2-tier logic:
-      Tier 1 — target ticker IS mentioned in article text:
-               → boost × 1.1 for triples mentioning it in subj/obj
-               → decay × 0.4 for others (macro context still relevant)
+    Tier 1 — target có trong text: normal min_relevance
+    Tier 2 — target KHÔNG có, nhưng ticker khác có: effective_min = 0.75
+             → strict filter nếu triple không đề cập target trong subj/obj
+    Tier 3 — không ticker nào có (pure macro): effective_min = max(0.50, min_relevance)
 
-      Tier 2 — target ticker NOT mentioned, but OTHER tickers ARE:
-               → strict mode: only keep triples that explicitly mention target
-               → raises effective min_relevance to 0.60 to block noise
-               → Example: GOOGL/MSFT in an Apple+Tesla article get dropped
-
-      Tier 3 — no ticker mentioned at all (pure macro article):
-               → normal × 0.4 decay (sector-level relevance)
+    price_impact_score (BUG FIX):
+      Luôn zero-out cho cross-ticker triples. Lý do: LLM tính score này
+      từ góc nhìn primary_ticker; direction không đáng tin cho target_ticker.
+      Ví dụ: "Apple ANNOUNCES headset" → +0.50 cho AAPL, nhưng cho MSFT
+      đây là competitive threat → phải âm, không phải +0.50.
+      Triple vẫn giữ nguyên structure value cho GATv2.
     """
     if primary_ticker.upper() == target_ticker.upper():
         return triples
 
-    target_lower = target_ticker.lower()
-    text_upper   = (article_text or "").upper()
-
-    # Determine context
-    target_in_text = _ticker_mentioned(target_ticker, text_upper)
+    text_upper     = (article_text or "").upper()
+    target_in_text = _ticker_mentioned_in_text(target_ticker, text_upper)
     others_in_text = any(
-        _ticker_mentioned(t, text_upper)
+        _ticker_mentioned_in_text(t, text_upper)
         for t in (all_article_tickers or [])
         if t.upper() != target_ticker.upper()
     )
 
-    # Strict mode: other tickers explicitly present but NOT this target
-    strict_mode     = others_in_text and not target_in_text
-    effective_min   = 0.60 if strict_mode else min_relevance
+    if target_in_text:
+        strict_mode   = False
+        effective_min = min_relevance
+    elif others_in_text:
+        strict_mode   = True
+        effective_min = 0.75
+    else:
+        strict_mode   = False
+        effective_min = max(0.50, min_relevance)
 
     out = []
     for t in triples:
-        t2        = dict(t)
-        subj_name = t.get("subject", {}).get("name", "").lower()
-        obj_name  = t.get("object",  {}).get("name", "").lower()
-        mentions  = target_lower in subj_name or target_lower in obj_name
-
+        t2       = dict(t)
+        mentions = _ticker_mentioned_in_triple(target_ticker, t)
         orig_rel = float(t.get("relevance_to_ticker", 0.0))
-        t2["relevance_to_ticker"] = (
-            min(1.0, orig_rel * 1.1) if mentions else orig_rel * 0.4
-        )
+
+        if strict_mode:
+            if not mentions:
+                continue
+            t2["relevance_to_ticker"] = min(1.0, orig_rel * 1.1)
+        else:
+            t2["relevance_to_ticker"] = (
+                min(1.0, orig_rel * 1.1) if mentions else orig_rel * 0.4
+            )
+
+        # ── BUG FIX: zero out price_impact cho mọi cross-ticker triple ──────
+        t2["price_impact_score"] = 0.0
+
         if t2["relevance_to_ticker"] >= effective_min:
             out.append(t2)
     return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ASYNC CONCURRENT EXTRACTOR  (test / small corpus)
+# ASYNC CONCURRENT EXTRACTOR
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AsyncConcurrentExtractor:
     """
-    Gửi N articles đồng thời qua asyncio.gather() + semaphore.
+    Gửi N chunks đồng thời qua asyncio.gather() + semaphore.
+    Phù hợp cho corpus < 500 articles hoặc test.
 
-    - Cost    : standard rate (1.0x)
-    - Latency : ~max(single_call_latency), thường 3–10s
-    - Best for: test scripts, corpus < 500 articles
-
-    CÁCH DÙNG:
-        extractor = AsyncConcurrentExtractor(max_concurrent=5)
-        results = extractor.extract_batch(articles)
-        # results[i] = List[RichTriple] cho articles[i]
+    Threshold defaults aligned với prompts.py:
+      min_relevance  = 0.50  (was 0.30)
+      min_confidence = 0.65  (was 0.35)
     """
 
     def __init__(
         self,
-        api_key: Optional[str] = None,
-        model: str = MODEL_ID,
-        temperature: float = 0.1,
-        min_relevance: float = 0.30,
-        min_confidence: float = 0.35,
-        max_concurrent: int = 5,
-        # Free tier: 5 | Paid tier: 10-15
-        # Gemini Flash RPM: 15 (free) / 2000 (paid Tier 1)
+        api_key:        Optional[str] = None,
+        model:          str   = MODEL_ID,
+        temperature:    float = 0.1,
+        min_relevance:  float = 0.50,   # ← was 0.30
+        min_confidence: float = 0.65,   # ← was 0.35
+        max_concurrent: int   = 5,
     ):
         self.min_relevance  = min_relevance
         self.min_confidence = min_confidence
@@ -288,11 +396,8 @@ class AsyncConcurrentExtractor:
 
         _key = api_key or os.getenv("GEMINI_API_KEY")
         if not _key:
-            raise RuntimeError(
-                "Missing GEMINI_API_KEY. Set: export GEMINI_API_KEY='your_key'"
-            )
+            raise RuntimeError("Missing GEMINI_API_KEY.")
         self.client = genai.Client(api_key=_key)
-
         self._gen_config = types.GenerateContentConfig(
             system_instruction=FINDKG_LITE_SYSTEM_PROMPT,
             response_mime_type="application/json",
@@ -302,12 +407,8 @@ class AsyncConcurrentExtractor:
         )
 
     async def _extract_one_async(
-        self,
-        idx: int,
-        article: Dict[str, str],
-        semaphore: asyncio.Semaphore,
-    ) -> tuple[int, List[Dict]]:
-        """Extract one article, respecting the concurrency semaphore."""
+        self, idx: int, article: Dict[str, str], semaphore: asyncio.Semaphore,
+    ) -> Tuple[int, List[Dict]]:
         async with semaphore:
             prompt = build_user_prompt(
                 text=article.get("text", ""),
@@ -322,43 +423,43 @@ class AsyncConcurrentExtractor:
                     config=self._gen_config,
                 )
                 raw = json.loads(response.text)
-                triples = _filter_and_clamp(raw, self.min_relevance, self.min_confidence)
-                return idx, triples
+                return idx, _filter_and_clamp(raw, self.min_relevance, self.min_confidence)
             except Exception as e:
-                print(f"⚠️  Async extract error idx={idx} "
-                      f"ticker={article.get('ticker')}: {e}")
+                print(f"  Async extract error idx={idx} ticker={article.get('ticker')}: {e}")
                 return idx, []
 
     def extract_batch(self, articles: List[Dict[str, str]]) -> List[List[Dict]]:
         """
-        Extract all articles concurrently. Blocking call (runs event loop internally).
-
-        Args:
-            articles: list of {text, ticker, date}
-
-        Returns:
-            List[List[RichTriple]] — index i = triples for articles[i]
+        articles: list of {text, ticker, date}
+        Trả về list[list[triple]] — index i = triples cho articles[i].
         """
         if not articles:
             return []
 
         async def _run_all():
             semaphore = asyncio.Semaphore(self.max_concurrent)
-            tasks = [
-                self._extract_one_async(i, art, semaphore)
-                for i, art in enumerate(articles)
-            ]
+            tasks = [self._extract_one_async(i, art, semaphore)
+                     for i, art in enumerate(articles)]
             return await asyncio.gather(*tasks)
 
-        print(f"📤 AsyncConcurrentExtractor: {len(articles)} articles, "
+        print(f"  AsyncConcurrentExtractor: {len(articles)} chunks, "
               f"max_concurrent={self.max_concurrent}")
         t0 = time.time()
 
-        pairs = asyncio.run(_run_all())
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    pairs = pool.submit(asyncio.run, _run_all()).result()
+            else:
+                pairs = loop.run_until_complete(_run_all())
+        except RuntimeError:
+            pairs = asyncio.run(_run_all())
 
         elapsed = time.time() - t0
         ok = sum(1 for _, t in pairs if t is not None)
-        print(f"✅ Done in {elapsed:.1f}s  ({ok}/{len(articles)} succeeded)")
+        print(f"  Done in {elapsed:.1f}s  ({ok}/{len(articles)} succeeded)")
 
         results: List[List[Dict]] = [[] for _ in articles]
         for idx, triples in pairs:
@@ -367,32 +468,27 @@ class AsyncConcurrentExtractor:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GEMINI BATCH API EXTRACTOR  (production / large corpus)
+# GEMINI BATCH API EXTRACTOR
 # ─────────────────────────────────────────────────────────────────────────────
 
 class GeminiBatchAPIExtractor:
     """
-    Xử lý nhiều articles qua Gemini Batch API chính thức.
+    50% cost, async job — dùng cho corpus > 500 chunks.
 
-    - Cost    : 50% so với standard rate
-    - Latency : 30s poll interval, thực tế 1–30 phút
-    - Best for: corpus lớn (>500 articles), production runs
-
-    CÁCH DÙNG:
-        extractor = GeminiBatchAPIExtractor(display_name="daily-2024-03-15")
-        results = extractor.extract_batch(articles)
-        # results[i] = List[RichTriple] cho articles[i]
+    Threshold defaults aligned với prompts.py:
+      min_relevance  = 0.50  (was 0.30)
+      min_confidence = 0.65  (was 0.35)
     """
 
     def __init__(
         self,
-        api_key: Optional[str] = None,
-        model: str = MODEL_ID,
-        min_relevance: float = 0.30,
-        min_confidence: float = 0.35,
-        poll_interval_secs: int = 30,
-        max_wait_secs: int = 86400,  # 24h max
-        display_name: str = "findkg-lite-v2",
+        api_key:            Optional[str] = None,
+        model:              str   = MODEL_ID,
+        min_relevance:      float = 0.50,   # ← was 0.30
+        min_confidence:     float = 0.65,   # ← was 0.35
+        poll_interval_secs: int   = 30,
+        max_wait_secs:      int   = 86400,
+        display_name:       str   = "findkg-lite-v3",
     ):
         self.min_relevance  = min_relevance
         self.min_confidence = min_confidence
@@ -403,26 +499,13 @@ class GeminiBatchAPIExtractor:
 
         _key = api_key or os.getenv("GEMINI_API_KEY")
         if not _key:
-            raise RuntimeError(
-                "Missing GEMINI_API_KEY. Set: export GEMINI_API_KEY='your_key'"
-            )
+            raise RuntimeError("Missing GEMINI_API_KEY.")
         self.client = genai.Client(api_key=_key)
 
     def extract_batch(self, articles: List[Dict[str, str]]) -> List[List[Dict]]:
-        """
-        Submit batch job, poll until done, return results in input order.
-
-        Args:
-            articles: list of {text, ticker, date}
-
-        Returns:
-            List[List[RichTriple]] — index i = triples for articles[i]
-            Returns [[]] for articles with parse errors.
-        """
         if not articles:
             return []
 
-        # Build inline requests
         inline_requests = []
         for i, art in enumerate(articles):
             prompt = build_user_prompt(
@@ -433,28 +516,21 @@ class GeminiBatchAPIExtractor:
             inline_requests.append({
                 "key": str(i),
                 "request": {
-                    "contents": [{
-                        "parts": [{"text": prompt}],
-                        "role": "user",
-                    }],
-                    "system_instruction": {
-                        "parts": [{"text": FINDKG_LITE_SYSTEM_PROMPT}]
-                    },
+                    "contents": [{"parts": [{"text": prompt}], "role": "user"}],
+                    "system_instruction": {"parts": [{"text": FINDKG_LITE_SYSTEM_PROMPT}]},
                     "generation_config": _GEN_CONFIG_DICT,
                 },
             })
 
-        print(f"📤 GeminiBatchAPIExtractor: submitting {len(inline_requests)} requests "
-              f"[display_name={self.display_name}]")
+        print(f"  GeminiBatchAPIExtractor: submitting {len(inline_requests)} chunks")
         batch_job = self.client.batches.create(
             model=self.model,
             src=inline_requests,
             config={"display_name": self.display_name},
         )
         job_name = batch_job.name
-        print(f"   Job: {job_name}  |  State: {batch_job.state.name}")
+        print(f"  Job: {job_name}  State: {batch_job.state.name}")
 
-        # Poll
         terminal = {"JOB_STATE_SUCCEEDED", "JOB_STATE_FAILED", "JOB_STATE_CANCELLED"}
         elapsed  = 0
         while elapsed < self.max_wait:
@@ -462,36 +538,27 @@ class GeminiBatchAPIExtractor:
             elapsed += self.poll_interval
             batch_job = self.client.batches.get(name=job_name)
             state = batch_job.state.name
-            print(f"   [{elapsed:5d}s] {state}")
+            print(f"  [{elapsed:5d}s] {state}")
             if state in terminal:
                 break
 
         if batch_job.state.name != "JOB_STATE_SUCCEEDED":
-            print(f"❌ Batch job did not succeed. Final state: {batch_job.state.name}")
-            if hasattr(batch_job, "error") and batch_job.error:
-                print(f"   Error: {batch_job.error}")
+            print(f"Batch job failed: {batch_job.state.name}")
             return [[] for _ in articles]
 
-        # Parse responses
         results: List[List[Dict]] = [[] for _ in articles]
         inlined = getattr(batch_job.response, "inlined_responses", None) or []
-        parsed_ok = 0
         for resp in inlined:
             try:
                 idx = int(resp.key)
             except (ValueError, AttributeError):
                 continue
-            if idx < 0 or idx >= len(articles):
-                continue
-            try:
-                raw_text = resp.response.candidates[0].content.parts[0].text
-                raw      = json.loads(raw_text)
-                results[idx] = _filter_and_clamp(raw, self.min_relevance,
-                                                  self.min_confidence)
-                parsed_ok += 1
-            except Exception as e:
-                print(f"⚠️  Parse error key={resp.key}: {e}")
-                results[idx] = []
-
-        print(f"✅ Batch done. Parsed {parsed_ok}/{len(articles)} responses.")
+            if 0 <= idx < len(articles):
+                try:
+                    raw_text = resp.response.candidates[0].content.parts[0].text
+                    results[idx] = _filter_and_clamp(
+                        json.loads(raw_text), self.min_relevance, self.min_confidence
+                    )
+                except Exception:
+                    results[idx] = []
         return results

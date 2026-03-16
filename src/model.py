@@ -1,27 +1,32 @@
-# src/model.py - MSGCA Sequential 2-Stage Fusion with GATv2 KG Encoder
+# src/model.py
 """
-Key fixes vs previous version:
-- KGGraphEncoder → KGGraphEncoderGATv2  (node_dim 1033, edge_attr 17D)
-- graph_norm added before fusion
-- _encode_graphs passes edge_attr to GATv2
-- node_dim sourced from TrainConfig.kg_node_dim (1033) not news_dim (128)
+V4 — StockMovementModel (Voyage embedding, no GATv2)
+
+Thay đổi so với V3:
+  - Bỏ KGGraphEncoderGATv2 và kg_encoder hoàn toàn
+  - s_n đầu vào là tensor (B, T, 1024) thay vì list of PyG Data
+  - NewsEncoder(1024 → dim) project xuống dim=256 rồi vào MSGCA
+  - Fusion order: price → news → macro → predict (như thiết kế gốc)
+  - _encode_graphs() được thay bằng _encode_news() — đơn giản hơn nhiều
+
+Interface:
+    model(s_o, s_h, s_c, s_m, s_n, label, mode="train")
+    # s_n: (B, T, 1024) — Voyage embedding của news theo window
 """
 
 import torch
 from torch import nn
 from sklearn.metrics import accuracy_score, matthews_corrcoef
 import torch.nn.functional as F
-from torch_geometric.data import Batch
 
 from configs.config import TrainConfig
-from encoders.kg_graph_encoder import KGGraphEncoderGATv2
 from encoders.mutil_encoder import MultimodalSourceEncoding
 from .fusion import StableGatedCrossAttention
 from .predictor import FinegrainedMovementPrediction
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LOSS FUNCTIONS
+# LOSS FUNCTIONS (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FocalLoss(nn.Module):
@@ -45,8 +50,8 @@ class LabelSmoothingCrossEntropy(nn.Module):
         self.weight    = weight
 
     def forward(self, inputs, targets):
-        n   = inputs.size(-1)
-        lp  = F.log_softmax(inputs, dim=-1)
+        n  = inputs.size(-1)
+        lp = F.log_softmax(inputs, dim=-1)
         with torch.no_grad():
             td = torch.zeros_like(lp).fill_(self.smoothing / (n - 1))
             td.scatter_(1, targets.unsqueeze(1), 1.0 - self.smoothing)
@@ -58,7 +63,7 @@ class LabelSmoothingCrossEntropy(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STOCK MOVEMENT MODEL
+# STOCK MOVEMENT MODEL V4
 # ─────────────────────────────────────────────────────────────────────────────
 
 class StockMovementModel(nn.Module):
@@ -66,11 +71,11 @@ class StockMovementModel(nn.Module):
         self,
         price_dim,
         macro_dim,
-        news_dim,       # GATv2 graph output dim = TrainConfig.news_embed_dim = 128
-        dim,
-        input_dim,
-        output_dim,
-        num_head,
+        news_dim,         # = 1024 (Voyage) — NewsEncoder projects to dim internally
+        dim,              # = 256 hidden dim
+        input_dim,        # = window_size = 20
+        output_dim,       # = 3 (DOWN/FLAT/UP)
+        num_head,         # = 4
         device,
         dropout=0.1,
         class_weights=None,
@@ -78,8 +83,8 @@ class StockMovementModel(nn.Module):
         focal_gamma=2.0,
         use_label_smoothing=False,
         smoothing=0.1,
-        # GNN params (kept for API compat but values sourced from TrainConfig)
-        use_gnn=True,
+        # Legacy GNN params — ignored in V4 but kept for API compat
+        use_gnn=False,
         gnn_type="gat",
         gnn_hidden_dim=128,
         gnn_num_layers=2,
@@ -88,56 +93,35 @@ class StockMovementModel(nn.Module):
     ):
         super().__init__()
         self.device   = device
-        self.output_dim = output_dim
-        self.use_gnn  = use_gnn
-        self.news_dim = news_dim   # = graph_out_dim = 128
-
-        # ── KG Encoder: GATv2 ────────────────────────────────────────────────
-        # node_dim = 1033 (Voyage 1024 + entity_type 8 + target_flag 1)
-        # output_dim = news_dim = 128 (feeds into fusion as graph embedding)
-        kg_node_dim = getattr(TrainConfig, "kg_node_dim", 1033)
+        self.news_dim = news_dim  # 1024
 
         if use_gnn:
-            self.kg_encoder = KGGraphEncoderGATv2(
-                node_dim=kg_node_dim,
-                hidden_dim=gnn_hidden_dim,
-                output_dim=news_dim,        # → 128D graph embedding
-                num_heads=gnn_heads,
-                num_layers=gnn_num_layers,
-                dropout=dropout,
-            ).to(device)
-            print(f"🔧 KG Encoder: GATv2 "
-                  f"({kg_node_dim}D → {gnn_hidden_dim}D hidden → {news_dim}D out, "
-                  f"{gnn_num_layers} layers, {gnn_heads} heads)")
-        else:
-            # Fallback: simple linear projection from raw node features
-            self.kg_encoder = nn.Sequential(
-                nn.Linear(kg_node_dim, news_dim),
-                nn.LayerNorm(news_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-            ).to(device)
+            print("  Note: use_gnn=True is ignored in V4 "
+                  "(GATv2 removed, using Voyage embedding directly)")
 
-        # Normalize graph output to same scale as price features
-        self.graph_norm = nn.LayerNorm(news_dim)
-
-        # ── Multimodal encoder ────────────────────────────────────────────────
+        # ── Multimodal encoder (price + macro + news) ─────────────────────────
+        # MultimodalSourceEncoding has NewsEncoder(news_dim=1024, dim=256)
+        # which projects 1024 → 256 via Linear + GELU
         self.multimodal_encoder = MultimodalSourceEncoding(
             price_dim=price_dim,
             macro_dim=macro_dim,
-            news_dim=news_dim,
+            news_dim=news_dim,   # 1024
             dim=dim,
         )
 
-        # ── MSGCA Sequential 2-Stage Fusion ──────────────────────────────────
-        # Stage 1: Price (Primary) + Graph/News (Aux) → filter noisy news
-        self.fusion_stage1 = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
-        # Stage 2: Fused Stage1 (Primary) + Macro (Aux) → integrate macro
-        self.fusion_stage2 = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
+        # ── MSGCA Sequential 2-Stage Fusion ───────────────────────────────────
+        # Stage 1: Price (Primary) + News (Aux)
+        self.fusion_stage1 = StableGatedCrossAttention(
+            dim=dim, num_head=num_head, dropout=dropout
+        )
+        # Stage 2: Fused1 (Primary) + Macro (Aux)
+        self.fusion_stage2 = StableGatedCrossAttention(
+            dim=dim, num_head=num_head, dropout=dropout
+        )
 
-        print("🔧 Fusion: SEQUENTIAL 2-STAGE MSGCA")
-        print("   Stage 1: Price (Primary) + Graph (Aux)")
-        print("   Stage 2: Fused1 (Primary) + Macro (Aux)")
+        print("  Fusion: 2-stage MSGCA")
+        print("    Stage 1: Price (primary) + News/Voyage (aux)")
+        print("    Stage 2: Fused1 (primary) + Macro (aux)")
 
         # ── Predictor ─────────────────────────────────────────────────────────
         self.movement_predictor = FinegrainedMovementPrediction(
@@ -145,90 +129,74 @@ class StockMovementModel(nn.Module):
         )
 
         # ── Loss ──────────────────────────────────────────────────────────────
-        self.use_focal_loss      = use_focal_loss
-        self.use_label_smoothing = use_label_smoothing
         if use_label_smoothing:
-            self.loss_fn = LabelSmoothingCrossEntropy(smoothing=smoothing, weight=class_weights)
-            print(f"🔧 Loss: Label Smoothing (ε={smoothing})")
+            self.loss_fn = LabelSmoothingCrossEntropy(
+                smoothing=smoothing, weight=class_weights
+            )
+            print(f"  Loss: Label Smoothing (ε={smoothing})")
         elif use_focal_loss:
             self.loss_fn = FocalLoss(alpha=class_weights, gamma=focal_gamma)
-            print(f"🔧 Loss: Focal Loss (γ={focal_gamma})")
+            print(f"  Loss: Focal Loss (γ={focal_gamma})")
         else:
             self.loss_fn = nn.CrossEntropyLoss(weight=class_weights)
-            print("🔧 Loss: Standard CE")
-
-    def _encode_graphs(self, graph_list) -> torch.Tensor:
-        """
-        Encode a list of PyG Data objects → (B, 1, news_dim) tensor.
-        Handles edge_attr for GATv2 when present.
-        """
-        B = len(graph_list)
-        zero = torch.zeros(B, 1, self.news_dim, device=self.device)
-
-        if not self.use_gnn:
-            # Simple mean-pool of raw node features → linear projection
-            embeddings = []
-            for g in graph_list:
-                if g is None or g.x is None or g.x.size(0) == 0:
-                    embeddings.append(torch.zeros(self.news_dim, device=self.device))
-                else:
-                    embeddings.append(g.x.mean(0).to(self.device))
-            v = torch.stack(embeddings)                   # (B, kg_node_dim)
-            return self.kg_encoder(v).unsqueeze(1)        # (B, 1, news_dim)
-
-        # Filter valid graphs
-        valid = [
-            (i, g) for i, g in enumerate(graph_list)
-            if g is not None and g.x is not None and g.x.size(0) > 0
-        ]
-        if not valid:
-            return zero
-
-        try:
-            valid_graphs = [g for _, g in valid]
-            batched = Batch.from_data_list(valid_graphs).to(self.device)
-        except Exception as e:
-            print(f"❌ Graph batching error: {e}")
-            return zero
-
-        # GATv2 forward — pass edge_attr if present
-        edge_attr = getattr(batched, "edge_attr", None)
-        try:
-            embs = self.kg_encoder(
-                x=batched.x,
-                edge_index=batched.edge_index,
-                edge_attr=edge_attr,
-                batch=batched.batch,
-            )                                             # (n_valid, news_dim)
-        except Exception as e:
-            print(f"❌ GATv2 encode error: {e}")
-            return zero
-
-        embs = F.normalize(embs, p=2, dim=-1)
-
-        out = zero.clone()
-        for out_idx, (orig_idx, _) in enumerate(valid):
-            out[orig_idx, 0, :] = embs[out_idx]
-        return out                                        # (B, 1, news_dim)
+            print("  Loss: Standard CE")
 
     def forward(
         self,
         s_o, s_h, s_c, s_m,
-        s_n_graphs,
+        s_n,           # (B, T, 1024) — Voyage news embedding
         label=None,
         mode="train",
         return_preds=False,
         return_logits=False,
+        # Legacy kwarg — ignored
+        s_n_graphs=None,
     ):
-        # 1. Encode modalities
-        v_m, v_i, _ = self.multimodal_encoder(s_o, s_h, s_c, s_m, None)
+        """
+        Forward pass.
 
-        v_n_raw = self._encode_graphs(s_n_graphs)   # (B, 1, news_dim)
-        v_n     = self.graph_norm(v_n_raw)           # normalize to same scale as v_i
+        Args:
+            s_o, s_h, s_c : (B, T, 1)   price OHLC
+            s_m           : (B, T, M)   macro indicators
+            s_n           : (B, T, 1024) Voyage news embedding
+            label         : (B,) long tensor
+            mode          : "train" | "test" | "logits"
+        """
+        # Handle legacy s_n_graphs kwarg (from V3 main.py collate_fn)
+        # If s_n is None but s_n_graphs is provided, use zeros
+        if s_n is None:
+            if s_n_graphs is not None:
+                B = s_o.shape[0]
+                T = s_o.shape[1]
+                s_n = torch.zeros(B, T, self.news_dim, device=self.device)
+            else:
+                B = s_o.shape[0]
+                T = s_o.shape[1]
+                s_n = torch.zeros(B, T, self.news_dim, device=self.device)
+        else:
+            s_n = s_n.to(self.device)
 
-        # 2. Sequential 2-stage fusion
-        H1     = self.fusion_stage1(primary=v_i,  aux=v_n)   # (B, T, dim)
-        H_final= self.fusion_stage2(primary=H1,   aux=v_m)   # (B, T, dim)
+        # 1. Encode all modalities
+        #    MultimodalSourceEncoding returns (v_m, v_i, v_n)
+        #    v_m: (B, T, dim)  macro encoded
+        #    v_i: (B, T, dim)  price encoded
+        #    v_n: (B, T, dim)  news encoded (NewsEncoder: 1024 → dim)
+        v_m, v_i, v_n = self.multimodal_encoder(
+            s_o.to(self.device),
+            s_h.to(self.device),
+            s_c.to(self.device),
+            s_m.to(self.device),
+            s_n,
+        )
+
+        # v_n might be None if MultimodalSourceEncoding receives None
+        # but we ensure s_n is always a tensor above
+        if v_n is None:
+            v_n = torch.zeros_like(v_i)
+
+        # 2. Sequential 2-stage MSGCA fusion
+        H1      = self.fusion_stage1(primary=v_i, aux=v_n)   # Price + News
+        H_final = self.fusion_stage2(primary=H1,  aux=v_m)   # Fused + Macro
 
         # 3. Predict
         logits = self.movement_predictor(fused_seq=H_final, orig_seq=v_i)
@@ -237,8 +205,10 @@ class StockMovementModel(nn.Module):
         # 4. Route by mode
         def _target(label):
             if isinstance(label, list):
-                return torch.tensor([x[0] for x in label],
-                                    dtype=torch.long, device=self.device)
+                return torch.tensor(
+                    [x[0] if isinstance(x, (list, tuple)) else x for x in label],
+                    dtype=torch.long, device=self.device
+                )
             return label.long().to(self.device)
 
         if mode == "train":
@@ -258,11 +228,19 @@ class StockMovementModel(nn.Module):
         elif mode == "logits":
             return logits
 
-    def get_prediction_confidence(self, s_o, s_h, s_c, s_m, s_n_graphs):
+    def get_prediction_confidence(self, s_o, s_h, s_c, s_m, s_n):
         self.eval()
         with torch.no_grad():
-            v_m, v_i, _ = self.multimodal_encoder(s_o, s_h, s_c, s_m, None)
-            v_n = self.graph_norm(self._encode_graphs(s_n_graphs))
+            v_m, v_i, v_n = self.multimodal_encoder(
+                s_o.to(self.device),
+                s_h.to(self.device),
+                s_c.to(self.device),
+                s_m.to(self.device),
+                s_n.to(self.device) if s_n is not None else
+                torch.zeros(s_o.shape[0], s_o.shape[1], self.news_dim, device=self.device),
+            )
+            if v_n is None:
+                v_n = torch.zeros_like(v_i)
             H1      = self.fusion_stage1(primary=v_i, aux=v_n)
             H_final = self.fusion_stage2(primary=H1,  aux=v_m)
             logits  = self.movement_predictor(fused_seq=H_final, orig_seq=v_i)

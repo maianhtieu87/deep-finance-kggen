@@ -1,4 +1,14 @@
-# main_test.py
+# main_test.py — V4
+"""
+Pipeline orchestrator V4.
+
+Luồng:
+  Phase A: Price + Macro data (Yahoo + FRED)
+  Phase B: News alignment
+  Phase B.1: Stage A — LLM extraction (extract_corpus.py)  [nếu cần]
+  Phase B.2: Voyage embedding (embed_news.py)              [nếu cần]
+  Phase C: Build unified_dataset.pkl (builder.py V4)
+"""
 
 import os
 import json
@@ -8,217 +18,192 @@ from configs.config import GlobalConfig
 from data_pipeline.fetchers.yahoo_fetcher import YahooFetcher
 from data_pipeline.processors.price_processor import PriceProcessor
 from data_pipeline.processors.macro_processor import MacroProcessor
-from data_pipeline.processors.news_processor import NewsProcessor, KGGenNewsEmbedder
+from data_pipeline.processors.news_processor import NewsProcessor
 from data_pipeline.builder import DatasetBuilder
 
 
-def _quick_check_kg_index(kg_index_path: str, n_samples: int = 5) -> bool:
-    """
-    Sanity check format + existence of kg_tensor_path
-    Expect:
-      embedded_kg.json: { "YYYY-MM-DD": [ {"date":..., "equity":..., "kg_tensor_path":...}, ... ], ... }
-    """
-    if not os.path.exists(kg_index_path):
-        print(f"❌ KG index not found: {kg_index_path}")
+def _check_news_embeddings(emb_path: str, n_sample: int = 5) -> bool:
+    """Sanity check news_embeddings.json format."""
+    if not os.path.exists(emb_path):
+        print(f"  news_embeddings.json not found: {emb_path}")
         return False
-
     try:
-        with open(kg_index_path, "r", encoding="utf-8") as f:
+        with open(emb_path) as f:
             obj = json.load(f)
+        if not isinstance(obj, dict) or len(obj) == 0:
+            print("  news_embeddings.json is empty.")
+            return False
+        # Check a sample
+        sample_dates = list(obj.keys())[:n_sample]
+        ok = 0
+        for d in sample_dates:
+            tickers = obj[d]
+            if not isinstance(tickers, dict):
+                continue
+            for t, emb in tickers.items():
+                if isinstance(emb, list) and len(emb) == 1024:
+                    ok += 1
+                    break
+        print(f"  Sanity check: {ok}/{len(sample_dates)} sampled dates have 1024D embeddings")
+        return ok > 0
     except Exception as e:
-        print(f"❌ Cannot read KG index JSON: {e}")
+        print(f"  Error reading news_embeddings.json: {e}")
         return False
 
-    if not isinstance(obj, dict) or len(obj) == 0:
-        print("❌ KG index JSON is empty or not a dict.")
-        return False
 
-    # pick some records
-    checked = 0
-    missing = 0
+def run_pipeline():
+    print("Pipeline V4 starting...")
 
-    for date_str, recs in obj.items():
-        if not isinstance(recs, list):
-            continue
-        for rec in recs:
-            if not isinstance(rec, dict):
-                continue
-            if "kg_tensor_path" not in rec:
-                continue
-            checked += 1
-            p = rec["kg_tensor_path"]
-            if not isinstance(p, str) or not os.path.exists(p):
-                missing += 1
-            if checked >= n_samples:
-                break
-        if checked >= n_samples:
-            break
-
-    if checked == 0:
-        print("⚠️ KG index has no usable records with 'kg_tensor_path'.")
-        return False
-
-    if missing > 0:
-        print(f"⚠️ KG index check: {missing}/{checked} sampled tensor paths are missing.")
-        print("   → Có thể bạn đã move folder data/interim/kg hoặc rebuild chưa xong.")
-        return True
-
-    print(f"✅ KG index sanity-check OK. Sampled {checked} tensor paths exist.")
-    return True
-
-
-def run_test_pipeline_skipping_news_fetch():
-    print("🚀 STARTING TEST PIPELINE (Skipping News Fetching)...")
-
-    EXISTING_NEWS_PATH = os.path.join(GlobalConfig.INTERIM_PATH, "concatenated_news_filtered.parquet")
+    EXISTING_NEWS_PATH = os.path.join(
+        GlobalConfig.INTERIM_PATH, "concatenated_news_filtered.parquet"
+    )
     if not os.path.exists(EXISTING_NEWS_PATH):
-        print(f"❌ ERROR: Không tìm thấy file tại {EXISTING_NEWS_PATH}")
+        print(f"News file not found: {EXISTING_NEWS_PATH}")
         return
 
-    # ===== PHASE A: PRICE + MACRO =====
-    print("\n--- Phase A: Fetching (Price & Macro only) ---")
+    # ── Phase A: Price + Macro ────────────────────────────────────────────────
+    print("\n--- Phase A: Price + Macro ---")
     yahoo = YahooFetcher()
     os.makedirs(GlobalConfig.RAW_PRICE_PATH, exist_ok=True)
     os.makedirs(GlobalConfig.RAW_MACRO_PATH, exist_ok=True)
     os.makedirs(GlobalConfig.PROCESSED_PATH, exist_ok=True)
 
-    print(f"   Downloading Price Data ({GlobalConfig.START_DATE} to {GlobalConfig.END_DATE})...")
     raw_price_list = yahoo.download_data(
-        GlobalConfig.START_DATE,
-        GlobalConfig.END_DATE,
-        GlobalConfig.TICKERS
+        GlobalConfig.START_DATE, GlobalConfig.END_DATE, GlobalConfig.TICKERS
     )
-
-    print("   Downloading Macro Indicators...")
     raw_macro = yahoo.fetch_macro_indicators(
-        GlobalConfig.START_DATE,
-        GlobalConfig.END_DATE,
-        GlobalConfig.MACRO_SYMBOLS
+        GlobalConfig.START_DATE, GlobalConfig.END_DATE, GlobalConfig.MACRO_SYMBOLS
     )
 
-    # ===== PHASE B: PROCESS =====
-    print("\n--- Phase B: Processing ---")
     price_proc = PriceProcessor()
     macro_proc = MacroProcessor()
-    news_proc = NewsProcessor()
-
-    print("   Processing Price & Macro...")
     price_dict = price_proc.combine_to_nested_dict(raw_price_list, GlobalConfig.TICKERS)
     processed_price_macro = macro_proc.process_and_enrich(price_dict, raw_macro)
-
     trading_dates = list(processed_price_macro.keys())
-    print(f"   Detected {len(trading_dates)} trading days.")
+    print(f"  {len(trading_dates)} trading days")
 
-    print(f"   📥 Loading existing news from: {EXISTING_NEWS_PATH}")
+    # ── Phase B: News alignment ───────────────────────────────────────────────
+    print("\n--- Phase B: News alignment ---")
+    news_proc = NewsProcessor()
     processed_news = pd.read_parquet(EXISTING_NEWS_PATH)
-    print(f"   Loaded {len(processed_news)} news records.")
+    print(f"  Loaded {len(processed_news):,} news records")
 
     if "headline" in processed_news.columns and "title" not in processed_news.columns:
         processed_news = processed_news.rename(columns={"headline": "title"})
-        print("   ✅ Renamed 'headline' -> 'title'.")
-
     if not pd.api.types.is_datetime64_any_dtype(processed_news["date"]):
         processed_news["date"] = pd.to_datetime(processed_news["date"]).dt.date
 
-    print("   Aligning news to current Trading Days...")
     aligned_news = news_proc.align_to_trading_days(processed_news, trading_dates)
-    print(f"   News after alignment: {len(aligned_news)} records.")
+    print(f"  After alignment: {len(aligned_news)} records")
 
-    # ===== PHASE B.1: KG OFFLINE (REUSE) =====
-    print("\n--- Phase B.1: KG (reuse existing outputs by default) ---")
+    # ── Phase B.1: Stage A — LLM extraction (optional) ───────────────────────
+    print("\n--- Phase B.1: LLM extraction (Stage A) ---")
+    cache_dir = GlobalConfig.kg_cache_dir()
+    cache_files = []
+    if os.path.exists(cache_dir):
+        cache_files = [f for f in os.listdir(cache_dir) if f.endswith(".json")]
 
-    kg_index_path = os.path.join(GlobalConfig.INTERIM_PATH, "kg_embeddings", "embedded_kg.json")
-
-    if os.path.exists(kg_index_path):
-        print(f"   ✅ Found KG index: {kg_index_path}")
-
-        ok = _quick_check_kg_index(kg_index_path, n_samples=5)
-        if not ok:
-            print("   ⚠️ KG index format/path seems problematic.")
-            ans = input("   → Bạn có muốn rebuild KG lại từ đầu (tốn LLM)? (y/n): ").strip().lower()
-            if ans == "y":
-                print("   🧨 Rebuilding KG (LLM extraction + graph build)...")
-                embedder = KGGenNewsEmbedder(
-                    interim_root=GlobalConfig.INTERIM_PATH,
-                    top_triples_per_article=5,
-                    # ✅ REMOVED: top_triples_per_day (không tồn tại)
-                    use_voyage_resolution=True,
-                    use_voyage_node_features=True,
-                    allow_llm_when_missing=True,  # Allow LLM calls
-                    # ✅ GNN params (khớp với config)
-                    graph_out_dim=128,
-                    graph_hidden_dim=128,
-                    graph_num_layers=2,
-                )
-                kg_index_path = embedder.process_and_save(aligned_news)
-            else:
-                print("   ❌ Không rebuild nhưng KG index hiện không ổn. Dừng để tránh builder lỗi.")
-                return
-        else:
-            # ✅ default: reuse
-            ans = input("   → Reuse KG đã build sẵn (skip build KG)? (y/n): ").strip().lower()
-            if ans == "y":
-                print("   ✅ Reusing existing KG index. (NO LLM / NO Voyage / NO graph rebuild)")
-            else:
-                print("   🧨 You chose to rebuild KG (LLM extraction + graph build)...")
-                embedder = KGGenNewsEmbedder(
-                    interim_root=GlobalConfig.INTERIM_PATH,
-                    top_triples_per_article=5,
-                    # ✅ REMOVED: top_triples_per_day
-                    use_voyage_resolution=True,
-                    use_voyage_node_features=True,
-                    allow_llm_when_missing=True,
-                    # ✅ GNN params
-                    graph_out_dim=128,
-                    graph_hidden_dim=128,
-                    graph_num_layers=2,
-                )
-                kg_index_path = embedder.process_and_save(aligned_news)
+    if cache_files:
+        print(f"  Found {len(cache_files)} cached articles")
+        ans = input("  Run Stage A to extract more (may cost API)? (y/n): ").strip().lower()
+        if ans == "y":
+            from extract_corpus import run_stage_a
+            run_stage_a(
+                news_df=processed_news,
+                cache_dir=cache_dir,
+                use_gemini_batch=False,
+                max_concurrent=5,
+                min_relevance=0.30,
+                min_confidence=0.35,
+            )
     else:
-        print("   ❌ No KG index found.")
-        ans = input("   → Build KG now (tốn LLM)? (y/n): ").strip().lower()
-        if ans != "y":
-            print("   ❌ Không có KG index để dùng. Dừng.")
-            return
-        embedder = KGGenNewsEmbedder(
-            interim_root=GlobalConfig.INTERIM_PATH,
-            top_triples_per_article=5,
-            # ✅ REMOVED: top_triples_per_day
-            use_voyage_resolution=True,
-            use_voyage_node_features=True,
-            allow_llm_when_missing=True,
-            graph_out_dim=128,
-            graph_hidden_dim=128,
-            graph_num_layers=2,
-        )
-        kg_index_path = embedder.process_and_save(aligned_news)
+        print("  No cache found.")
+        ans = input("  Run Stage A now (requires GEMINI_API_KEY)? (y/n): ").strip().lower()
+        if ans == "y":
+            from extract_corpus import run_stage_a
+            run_stage_a(
+                news_df=processed_news,
+                cache_dir=cache_dir,
+                use_gemini_batch=False,
+                max_concurrent=5,
+                min_relevance=0.30,
+                min_confidence=0.35,
+            )
+        else:
+            print("  Skipping extraction. News embeddings will be zeros.")
 
-    embedding_json_path = kg_index_path
-
-    # ===== PHASE C: FINAL UNION =====
-    print("\n--- Phase C: Building Union File ---")
-    builder = DatasetBuilder()
-
-    filing_path = os.path.join(GlobalConfig.RAW_FILINGS_PATH, "final_summary_filing_data.parquet")
-    if not os.path.exists(filing_path):
-        print(f"   ⚠️ Warning: Filing file not found at {filing_path}. Creating dataset without filings.")
-        pd.DataFrame(columns=["filedAt", "ticker", "formType", "content_summary"]).to_parquet("dummy_filings.parquet")
-        filing_path = "dummy_filings.parquet"
-
-    dataset = builder.create_synchronized_data(
-        processed_price_macro,
-        aligned_news,
-        filing_path,
-        embedding_path=embedding_json_path
+    # ── Phase B.2: Voyage embedding (embed_news.py) ───────────────────────────
+    print("\n--- Phase B.2: Voyage embedding ---")
+    emb_path = os.path.join(
+        GlobalConfig.INTERIM_PATH, "kg_embeddings", "news_embeddings.json"
     )
 
+    if os.path.exists(emb_path):
+        ok = _check_news_embeddings(emb_path)
+        if ok:
+            ans = input("  Reuse existing news_embeddings.json? (y/n): ").strip().lower()
+            if ans == "y":
+                print("  Reusing existing embeddings.")
+            else:
+                _run_embed(processed_news, cache_dir, emb_path)
+        else:
+            print("  Existing file has issues — rebuilding...")
+            _run_embed(processed_news, cache_dir, emb_path)
+    else:
+        print("  news_embeddings.json not found.")
+        voyage_key = os.getenv("VOYAGE_API_KEY", GlobalConfig.VOYAGE_API_KEY)
+        if voyage_key and voyage_key not in ("", "---"):
+            print("  Running embed_news.py...")
+            _run_embed(processed_news, cache_dir, emb_path)
+        else:
+            print("  VOYAGE_API_KEY not set — embeddings will be zeros.")
+            print("  Set key and run: python embed_news.py")
+
+    # ── Phase C: Build unified dataset ───────────────────────────────────────
+    print("\n--- Phase C: Building unified_dataset.pkl ---")
+    builder = DatasetBuilder()
+
+    filing_path = os.path.join(
+        GlobalConfig.RAW_FILINGS_PATH, "final_summary_filing_data.parquet"
+    )
+    dummy_filing = False
+    if not os.path.exists(filing_path):
+        print(f"  Filing not found — using dummy")
+        pd.DataFrame(
+            columns=["filedAt", "ticker", "formType", "content_summary"]
+        ).to_parquet("dummy_filings.parquet")
+        filing_path   = "dummy_filings.parquet"
+        dummy_filing  = True
+
+    dataset = builder.create_synchronized_data(
+        price_macro_dict=processed_price_macro,
+        news_df=aligned_news,
+        filing_path=filing_path,
+        embedding_path=emb_path if os.path.exists(emb_path) else None,
+    )
     builder.save(dataset, filename="unified_dataset_test.pkl")
 
-    if os.path.exists("dummy_filings.parquet"):
+    if dummy_filing and os.path.exists("dummy_filings.parquet"):
         os.remove("dummy_filings.parquet")
 
-    print("\n✅ TEST PIPELINE COMPLETED SUCCESSFULLY!")
+    print("\nPipeline V4 complete!")
+    print("Next: python main.py")
+
+
+def _run_embed(news_df, cache_dir, emb_path):
+    """Helper to run embed_news.run_embed_news()."""
+    from embed_news import run_embed_news
+    voyage_cache = GlobalConfig.kg_voyage_cache_dir()
+    run_embed_news(
+        news_df=news_df,
+        cache_dir=cache_dir,
+        output_path=emb_path,
+        voyage_cache=voyage_cache,
+        window_days=3,
+        min_relevance=0.30,
+        min_confidence=0.35,
+    )
 
 
 if __name__ == "__main__":
-    run_test_pipeline_skipping_news_fetch()
+    run_pipeline()
