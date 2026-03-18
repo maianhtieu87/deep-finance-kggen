@@ -1,47 +1,37 @@
-# ===============================
-# Core ML & Data
-# ===============================
+# requirements.txt — V4 (Voyage direct embedding, no GATv2)
+# Removed vs V3: torch-geometric, torch-scatter, torch-sparse,
+#                sentence-transformers (resolver.py deleted),
+#                dspy-ai, litellm (not used in pipeline)
+
+# ── Core ML & Data ──────────────────────────────────────────
 torch
 numpy
 pandas
 scikit-learn
 
-# ===============================
-# Data Fetching
-# ===============================
+# ── Data Fetching ────────────────────────────────────────────
 yfinance
 pandas-datareader
 httpx
 tenacity
 
-# ===============================
-# Data Processing
-# ===============================
+# ── Data Processing ──────────────────────────────────────────
 polars
 pyarrow
 openpyxl
 tqdm
 rich
 
-# ===============================
-# Knowledge Graph / LLM
-# ===============================
-dspy-ai
-litellm
+# ── LLM / KG Extraction ──────────────────────────────────────
+google-genai            # Gemini API (extractor_batch.py)
 
-# ===============================
-# Semantic Embedding & Similarity
-# ===============================
-sentence-transformers
+# ── Embedding ────────────────────────────────────────────────
+requests                # Voyage AI REST calls (embed_news.py, voyage_embedder)
 
-# ===============================
-# Utils / Env
-# ===============================
+# ── Utils / Env ──────────────────────────────────────────────
 python-dotenv
 orjson
 
-# ===============================
-# Notebook / Debug
-# ===============================
+# ── Dev / Debug ──────────────────────────────────────────────
 jupyter
 ipykernel

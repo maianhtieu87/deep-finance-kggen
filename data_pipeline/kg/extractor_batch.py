@@ -1,7 +1,13 @@
-# data_pipeline/kg/extractor_batch.py — V3.2
+# data_pipeline/kg/extractor_batch.py — V3.3
 """
-Quality filter chain added in V3.2:
+Quality filter chain:
   apply_quality_filters() = smart_dedup -> fix_regulates -> post_filter -> limit_signals
+
+V3.3 change (Priority 1 fix):
+  limit_signals_per_source() now also caps COMP SIGNALS to max_comp_signals=2.
+  Prevents technical-analysis articles generating 13+ Meta SIGNALS triples from
+  Market Clubhouse-style sources (price level spam that dominates embedding space).
+  COMP ANNOUNCES/RAISES/CUTS are NOT limited — earnings metrics are always valid.
 """
 from __future__ import annotations
 import asyncio, json, os, re, time, hashlib
@@ -111,6 +117,8 @@ def _filter_and_clamp(raw, min_relevance, min_confidence):
         out.append(t)
     return out
 
+# ── DEDUP ─────────────────────────────────────────────────────────────────────
+
 def dedup_triples(triples):
     seen, out = set(), []
     for t in triples:
@@ -127,6 +135,7 @@ def _normalize_object_for_dedup(name):
     return re.sub(r'\s+', ' ', n).strip()
 
 def smart_dedup_triples(triples):
+    """Fuzzy dedup resolving cross-chunk contradictions."""
     if not triples: return []
     exact_seen, exact_deduped = set(), []
     for t in triples:
@@ -150,6 +159,8 @@ def smart_dedup_triples(triples):
         result.append(best)
     return result
 
+# ── POST-EXTRACTION QUALITY FILTERS ──────────────────────────────────────────
+
 _LEGAL_SUFFIX_RE = re.compile(
     r',?\s*(Inc\.?|Corp\.?|Corporation|Co\.?|Company|Ltd\.?|Limited|Group|Platforms?|Holdings?|Services?|LLC|LLP|PLC|S\.A\.|N\.V\.)\.?\s*$',
     re.IGNORECASE)
@@ -160,7 +171,7 @@ def _norm_name_selfloop(name):
     return re.sub(r'\s+', ' ', n).strip()
 
 def fix_regulates_direction(triples):
-    """Flip reversed REGULATES (COMP->ORG_REG) and drop semantic self-loops."""
+    """Flip reversed REGULATES (COMP->ORG_REG) and drop semantic self-loops (all relations)."""
     REGULATOR_TYPES = {"ORG_GOV", "ORG_REG"}
     COMPANY_TYPES   = {"COMP", "PRODUCT", "PERSON"}
     result = []
@@ -173,13 +184,17 @@ def fix_regulates_direction(triples):
         if st in COMPANY_TYPES and ot in REGULATOR_TYPES:
             t2 = dict(t); t2["subject"] = dict(obj); t2["object"] = dict(subj); result.append(t2)
         elif st in COMPANY_TYPES and ot in COMPANY_TYPES:
-            pass
+            pass  # wrong direction and wrong target → drop
         else:
             result.append(t)
     return result
 
 def post_filter_triples(triples, min_rel_relates_to=0.75):
-    """Promote RELATES_TO+ECON_IND -> ANNOUNCES; drop RELATES_TO noise; drop zero-signal."""
+    """
+    1. RELATES_TO + ECON_IND → promote to ANNOUNCES.
+    2. RELATES_TO at rel < 0.75 → drop.
+    3. abs(impact) < 0.05 AND rel < 0.60 → drop.
+    """
     result = []
     for t in triples:
         rel, rv, imp = t.get("relation",""), float(t.get("relevance_to_ticker",0)), float(t.get("price_impact_score",0))
@@ -191,31 +206,85 @@ def post_filter_triples(triples, min_rel_relates_to=0.75):
         result.append(t)
     return result
 
-def limit_signals_per_source(triples, max_per_person=2, max_per_regulator=2):
-    """Cap PERSON SIGNALS/RAISES/ANNOUNCES to max_per_person; ORG REGULATES to max_per_regulator."""
-    LIMIT_RELS_P = {"SIGNALS", "RAISES", "ANNOUNCES"}
-    LIMIT_RELS_R = {"REGULATES"}
-    REG_TYPES    = {"ORG_GOV", "ORG_REG"}
-    indexed_sorted = sorted(enumerate(triples), key=lambda x: float(x[1].get("confidence",0)), reverse=True)
-    pc, rc, keep = {}, {}, set()
+def limit_signals_per_source(
+    triples: List[Dict],
+    max_per_person:    int = 2,
+    max_per_regulator: int = 2,
+    max_comp_signals:  int = 2,
+) -> List[Dict]:
+    """
+    Cap noise from repeated sources.
+
+    PERSON subjects  — max 2 SIGNALS/RAISES/ANNOUNCES per person.
+      Prevents 4+ triples from one analyst report.
+
+    ORG_REG/ORG_GOV  — max 2 REGULATES per body.
+      Prevents EU regulatory event generating 8+ REGULATES triples.
+
+    COMP subjects    — max 2 SIGNALS per company (V3.3 new).
+      Prevents technical-analysis articles ("Market Clubhouse") generating
+      13+ COMP SIGNALS triples (price levels 316, 318, 313...) that dominate
+      embedding space and wash out real fundamental signals.
+      IMPORTANT: ANNOUNCES/RAISES/CUTS for COMP are NOT limited — earnings
+      metrics (revenue, EPS, margin, guidance) are always individually valid.
+
+    Sort by confidence DESC → keep highest-quality triples.
+    """
+    LIMIT_RELS_PERSON    = {"SIGNALS", "RAISES", "ANNOUNCES"}
+    LIMIT_RELS_REGULATOR = {"REGULATES"}
+    LIMIT_RELS_COMP_SIG  = {"SIGNALS"}          # ONLY SIGNALS, NOT ANNOUNCES/RAISES/CUTS
+    REGULATOR_TYPES      = {"ORG_GOV", "ORG_REG"}
+
+    indexed_sorted = sorted(
+        enumerate(triples),
+        key=lambda x: float(x[1].get("confidence", 0)),
+        reverse=True,
+    )
+
+    person_count:   Dict[str, int] = {}
+    reg_count:      Dict[str, int] = {}
+    comp_sig_count: Dict[str, int] = {}
+    keep: set = set()
+
     for orig_i, t in indexed_sorted:
-        rel, sn, st = t.get("relation",""), t.get("subject",{}).get("name",""), t.get("subject",{}).get("type","")
-        if rel in LIMIT_RELS_P and st == "PERSON":
-            if pc.get(sn, 0) >= max_per_person: continue
-            pc[sn] = pc.get(sn, 0) + 1
-        elif rel in LIMIT_RELS_R and st in REG_TYPES:
-            if rc.get(sn, 0) >= max_per_regulator: continue
-            rc[sn] = rc.get(sn, 0) + 1
+        rel       = t.get("relation", "")
+        subj_name = t.get("subject", {}).get("name", "")
+        subj_type = t.get("subject", {}).get("type", "")
+
+        if rel in LIMIT_RELS_PERSON and subj_type == "PERSON":
+            if person_count.get(subj_name, 0) >= max_per_person: continue
+            person_count[subj_name] = person_count.get(subj_name, 0) + 1
+
+        elif rel in LIMIT_RELS_REGULATOR and subj_type in REGULATOR_TYPES:
+            if reg_count.get(subj_name, 0) >= max_per_regulator: continue
+            reg_count[subj_name] = reg_count.get(subj_name, 0) + 1
+
+        elif rel in LIMIT_RELS_COMP_SIG and subj_type == "COMP":
+            if comp_sig_count.get(subj_name, 0) >= max_comp_signals: continue
+            comp_sig_count[subj_name] = comp_sig_count.get(subj_name, 0) + 1
+
         keep.add(orig_i)
+
     return [t for i, t in enumerate(triples) if i in keep]
 
-def apply_quality_filters(triples):
-    """Full quality chain: smart_dedup -> fix_regulates -> post_filter -> limit_signals."""
+def apply_quality_filters(triples: List[Dict]) -> List[Dict]:
+    """
+    Full quality chain:
+      smart_dedup → fix_regulates_direction → post_filter_triples → limit_signals_per_source
+
+    Order matters:
+      1. smart_dedup first resolves cross-chunk contradictions
+      2. fix_regulates fixes direction before dedup has a chance to miss it
+      3. post_filter promotes/drops by relation+type
+      4. limit_signals caps source noise last (after other filters reduced count)
+    """
     triples = smart_dedup_triples(triples)
     triples = fix_regulates_direction(triples)
     triples = post_filter_triples(triples)
     triples = limit_signals_per_source(triples)
     return triples
+
+# ── TICKER DETECTION ─────────────────────────────────────────────────────────
 
 TICKER_NAME_MAP: Dict[str, List[str]] = {
     "TSLA": ["Tesla","TSLA"], "AAPL": ["Apple","AAPL"], "AMZN": ["Amazon","AMZN"],
@@ -264,14 +333,15 @@ def _ticker_mentioned_in_triple(ticker, triple):
     return False
 
 def rescore_triples_for_ticker(triples, primary_ticker, target_ticker, min_relevance=None, article_text="", all_article_tickers=None):
+    """3-tier rescore + price_impact zeroing for cross-ticker triples."""
     if min_relevance is None: min_relevance = GlobalConfig.KG_MIN_RELEVANCE
     if primary_ticker.upper() == target_ticker.upper(): return triples
     tu = (article_text or "").upper()
     tin = _ticker_mentioned_in_text(target_ticker, tu)
     oin = any(_ticker_mentioned_in_text(t, tu) for t in (all_article_tickers or []) if t.upper() != target_ticker.upper())
-    if tin:        strict, emin = False, min_relevance
-    elif oin:      strict, emin = True,  0.75
-    else:          strict, emin = False, max(0.50, min_relevance)
+    if tin:   strict, emin = False, min_relevance
+    elif oin: strict, emin = True,  0.75
+    else:     strict, emin = False, max(0.50, min_relevance)
     out = []
     for t in triples:
         t2 = dict(t)
@@ -282,10 +352,11 @@ def rescore_triples_for_ticker(triples, primary_ticker, target_ticker, min_relev
             t2["relevance_to_ticker"] = min(1.0, or_ * 1.1)
         else:
             t2["relevance_to_ticker"] = min(1.0, or_ * 1.1) if mentions else or_ * 0.4
-        t2["price_impact_score"] = 0.0
+        t2["price_impact_score"] = 0.0  # direction unreliable for cross-ticker
         if t2["relevance_to_ticker"] >= emin: out.append(t2)
     return out
 
+# ── ASYNC CONCURRENT EXTRACTOR ────────────────────────────────────────────────
 
 class AsyncConcurrentExtractor:
     def __init__(self, api_key=None, model=MODEL_ID, temperature=0.1, min_relevance=None, min_confidence=None, max_concurrent=None):
@@ -333,6 +404,7 @@ class AsyncConcurrentExtractor:
         for idx, triples in pairs: results[idx] = triples or []
         return results
 
+# ── GEMINI BATCH API EXTRACTOR ────────────────────────────────────────────────
 
 class GeminiBatchAPIExtractor:
     def __init__(self, api_key=None, model=MODEL_ID, min_relevance=None, min_confidence=None, poll_interval_secs=30, max_wait_secs=86400, display_name="findkg-lite-v3"):
