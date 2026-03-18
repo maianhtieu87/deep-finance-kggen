@@ -3,8 +3,8 @@
 Configuration V4 — 9-ticker universe.
 
 Thay đổi so với V3:
-  - news_embed_dim = 1024  (Voyage-3-large output, dùng trực tiếp cho NewsEncoder)
-  - kg_node_dim, kg_edge_attr_dim: kept for reference but NOT used in V4 model
+  - news_embed_dim = 1024  (Voyage-3-large output)
+  - KG_MIN_RELEVANCE / KG_MIN_CONFIDENCE: centralized thresholds (single source of truth)
   - use_gnn = False  (GATv2 pipeline removed)
 """
 
@@ -51,6 +51,17 @@ class GlobalConfig:
         "^TNX",    # 10-Year Treasury Yield
     ]
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # KG EXTRACTION THRESHOLDS  ← SINGLE SOURCE OF TRUTH
+    # Thay đổi ở đây sẽ propagate tự động tới tất cả scripts:
+    #   extractor.py, extractor_batch.py, extract_corpus.py,
+    #   embed_news.py, build_graphs.py, test_extraction.py, main_test.py
+    # ─────────────────────────────────────────────────────────────────────────
+    KG_MIN_RELEVANCE  = 0.50   # skip triple if relevance_to_ticker < this
+    KG_MIN_CONFIDENCE = 0.65   # skip triple if confidence < this
+    KG_MAX_CONCURRENT = 5      # async concurrent Gemini API calls
+    KG_WINDOW_EMBED   = 3      # rolling window days for embed_news.py aggregation
+
     # Voyage embedding
     EMBED_MODEL       = "voyage-3-large"
     MAX_RETRIES       = 6
@@ -92,12 +103,10 @@ class TrainConfig:
     output_dim  = 3
     num_head    = 4
 
-    # V4: news_embed_dim = Voyage-3-large output dimension
-    # NewsEncoder(1024, dim) projects 1024 → 256 during training
-    news_embed_dim  = 1024   # was 128 in V3
+    news_embed_dim  = 1024   # Voyage-3-large output dimension
 
-    # GNN config (kept for reference but NOT used in V4)
-    use_gnn        = False   # V4: no GATv2
+    # GNN config (kept for reference, NOT used in V4)
+    use_gnn        = False
     gnn_type       = "gat"
     gnn_hidden_dim = 128
     gnn_num_layers = 2
@@ -112,14 +121,16 @@ class TrainConfig:
     use_label_smoothing = False
     label_smoothing     = 0.1
 
-    kg_window_days = 3      # rolling window for embed_news.py (was 20 for graph)
+    kg_window_days = 3
     kg_top_triples = 5
     kg_use_voyage  = True
     kg_allow_llm   = False
 
-    use_improved_resolver = False  # KMeans removed in V4
+    use_improved_resolver = False
     resolver_kmeans_k     = 64
     resolver_min_cluster  = 3
+
+    drop_out = 0.1
 
 
 class ModelConfig:
@@ -130,7 +141,6 @@ class ModelConfig:
     macro_lstm_hidden = 64
     macro_lstm_layers = 2
 
-    # V4: no GATv2, but keep fields for reference
     kg_node_dim      = 1033
     kg_edge_attr_dim = 17
     kg_use_gat       = False
@@ -186,6 +196,8 @@ def validate_config() -> bool:
         return False
 
     print("Configuration validated (V4 — Voyage direct embedding)")
+    print(f"  KG thresholds: min_relevance={GlobalConfig.KG_MIN_RELEVANCE}  "
+          f"min_confidence={GlobalConfig.KG_MIN_CONFIDENCE}")
     return True
 
 
@@ -195,5 +207,6 @@ if __name__ == "__main__":
     print(f"Date     : {GlobalConfig.START_DATE} → {GlobalConfig.END_DATE}")
     print(f"News dim : {TrainConfig.news_embed_dim} (Voyage-3-large)")
     print(f"use_gnn  : {TrainConfig.use_gnn}")
+    print(f"KG thresholds: rel>={GlobalConfig.KG_MIN_RELEVANCE}  conf>={GlobalConfig.KG_MIN_CONFIDENCE}")
     print()
     validate_config()

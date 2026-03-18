@@ -666,8 +666,8 @@ def main():
                         help="Rolling window days for triple aggregation (default 3)")
     parser.add_argument("--ticker",     default=None)
     parser.add_argument("--date",       default=None,  help="Date prefix filter, e.g. '2022-06'")
-    parser.add_argument("--min-relevance",  type=float, default=0.30)
-    parser.add_argument("--min-confidence", type=float, default=0.35)
+    parser.add_argument("--min-relevance",  type=float, default=GlobalConfig.KG_MIN_RELEVANCE)
+    parser.add_argument("--min-confidence", type=float, default=GlobalConfig.KG_MIN_CONFIDENCE)
     args = parser.parse_args()
 
     news_path = args.news or os.path.join(

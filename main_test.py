@@ -113,8 +113,8 @@ def run_pipeline():
                 cache_dir=cache_dir,
                 use_gemini_batch=False,
                 max_concurrent=5,
-                min_relevance=0.30,
-                min_confidence=0.35,
+                min_relevance=GlobalConfig.KG_MIN_RELEVANCE,
+                min_confidence=GlobalConfig.KG_MIN_CONFIDENCE,
             )
     else:
         print("  No cache found.")
@@ -126,8 +126,8 @@ def run_pipeline():
                 cache_dir=cache_dir,
                 use_gemini_batch=False,
                 max_concurrent=5,
-                min_relevance=0.30,
-                min_confidence=0.35,
+                min_relevance=GlobalConfig.KG_MIN_RELEVANCE,
+                min_confidence=GlobalConfig.KG_MIN_CONFIDENCE,
             )
         else:
             print("  Skipping extraction. News embeddings will be zeros.")
@@ -191,7 +191,6 @@ def run_pipeline():
 
 
 def _run_embed(news_df, cache_dir, emb_path):
-    """Helper to run embed_news.run_embed_news()."""
     from embed_news import run_embed_news
     voyage_cache = GlobalConfig.kg_voyage_cache_dir()
     run_embed_news(
@@ -199,9 +198,9 @@ def _run_embed(news_df, cache_dir, emb_path):
         cache_dir=cache_dir,
         output_path=emb_path,
         voyage_cache=voyage_cache,
-        window_days=3,
-        min_relevance=0.30,
-        min_confidence=0.35,
+        window_days=GlobalConfig.KG_WINDOW_EMBED,
+        min_relevance=GlobalConfig.KG_MIN_RELEVANCE,
+        min_confidence=GlobalConfig.KG_MIN_CONFIDENCE,
     )
 
 

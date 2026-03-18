@@ -473,8 +473,8 @@ def main():
     parser.add_argument("--window",     type=int,   default=20)
     parser.add_argument("--ticker",     default=None)
     parser.add_argument("--no-voyage",  action="store_true")
-    parser.add_argument("--min-relevance",  type=float, default=0.30)
-    parser.add_argument("--min-confidence", type=float, default=0.35)
+    parser.add_argument("--min-relevance",  type=float, default=GlobalConfig.KG_MIN_RELEVANCE)
+    parser.add_argument("--min-confidence", type=float, default=GlobalConfig.KG_MIN_CONFIDENCE)
     parser.add_argument("--news",       default=None)
     args = parser.parse_args()
 

@@ -8,6 +8,7 @@ from typing import List, Dict, Any, Optional
 from google import genai
 from google.genai import types
 
+from configs.config import GlobalConfig
 from .prompts import (
     FINDKG_LITE_SYSTEM_PROMPT,
     FINDKG_LITE_USER_PROMPT,
@@ -46,39 +47,35 @@ RESPONSE_SCHEMA = {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SEQUENTIAL EXTRACTOR  (1 article per call — fallback / unit test only)
-# For production use AsyncConcurrentExtractor or GeminiBatchAPIExtractor.
-# ─────────────────────────────────────────────────────────────────────────────
-
 class FinDKGLiteExtractor:
     """
     Sequential KG extractor. 1 API call per article.
     Prefer AsyncConcurrentExtractor for batches.
+
+    Thresholds từ GlobalConfig (single source of truth):
+      min_relevance  = GlobalConfig.KG_MIN_RELEVANCE  (0.50)
+      min_confidence = GlobalConfig.KG_MIN_CONFIDENCE (0.65)
     """
 
     def __init__(
         self,
-        api_key: Optional[str] = None,
-        model: str = "gemini-2.0-flash",
-        temperature: float = 0.1,
-        min_relevance: float = 0.30,
-        min_confidence: float = 0.35,
-        max_retries: int = 3,
-        backoff_base: float = 10.0,
+        api_key:        Optional[str] = None,
+        model:          str   = "gemini-2.0-flash",
+        temperature:    float = 0.1,
+        min_relevance:  float = None,   # None → GlobalConfig.KG_MIN_RELEVANCE
+        min_confidence: float = None,   # None → GlobalConfig.KG_MIN_CONFIDENCE
+        max_retries:    int   = 3,
+        backoff_base:   float = 10.0,
     ):
-        self.min_relevance  = min_relevance
-        self.min_confidence = min_confidence
+        self.min_relevance  = min_relevance  if min_relevance  is not None else GlobalConfig.KG_MIN_RELEVANCE
+        self.min_confidence = min_confidence if min_confidence is not None else GlobalConfig.KG_MIN_CONFIDENCE
         self.max_retries    = max_retries
         self.backoff_base   = backoff_base
         self.model_name     = model
 
         _api_key = api_key or os.getenv("GEMINI_API_KEY")
         if not _api_key:
-            raise RuntimeError(
-                "Missing GEMINI_API_KEY. "
-                "Set environment variable: export GEMINI_API_KEY='your_key'"
-            )
+            raise RuntimeError("Missing GEMINI_API_KEY.")
 
         self.client = genai.Client(api_key=_api_key)
         self._gen_config = types.GenerateContentConfig(
@@ -89,8 +86,6 @@ class FinDKGLiteExtractor:
             max_output_tokens=2048,
         )
 
-    # ── Prompt assembly ───────────────────────────────────────────────────────
-
     def _build_few_shot_str(self) -> str:
         parts = []
         for ex in FEW_SHOT_EXAMPLES:
@@ -99,10 +94,9 @@ class FinDKGLiteExtractor:
                 f"ARTICLE: {ex['input']}\n"
                 f"OUTPUT: {json.dumps(ex['output'], ensure_ascii=False)}"
             )
-        return "\n\n---\n\n".join(parts)
+        return "\n\n".join(parts)
 
     def _build_prompt(self, text: str, ticker: str, news_date: str) -> str:
-        """Build complete prompt. sector removed — no longer in USER_PROMPT template."""
         few_shot = self._build_few_shot_str()
         class _SafeDict(dict):
             def __missing__(self, key): return ""
@@ -118,20 +112,17 @@ class FinDKGLiteExtractor:
             f"NOW EXTRACT FROM THIS NEW ARTICLE:\n\n{user_part}"
         )
 
-    # ── Extraction ────────────────────────────────────────────────────────────
-
     def extract(
         self,
         text: str,
         ticker: str,
         news_date: str = "",
-        sector: Optional[str] = None,   # kept for backward compat, ignored
+        sector: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         if not text or not text.strip():
             return []
 
         prompt = self._build_prompt(text, ticker, news_date)
-
         last_err = None
         for attempt in range(self.max_retries):
             try:
@@ -144,15 +135,12 @@ class FinDKGLiteExtractor:
                 if not isinstance(raw, list):
                     return []
                 return self._filter_and_clamp(raw)
-
             except Exception as e:
                 last_err = e
                 wait = self.backoff_base * (2 ** attempt) + random.uniform(0, 2)
-                print(f"⚠️  Gemini error (attempt {attempt+1}/{self.max_retries}): {e}")
-                print(f"    Retry in {wait:.1f}s ...")
                 time.sleep(wait)
 
-        print(f"❌ Extraction failed after {self.max_retries} retries: {last_err}")
+        print(f"Extraction failed: {last_err}")
         return []
 
     def _filter_and_clamp(self, raw: list) -> List[Dict]:
@@ -170,10 +158,6 @@ class FinDKGLiteExtractor:
             filtered.append(t)
         return filtered
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# BACKWARD COMPAT — legacy cache migration
-# ─────────────────────────────────────────────────────────────────────────────
 
 def upgrade_legacy_triple(t: Any) -> Dict[str, Any]:
     if isinstance(t, dict):

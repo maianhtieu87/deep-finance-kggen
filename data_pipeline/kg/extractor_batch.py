@@ -1,41 +1,17 @@
-# data_pipeline/kg/extractor_batch.py
+# data_pipeline/kg/extractor_batch.py — V3.2
 """
-FinDKG-Lite Batch Extractors — V3
-
-Thay đổi chính so với V2:
-  - Chunk-based text: gộp headlines + content cho mỗi (ticker, date), chia chunk
-    3000 chars với overlap 200 chars, extract từng chunk rồi merge+dedup triples
-  - Fix lỗi 2: _all_tickers được truyền đúng qua cột _all_tickers sau explode
-  - Fix lỗi 7: detect_primary_ticker dùng title weight × 3 so với body weight × 1
-  - Fix lỗi strict-mode tier 2: effective_min nâng lên 0.75
-  - Bỏ KMeans entity resolution khỏi pipeline này (sẽ dùng alias dict ở Stage B)
-
-Fixes từ prompts.py v2 (applied vào V3):
-  - min_relevance default: 0.30 → 0.50 (aligned với prompt threshold)
-  - min_confidence default: 0.35 → 0.65 (aligned với prompt threshold)
-  - rescore_triples_for_ticker: price_impact_score được zero-out cho cross-ticker triples
-    (Bug fix: score được tính cho primary_ticker; direction không đáng tin cho ticker khác)
+Quality filter chain added in V3.2:
+  apply_quality_filters() = smart_dedup -> fix_regulates -> post_filter -> limit_signals
 """
-
 from __future__ import annotations
-
-import asyncio
-import json
-import os
-import re
-import time
-import hashlib
+import asyncio, json, os, re, time, hashlib
 from typing import Any, Dict, List, Optional, Tuple
-
 from google import genai
 from google.genai import types
-
+from configs.config import GlobalConfig
 from .prompts import (
-    FINDKG_LITE_SYSTEM_PROMPT,
-    FINDKG_LITE_USER_PROMPT,
-    FEW_SHOT_EXAMPLES,
-    VALID_ENTITY_TYPES,
-    VALID_RELATIONS,
+    FINDKG_LITE_SYSTEM_PROMPT, FINDKG_LITE_USER_PROMPT, FEW_SHOT_EXAMPLES,
+    VALID_ENTITY_TYPES, VALID_RELATIONS,
 )
 
 MODEL_ID = "gemini-2.0-flash"
@@ -45,407 +21,303 @@ RESPONSE_SCHEMA = {
     "items": {
         "type": "OBJECT",
         "properties": {
-            "subject": {
-                "type": "OBJECT",
-                "properties": {
-                    "name": {"type": "STRING"},
-                    "type": {"type": "STRING", "enum": VALID_ENTITY_TYPES},
-                },
-                "required": ["name", "type"],
-            },
-            "relation":            {"type": "STRING", "enum": VALID_RELATIONS},
-            "object": {
-                "type": "OBJECT",
-                "properties": {
-                    "name": {"type": "STRING"},
-                    "type": {"type": "STRING", "enum": VALID_ENTITY_TYPES},
-                },
-                "required": ["name", "type"],
-            },
-            "confidence":          {"type": "NUMBER"},
-            "price_impact_score":  {"type": "NUMBER"},
+            "subject": {"type": "OBJECT",
+                "properties": {"name": {"type": "STRING"}, "type": {"type": "STRING", "enum": VALID_ENTITY_TYPES}},
+                "required": ["name", "type"]},
+            "relation": {"type": "STRING", "enum": VALID_RELATIONS},
+            "object": {"type": "OBJECT",
+                "properties": {"name": {"type": "STRING"}, "type": {"type": "STRING", "enum": VALID_ENTITY_TYPES}},
+                "required": ["name", "type"]},
+            "confidence": {"type": "NUMBER"},
+            "price_impact_score": {"type": "NUMBER"},
             "relevance_to_ticker": {"type": "NUMBER"},
-            "reasoning":           {"type": "STRING"},
+            "reasoning": {"type": "STRING"},
         },
-        "required": [
-            "subject", "relation", "object",
-            "confidence", "price_impact_score", "relevance_to_ticker",
-        ],
+        "required": ["subject", "relation", "object", "confidence", "price_impact_score", "relevance_to_ticker"],
     },
 }
 
 _GEN_CONFIG_DICT = {
     "response_mime_type": "application/json",
-    "response_schema":    RESPONSE_SCHEMA,
-    "temperature":        0.1,
-    "max_output_tokens":  2048,
+    "response_schema": RESPONSE_SCHEMA,
+    "temperature": 0.1,
+    "max_output_tokens": 2048,
 }
 
+def _norm(s): return re.sub(r"\s+", " ", (s or "")).strip()
+def _sha1(s): return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
 
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
-
-
-def _sha1(s: str) -> str:
-    return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
-
-
-def _parse_tickers(val: Any) -> List[str]:
-    """Parse ticker column into list. Supports "AAPL,GOOGL" | ["AAPL"] | "AAPL"."""
-    if isinstance(val, list):
-        return [t.strip().upper() for t in val if isinstance(t, str) and t.strip()]
-    if isinstance(val, str):
-        return [t.strip().upper() for t in val.split(",") if t.strip()]
+def _parse_tickers(val):
+    if isinstance(val, list): return [t.strip().upper() for t in val if isinstance(t, str) and t.strip()]
+    if isinstance(val, str):  return [t.strip().upper() for t in val.split(",") if t.strip()]
     return []
 
-
-def _build_few_shot_str() -> str:
+def _build_few_shot_str():
     parts = []
     for ex in FEW_SHOT_EXAMPLES:
-        parts.append(
-            f"TICKER: {ex['ticker']}\n"
-            f"ARTICLE: {ex['input']}\n"
-            f"OUTPUT: {json.dumps(ex['output'], ensure_ascii=False)}"
-        )
+        parts.append(f"TICKER: {ex['ticker']}\nARTICLE: {ex['input']}\nOUTPUT: {json.dumps(ex['output'], ensure_ascii=False)}")
     return "\n\n---\n\n".join(parts)
-
 
 _FEW_SHOT_STR = _build_few_shot_str()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CHUNK-BASED TEXT SPLITTING
-# ─────────────────────────────────────────────────────────────────────────────
-
-CHUNK_SIZE    = 3000
+CHUNK_SIZE = 3000
 CHUNK_OVERLAP = 200
 
-
-def _split_at_sentence_boundary(text: str, max_chars: int) -> int:
-    if len(text) <= max_chars:
-        return len(text)
+def _split_at_sentence_boundary(text, max_chars):
+    if len(text) <= max_chars: return len(text)
     window = text[:max_chars]
     for sep in (". ", "! ", "? ", "\n", " "):
         pos = window.rfind(sep)
-        if pos > max_chars * 0.6:
-            return pos + len(sep)
+        if pos > max_chars * 0.6: return pos + len(sep)
     return max_chars
 
-
-def split_text_chunks(text: str, chunk_size: int = CHUNK_SIZE,
-                      overlap: int = CHUNK_OVERLAP) -> List[str]:
+def split_text_chunks(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     text = text.strip()
-    if len(text) <= chunk_size:
-        return [text]
-
-    chunks = []
-    start  = 0
+    if len(text) <= chunk_size: return [text]
+    chunks, start = [], 0
     while start < len(text):
-        end   = _split_at_sentence_boundary(text[start:], chunk_size)
+        end = _split_at_sentence_boundary(text[start:], chunk_size)
         chunk = text[start: start + end].strip()
-        if chunk:
-            chunks.append(chunk)
-        if start + end >= len(text):
-            break
+        if chunk: chunks.append(chunk)
+        if start + end >= len(text): break
         start = start + end - overlap
-        if start < 0:
-            start = 0
+        if start < 0: start = 0
     return chunks if chunks else [text[:chunk_size]]
 
-
-def build_combined_text(titles: List[str], contents: List[str]) -> str:
-    headline_block = "\n".join(f"- {t}" for t in titles if t and t.strip())
-    content_block  = "\n\n---\n\n".join(c for c in contents if c and c.strip())
+def build_combined_text(titles, contents):
+    h = "\n".join(f"- {t}" for t in titles if t and t.strip())
+    c = "\n\n---\n\n".join(x for x in contents if x and x.strip())
     parts = []
-    if headline_block:
-        parts.append(f"HEADLINES:\n{headline_block}")
-    if content_block:
-        parts.append(f"ARTICLES:\n{content_block}")
+    if h: parts.append(f"HEADLINES:\n{h}")
+    if c: parts.append(f"ARTICLES:\n{c}")
     return "\n\n".join(parts)
 
-
-def build_user_prompt(text: str, ticker: str, news_date: str,
-                      sector: Optional[str] = None) -> str:
+def build_user_prompt(text, ticker, news_date, sector=None):
     class _SafeDict(dict):
         def __missing__(self, key): return ""
-    user_part = FINDKG_LITE_USER_PROMPT.format_map(_SafeDict(
-        ticker=ticker,
-        news_date=news_date,
-        news_text=text,
-        sector="",
-    ))
-    return (
-        f"EXAMPLES (study these carefully):\n\n{_FEW_SHOT_STR}\n\n"
-        f"{'='*60}\n\n"
-        f"NOW EXTRACT FROM THIS NEW ARTICLE:\n\n{user_part}"
-    )
+    user_part = FINDKG_LITE_USER_PROMPT.format_map(_SafeDict(ticker=ticker, news_date=news_date, news_text=text, sector=""))
+    return f"EXAMPLES (study these carefully):\n\n{_FEW_SHOT_STR}\n\n{'='*60}\n\nNOW EXTRACT FROM THIS NEW ARTICLE:\n\n{user_part}"
 
-
-def _filter_and_clamp(raw: Any, min_relevance: float,
-                      min_confidence: float) -> List[Dict]:
-    if not isinstance(raw, list):
-        return []
+def _filter_and_clamp(raw, min_relevance, min_confidence):
+    if not isinstance(raw, list): return []
     out = []
     for t in raw:
-        if not isinstance(t, dict):
-            continue
-        rel  = float(t.get("relevance_to_ticker", 0))
-        conf = float(t.get("confidence", 0))
-        if rel < min_relevance or conf < min_confidence:
-            continue
+        if not isinstance(t, dict): continue
+        rel, conf = float(t.get("relevance_to_ticker", 0)), float(t.get("confidence", 0))
+        if rel < min_relevance or conf < min_confidence: continue
         t["confidence"]          = max(0.0, min(1.0, conf))
         t["price_impact_score"]  = max(-1.0, min(1.0, float(t.get("price_impact_score", 0.0))))
         t["relevance_to_ticker"] = max(0.0, min(1.0, rel))
         out.append(t)
     return out
 
-
-def dedup_triples(triples: List[Dict]) -> List[Dict]:
+def dedup_triples(triples):
     seen, out = set(), []
     for t in triples:
-        key = (
-            t.get("subject", {}).get("name", ""),
-            t.get("relation", ""),
-            t.get("object",  {}).get("name", ""),
-        )
+        key = (t.get("subject",{}).get("name",""), t.get("relation",""), t.get("object",{}).get("name",""))
         if key not in seen:
-            seen.add(key)
-            out.append(t)
+            seen.add(key); out.append(t)
     return out
 
+def _normalize_object_for_dedup(name):
+    if not name: return ""
+    n = name.lower()
+    n = re.sub(r'(\d),(\d)', r'\1\2', n)
+    n = re.sub(r'\b(units?|shares?|vehicles?|cars?|trucks?|vans?|jobs?|employees?|workers?|people|staff|posts?|items?|pieces?)\s*$', '', n, flags=re.IGNORECASE)
+    return re.sub(r'\s+', ' ', n).strip()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PRIMARY TICKER DETECTION  (title weight × 3)
-# ─────────────────────────────────────────────────────────────────────────────
+def smart_dedup_triples(triples):
+    if not triples: return []
+    exact_seen, exact_deduped = set(), []
+    for t in triples:
+        key = (t.get("subject",{}).get("name",""), t.get("relation",""), t.get("object",{}).get("name",""))
+        if key not in exact_seen:
+            exact_seen.add(key); exact_deduped.append(t)
+    fuzzy = {}
+    for t in exact_deduped:
+        k = (t.get("subject",{}).get("name","").lower().strip(), t.get("relation",""),
+             _normalize_object_for_dedup(t.get("object",{}).get("name","")))
+        fuzzy.setdefault(k, []).append(t)
+    result = []
+    for _, group in fuzzy.items():
+        if len(group) == 1:
+            result.append(group[0]); continue
+        impacts = [float(t.get("price_impact_score", 0)) for t in group]
+        if any(x > 0.05 for x in impacts) and any(x < -0.05 for x in impacts):
+            best = max(group, key=lambda t: (float(t.get("confidence",0)), abs(float(t.get("price_impact_score",0)))))
+        else:
+            best = max(group, key=lambda t: float(t.get("confidence",0)) * float(t.get("relevance_to_ticker",0)))
+        result.append(best)
+    return result
+
+_LEGAL_SUFFIX_RE = re.compile(
+    r',?\s*(Inc\.?|Corp\.?|Corporation|Co\.?|Company|Ltd\.?|Limited|Group|Platforms?|Holdings?|Services?|LLC|LLP|PLC|S\.A\.|N\.V\.)\.?\s*$',
+    re.IGNORECASE)
+
+def _norm_name_selfloop(name):
+    if not name: return ""
+    n = _LEGAL_SUFFIX_RE.sub('', name).strip().lower()
+    return re.sub(r'\s+', ' ', n).strip()
+
+def fix_regulates_direction(triples):
+    """Flip reversed REGULATES (COMP->ORG_REG) and drop semantic self-loops."""
+    REGULATOR_TYPES = {"ORG_GOV", "ORG_REG"}
+    COMPANY_TYPES   = {"COMP", "PRODUCT", "PERSON"}
+    result = []
+    for t in triples:
+        subj, obj = t.get("subject",{}), t.get("object",{})
+        if _norm_name_selfloop(subj.get("name","")) == _norm_name_selfloop(obj.get("name","")): continue
+        if t.get("relation") != "REGULATES":
+            result.append(t); continue
+        st, ot = subj.get("type",""), obj.get("type","")
+        if st in COMPANY_TYPES and ot in REGULATOR_TYPES:
+            t2 = dict(t); t2["subject"] = dict(obj); t2["object"] = dict(subj); result.append(t2)
+        elif st in COMPANY_TYPES and ot in COMPANY_TYPES:
+            pass
+        else:
+            result.append(t)
+    return result
+
+def post_filter_triples(triples, min_rel_relates_to=0.75):
+    """Promote RELATES_TO+ECON_IND -> ANNOUNCES; drop RELATES_TO noise; drop zero-signal."""
+    result = []
+    for t in triples:
+        rel, rv, imp = t.get("relation",""), float(t.get("relevance_to_ticker",0)), float(t.get("price_impact_score",0))
+        ot = t.get("object",{}).get("type","")
+        if rel == "RELATES_TO" and ot == "ECON_IND":
+            t2 = dict(t); t2["relation"] = "ANNOUNCES"; result.append(t2); continue
+        if rel == "RELATES_TO" and rv < min_rel_relates_to: continue
+        if abs(imp) < 0.05 and rv < 0.60: continue
+        result.append(t)
+    return result
+
+def limit_signals_per_source(triples, max_per_person=2, max_per_regulator=2):
+    """Cap PERSON SIGNALS/RAISES/ANNOUNCES to max_per_person; ORG REGULATES to max_per_regulator."""
+    LIMIT_RELS_P = {"SIGNALS", "RAISES", "ANNOUNCES"}
+    LIMIT_RELS_R = {"REGULATES"}
+    REG_TYPES    = {"ORG_GOV", "ORG_REG"}
+    indexed_sorted = sorted(enumerate(triples), key=lambda x: float(x[1].get("confidence",0)), reverse=True)
+    pc, rc, keep = {}, {}, set()
+    for orig_i, t in indexed_sorted:
+        rel, sn, st = t.get("relation",""), t.get("subject",{}).get("name",""), t.get("subject",{}).get("type","")
+        if rel in LIMIT_RELS_P and st == "PERSON":
+            if pc.get(sn, 0) >= max_per_person: continue
+            pc[sn] = pc.get(sn, 0) + 1
+        elif rel in LIMIT_RELS_R and st in REG_TYPES:
+            if rc.get(sn, 0) >= max_per_regulator: continue
+            rc[sn] = rc.get(sn, 0) + 1
+        keep.add(orig_i)
+    return [t for i, t in enumerate(triples) if i in keep]
+
+def apply_quality_filters(triples):
+    """Full quality chain: smart_dedup -> fix_regulates -> post_filter -> limit_signals."""
+    triples = smart_dedup_triples(triples)
+    triples = fix_regulates_direction(triples)
+    triples = post_filter_triples(triples)
+    triples = limit_signals_per_source(triples)
+    return triples
 
 TICKER_NAME_MAP: Dict[str, List[str]] = {
-    "TSLA":  ["Tesla", "TSLA"],
-    "AAPL":  ["Apple", "AAPL"],
-    "AMZN":  ["Amazon", "AMZN"],
-    "MSFT":  ["Microsoft", "MSFT"],
-    "GOOGL": ["Google", "Alphabet", "GOOGL"],
-    "GOOG":  ["Google", "Alphabet", "GOOG"],
-    "META":  ["Meta", "Facebook", "META"],
-    "BA":    ["Boeing", "BA"],
-    "JPM":   ["JPMorgan", "JP Morgan", "JPM"],
-    "WMT":   ["Walmart", "WMT"],
-    "NVDA":  ["Nvidia", "NVDA"],
-    "NFLX":  ["Netflix", "NFLX"],
-    "INTC":  ["Intel", "INTC"],
-    "AMD":   ["AMD", "Advanced Micro"],
-    "RIVN":  ["Rivian", "RIVN"],
-    "LCID":  ["Lucid", "LCID"],
-    "GM":    ["General Motors", "GM"],
-    "F":     ["Ford", "F Motor"],
+    "TSLA": ["Tesla","TSLA"], "AAPL": ["Apple","AAPL"], "AMZN": ["Amazon","AMZN"],
+    "MSFT": ["Microsoft","MSFT"], "GOOGL": ["Google","Alphabet","GOOGL"],
+    "GOOG": ["Google","Alphabet","GOOG"], "META": ["Meta","Facebook","META"],
+    "BA": ["Boeing","BA"], "JPM": ["JPMorgan","JP Morgan","JPM"],
+    "WMT": ["Walmart","WMT"], "NVDA": ["Nvidia","NVDA"], "NFLX": ["Netflix","NFLX"],
+    "INTC": ["Intel","INTC"], "AMD": ["AMD","Advanced Micro"],
+    "RIVN": ["Rivian","RIVN"], "LCID": ["Lucid","LCID"],
+    "GM": ["General Motors","GM"], "F": ["Ford","F Motor"],
 }
-
 TITLE_WEIGHT = 3
 
-
-def detect_primary_ticker(title: str, content: str, tickers: List[str]) -> str:
-    if not tickers:
-        return ""
-    if len(tickers) == 1:
-        return tickers[0]
-
-    title_upper   = (title   or "").upper()
-    content_upper = (content or "").upper()
-
+def detect_primary_ticker(title, content, tickers):
+    if not tickers: return ""
+    if len(tickers) == 1: return tickers[0]
+    tu, cu = (title or "").upper(), (content or "").upper()
     counts = {}
     for t in tickers:
         score = 0
         for name in TICKER_NAME_MAP.get(t, [t]):
-            n_up = name.upper()
-            score += title_upper.count(n_up) * TITLE_WEIGHT
-            score += content_upper.count(n_up)
+            n = name.upper()
+            score += tu.count(n) * TITLE_WEIGHT + cu.count(n)
         counts[t] = score
-
     best = max(counts.values())
-    if best == 0:
-        return tickers[0]
+    if best == 0: return tickers[0]
     for t in tickers:
-        if counts[t] == best:
-            return t
+        if counts[t] == best: return t
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MULTI-TICKER RESCORE
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _ticker_mentioned_in_text(ticker: str, text_upper: str) -> bool:
+def _ticker_mentioned_in_text(ticker, text_upper):
     for name in TICKER_NAME_MAP.get(ticker, [ticker]):
-        name_upper = name.upper()
+        nu = name.upper()
         if len(name) <= 3:
-            pattern = r'\b' + re.escape(name_upper) + r'\b'
-            if re.search(pattern, text_upper):
-                return True
+            if re.search(r'\b' + re.escape(nu) + r'\b', text_upper): return True
         else:
-            if name_upper in text_upper:
-                return True
+            if nu in text_upper: return True
     return False
 
-
-def _ticker_mentioned_in_triple(ticker: str, triple: Dict) -> bool:
-    target_lower = ticker.lower()
-    subj_name    = triple.get("subject", {}).get("name", "").lower()
-    obj_name     = triple.get("object",  {}).get("name", "").lower()
-    if target_lower in subj_name or target_lower in obj_name:
-        return True
+def _ticker_mentioned_in_triple(ticker, triple):
+    tl = ticker.lower()
+    sn = triple.get("subject",{}).get("name","").lower()
+    on = triple.get("object",{}).get("name","").lower()
+    if tl in sn or tl in on: return True
     for name in TICKER_NAME_MAP.get(ticker.upper(), []):
-        name_lower = name.lower()
-        if name_lower in subj_name or name_lower in obj_name:
-            return True
+        if name.lower() in sn or name.lower() in on: return True
     return False
 
-
-def rescore_triples_for_ticker(
-    triples: List[Dict],
-    primary_ticker: str,
-    target_ticker: str,
-    min_relevance: float = 0.50,
-    article_text: str = "",
-    all_article_tickers: Optional[List[str]] = None,
-) -> List[Dict]:
-    """
-    3-tier rescore + price_impact zeroing cho cross-ticker triples.
-
-    Tier 1 — target có trong text: normal min_relevance
-    Tier 2 — target KHÔNG có, nhưng ticker khác có: effective_min = 0.75
-             → strict filter nếu triple không đề cập target trong subj/obj
-    Tier 3 — không ticker nào có (pure macro): effective_min = max(0.50, min_relevance)
-
-    price_impact_score (BUG FIX):
-      Luôn zero-out cho cross-ticker triples. Lý do: LLM tính score này
-      từ góc nhìn primary_ticker; direction không đáng tin cho target_ticker.
-      Ví dụ: "Apple ANNOUNCES headset" → +0.50 cho AAPL, nhưng cho MSFT
-      đây là competitive threat → phải âm, không phải +0.50.
-      Triple vẫn giữ nguyên structure value cho GATv2.
-    """
-    if primary_ticker.upper() == target_ticker.upper():
-        return triples
-
-    text_upper     = (article_text or "").upper()
-    target_in_text = _ticker_mentioned_in_text(target_ticker, text_upper)
-    others_in_text = any(
-        _ticker_mentioned_in_text(t, text_upper)
-        for t in (all_article_tickers or [])
-        if t.upper() != target_ticker.upper()
-    )
-
-    if target_in_text:
-        strict_mode   = False
-        effective_min = min_relevance
-    elif others_in_text:
-        strict_mode   = True
-        effective_min = 0.75
-    else:
-        strict_mode   = False
-        effective_min = max(0.50, min_relevance)
-
+def rescore_triples_for_ticker(triples, primary_ticker, target_ticker, min_relevance=None, article_text="", all_article_tickers=None):
+    if min_relevance is None: min_relevance = GlobalConfig.KG_MIN_RELEVANCE
+    if primary_ticker.upper() == target_ticker.upper(): return triples
+    tu = (article_text or "").upper()
+    tin = _ticker_mentioned_in_text(target_ticker, tu)
+    oin = any(_ticker_mentioned_in_text(t, tu) for t in (all_article_tickers or []) if t.upper() != target_ticker.upper())
+    if tin:        strict, emin = False, min_relevance
+    elif oin:      strict, emin = True,  0.75
+    else:          strict, emin = False, max(0.50, min_relevance)
     out = []
     for t in triples:
-        t2       = dict(t)
+        t2 = dict(t)
         mentions = _ticker_mentioned_in_triple(target_ticker, t)
-        orig_rel = float(t.get("relevance_to_ticker", 0.0))
-
-        if strict_mode:
-            if not mentions:
-                continue
-            t2["relevance_to_ticker"] = min(1.0, orig_rel * 1.1)
+        or_ = float(t.get("relevance_to_ticker", 0.0))
+        if strict:
+            if not mentions: continue
+            t2["relevance_to_ticker"] = min(1.0, or_ * 1.1)
         else:
-            t2["relevance_to_ticker"] = (
-                min(1.0, orig_rel * 1.1) if mentions else orig_rel * 0.4
-            )
-
-        # ── BUG FIX: zero out price_impact cho mọi cross-ticker triple ──────
+            t2["relevance_to_ticker"] = min(1.0, or_ * 1.1) if mentions else or_ * 0.4
         t2["price_impact_score"] = 0.0
-
-        if t2["relevance_to_ticker"] >= effective_min:
-            out.append(t2)
+        if t2["relevance_to_ticker"] >= emin: out.append(t2)
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ASYNC CONCURRENT EXTRACTOR
-# ─────────────────────────────────────────────────────────────────────────────
-
 class AsyncConcurrentExtractor:
-    """
-    Gửi N chunks đồng thời qua asyncio.gather() + semaphore.
-    Phù hợp cho corpus < 500 articles hoặc test.
-
-    Threshold defaults aligned với prompts.py:
-      min_relevance  = 0.50  (was 0.30)
-      min_confidence = 0.65  (was 0.35)
-    """
-
-    def __init__(
-        self,
-        api_key:        Optional[str] = None,
-        model:          str   = MODEL_ID,
-        temperature:    float = 0.1,
-        min_relevance:  float = 0.50,   # ← was 0.30
-        min_confidence: float = 0.65,   # ← was 0.35
-        max_concurrent: int   = 5,
-    ):
-        self.min_relevance  = min_relevance
-        self.min_confidence = min_confidence
-        self.max_concurrent = max_concurrent
-        self.model          = model
-        self.temperature    = temperature
-
+    def __init__(self, api_key=None, model=MODEL_ID, temperature=0.1, min_relevance=None, min_confidence=None, max_concurrent=None):
+        self.min_relevance  = min_relevance  if min_relevance  is not None else GlobalConfig.KG_MIN_RELEVANCE
+        self.min_confidence = min_confidence if min_confidence is not None else GlobalConfig.KG_MIN_CONFIDENCE
+        self.max_concurrent = max_concurrent if max_concurrent is not None else GlobalConfig.KG_MAX_CONCURRENT
+        self.model = model
         _key = api_key or os.getenv("GEMINI_API_KEY")
-        if not _key:
-            raise RuntimeError("Missing GEMINI_API_KEY.")
+        if not _key: raise RuntimeError("Missing GEMINI_API_KEY.")
         self.client = genai.Client(api_key=_key)
         self._gen_config = types.GenerateContentConfig(
             system_instruction=FINDKG_LITE_SYSTEM_PROMPT,
             response_mime_type="application/json",
             response_schema=RESPONSE_SCHEMA,
-            temperature=temperature,
-            max_output_tokens=2048,
-        )
+            temperature=temperature, max_output_tokens=2048)
 
-    async def _extract_one_async(
-        self, idx: int, article: Dict[str, str], semaphore: asyncio.Semaphore,
-    ) -> Tuple[int, List[Dict]]:
+    async def _extract_one_async(self, idx, article, semaphore):
         async with semaphore:
-            prompt = build_user_prompt(
-                text=article.get("text", ""),
-                ticker=article.get("ticker", "UNKNOWN"),
-                news_date=article.get("date", ""),
-            )
+            prompt = build_user_prompt(article.get("text",""), article.get("ticker","UNKNOWN"), article.get("date",""))
             try:
-                response = await asyncio.to_thread(
-                    self.client.models.generate_content,
-                    model=self.model,
-                    contents=prompt,
-                    config=self._gen_config,
-                )
-                raw = json.loads(response.text)
-                return idx, _filter_and_clamp(raw, self.min_relevance, self.min_confidence)
+                response = await asyncio.to_thread(self.client.models.generate_content, model=self.model, contents=prompt, config=self._gen_config)
+                return idx, _filter_and_clamp(json.loads(response.text), self.min_relevance, self.min_confidence)
             except Exception as e:
-                print(f"  Async extract error idx={idx} ticker={article.get('ticker')}: {e}")
-                return idx, []
+                print(f"  Async extract error idx={idx}: {e}"); return idx, []
 
-    def extract_batch(self, articles: List[Dict[str, str]]) -> List[List[Dict]]:
-        """
-        articles: list of {text, ticker, date}
-        Trả về list[list[triple]] — index i = triples cho articles[i].
-        """
-        if not articles:
-            return []
-
+    def extract_batch(self, articles):
+        if not articles: return []
         async def _run_all():
-            semaphore = asyncio.Semaphore(self.max_concurrent)
-            tasks = [self._extract_one_async(i, art, semaphore)
-                     for i, art in enumerate(articles)]
-            return await asyncio.gather(*tasks)
-
-        print(f"  AsyncConcurrentExtractor: {len(articles)} chunks, "
-              f"max_concurrent={self.max_concurrent}")
+            sem = asyncio.Semaphore(self.max_concurrent)
+            return await asyncio.gather(*[self._extract_one_async(i, a, sem) for i, a in enumerate(articles)])
+        print(f"  AsyncConcurrentExtractor: {len(articles)} chunks, max_concurrent={self.max_concurrent}")
         t0 = time.time()
-
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
@@ -456,109 +328,45 @@ class AsyncConcurrentExtractor:
                 pairs = loop.run_until_complete(_run_all())
         except RuntimeError:
             pairs = asyncio.run(_run_all())
-
-        elapsed = time.time() - t0
-        ok = sum(1 for _, t in pairs if t is not None)
-        print(f"  Done in {elapsed:.1f}s  ({ok}/{len(articles)} succeeded)")
-
-        results: List[List[Dict]] = [[] for _ in articles]
-        for idx, triples in pairs:
-            results[idx] = triples or []
+        print(f"  Done in {time.time()-t0:.1f}s  ({sum(1 for _,t in pairs if t is not None)}/{len(articles)} succeeded)")
+        results = [[] for _ in articles]
+        for idx, triples in pairs: results[idx] = triples or []
         return results
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GEMINI BATCH API EXTRACTOR
-# ─────────────────────────────────────────────────────────────────────────────
-
 class GeminiBatchAPIExtractor:
-    """
-    50% cost, async job — dùng cho corpus > 500 chunks.
-
-    Threshold defaults aligned với prompts.py:
-      min_relevance  = 0.50  (was 0.30)
-      min_confidence = 0.65  (was 0.35)
-    """
-
-    def __init__(
-        self,
-        api_key:            Optional[str] = None,
-        model:              str   = MODEL_ID,
-        min_relevance:      float = 0.50,   # ← was 0.30
-        min_confidence:     float = 0.65,   # ← was 0.35
-        poll_interval_secs: int   = 30,
-        max_wait_secs:      int   = 86400,
-        display_name:       str   = "findkg-lite-v3",
-    ):
-        self.min_relevance  = min_relevance
-        self.min_confidence = min_confidence
-        self.poll_interval  = poll_interval_secs
-        self.max_wait       = max_wait_secs
-        self.display_name   = display_name
-        self.model          = f"models/{model}"
-
+    def __init__(self, api_key=None, model=MODEL_ID, min_relevance=None, min_confidence=None, poll_interval_secs=30, max_wait_secs=86400, display_name="findkg-lite-v3"):
+        self.min_relevance  = min_relevance  if min_relevance  is not None else GlobalConfig.KG_MIN_RELEVANCE
+        self.min_confidence = min_confidence if min_confidence is not None else GlobalConfig.KG_MIN_CONFIDENCE
+        self.poll_interval, self.max_wait, self.display_name = poll_interval_secs, max_wait_secs, display_name
+        self.model = f"models/{model}"
         _key = api_key or os.getenv("GEMINI_API_KEY")
-        if not _key:
-            raise RuntimeError("Missing GEMINI_API_KEY.")
+        if not _key: raise RuntimeError("Missing GEMINI_API_KEY.")
         self.client = genai.Client(api_key=_key)
 
-    def extract_batch(self, articles: List[Dict[str, str]]) -> List[List[Dict]]:
-        if not articles:
-            return []
-
-        inline_requests = []
-        for i, art in enumerate(articles):
-            prompt = build_user_prompt(
-                text=art.get("text", ""),
-                ticker=art.get("ticker", "UNKNOWN"),
-                news_date=art.get("date", ""),
-            )
-            inline_requests.append({
-                "key": str(i),
-                "request": {
-                    "contents": [{"parts": [{"text": prompt}], "role": "user"}],
-                    "system_instruction": {"parts": [{"text": FINDKG_LITE_SYSTEM_PROMPT}]},
-                    "generation_config": _GEN_CONFIG_DICT,
-                },
-            })
-
+    def extract_batch(self, articles):
+        if not articles: return []
+        inline_requests = [{"key": str(i), "request": {
+            "contents": [{"parts": [{"text": build_user_prompt(a.get("text",""), a.get("ticker","UNKNOWN"), a.get("date",""))}], "role": "user"}],
+            "system_instruction": {"parts": [{"text": FINDKG_LITE_SYSTEM_PROMPT}]},
+            "generation_config": _GEN_CONFIG_DICT}} for i, a in enumerate(articles)]
         print(f"  GeminiBatchAPIExtractor: submitting {len(inline_requests)} chunks")
-        batch_job = self.client.batches.create(
-            model=self.model,
-            src=inline_requests,
-            config={"display_name": self.display_name},
-        )
-        job_name = batch_job.name
-        print(f"  Job: {job_name}  State: {batch_job.state.name}")
-
-        terminal = {"JOB_STATE_SUCCEEDED", "JOB_STATE_FAILED", "JOB_STATE_CANCELLED"}
-        elapsed  = 0
+        batch_job = self.client.batches.create(model=self.model, src=inline_requests, config={"display_name": self.display_name})
+        print(f"  Job: {batch_job.name}  State: {batch_job.state.name}")
+        terminal = {"JOB_STATE_SUCCEEDED","JOB_STATE_FAILED","JOB_STATE_CANCELLED"}
+        elapsed = 0
         while elapsed < self.max_wait:
-            time.sleep(self.poll_interval)
-            elapsed += self.poll_interval
-            batch_job = self.client.batches.get(name=job_name)
-            state = batch_job.state.name
-            print(f"  [{elapsed:5d}s] {state}")
-            if state in terminal:
-                break
-
+            time.sleep(self.poll_interval); elapsed += self.poll_interval
+            batch_job = self.client.batches.get(name=batch_job.name)
+            print(f"  [{elapsed:5d}s] {batch_job.state.name}")
+            if batch_job.state.name in terminal: break
         if batch_job.state.name != "JOB_STATE_SUCCEEDED":
-            print(f"Batch job failed: {batch_job.state.name}")
-            return [[] for _ in articles]
-
-        results: List[List[Dict]] = [[] for _ in articles]
-        inlined = getattr(batch_job.response, "inlined_responses", None) or []
-        for resp in inlined:
+            print(f"Batch job failed: {batch_job.state.name}"); return [[] for _ in articles]
+        results = [[] for _ in articles]
+        for resp in (getattr(batch_job.response, "inlined_responses", None) or []):
             try:
                 idx = int(resp.key)
-            except (ValueError, AttributeError):
-                continue
-            if 0 <= idx < len(articles):
-                try:
-                    raw_text = resp.response.candidates[0].content.parts[0].text
-                    results[idx] = _filter_and_clamp(
-                        json.loads(raw_text), self.min_relevance, self.min_confidence
-                    )
-                except Exception:
-                    results[idx] = []
+                if 0 <= idx < len(articles):
+                    results[idx] = _filter_and_clamp(json.loads(resp.response.candidates[0].content.parts[0].text), self.min_relevance, self.min_confidence)
+            except Exception: pass
         return results
