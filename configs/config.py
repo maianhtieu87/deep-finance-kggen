@@ -1,13 +1,11 @@
 # configs/config.py
 """
-Configuration V4 — 9-ticker universe.
+Configuration V5 — 9-ticker universe.
 
-Thay đổi so với V3:
-  - news_embed_dim = 1024  (Voyage-3-large output)
-  - KG_MIN_RELEVANCE / KG_MIN_CONFIDENCE: centralized thresholds (single source of truth)
-  - use_gnn = False  (GATv2 pipeline removed)
+V5 changes vs V4:
+  - Remove KG_WINDOW_EMBED (rolling window removed from embed_news.py)
+  - CHUNK_SIZE 3000→5000, CHUNK_OVERLAP 200→0 (in extractor_batch.py)
 """
-
 import os
 from datetime import datetime
 
@@ -53,14 +51,11 @@ class GlobalConfig:
 
     # ─────────────────────────────────────────────────────────────────────────
     # KG EXTRACTION THRESHOLDS  ← SINGLE SOURCE OF TRUTH
-    # Thay đổi ở đây sẽ propagate tự động tới tất cả scripts:
-    #   extractor.py, extractor_batch.py, extract_corpus.py,
-    #   embed_news.py, build_graphs.py, test_extraction.py, main_test.py
     # ─────────────────────────────────────────────────────────────────────────
     KG_MIN_RELEVANCE  = 0.50   # skip triple if relevance_to_ticker < this
     KG_MIN_CONFIDENCE = 0.65   # skip triple if confidence < this
     KG_MAX_CONCURRENT = 5      # async concurrent Gemini API calls
-    KG_WINDOW_EMBED   = 3      # rolling window days for embed_news.py aggregation
+    # KG_WINDOW_EMBED removed in V5 — embed_news.py embeds each day independently
 
     # Voyage embedding
     EMBED_MODEL       = "voyage-3-large"
@@ -105,7 +100,6 @@ class TrainConfig:
 
     news_embed_dim  = 1024   # Voyage-3-large output dimension
 
-    # GNN config (kept for reference, NOT used in V4)
     use_gnn        = False
     gnn_type       = "gat"
     gnn_hidden_dim = 128
@@ -121,7 +115,6 @@ class TrainConfig:
     use_label_smoothing = False
     label_smoothing     = 0.1
 
-    kg_window_days = 3
     kg_top_triples = 5
     kg_use_voyage  = True
     kg_allow_llm   = False
@@ -174,37 +167,30 @@ class PathConfig:
 
 def validate_config() -> bool:
     errors = []
-
     for path in [GlobalConfig.DATA_DIR, GlobalConfig.RAW_PATH, GlobalConfig.INTERIM_PATH]:
         if not os.path.exists(path):
             errors.append(f"Path does not exist: {path}")
-
     expected = {"TSLA", "AAPL", "AMZN", "MSFT", "GOOGL", "META", "BA", "JPM", "WMT"}
     actual   = set(GlobalConfig.TICKERS)
     if actual != expected:
         errors.append(f"TICKERS mismatch. Expected {sorted(expected)}, got {sorted(actual)}")
-
     if TrainConfig.news_embed_dim != 1024:
-        errors.append(
-            f"news_embed_dim should be 1024 (Voyage-3-large) but is {TrainConfig.news_embed_dim}"
-        )
-
+        errors.append(f"news_embed_dim should be 1024 but is {TrainConfig.news_embed_dim}")
     if errors:
         print("Configuration errors:")
         for e in errors:
             print(f"  - {e}")
         return False
-
-    print("Configuration validated (V4 — Voyage direct embedding)")
+    print("Configuration validated (V5 — Voyage direct embedding, no rolling window)")
     print(f"  KG thresholds: min_relevance={GlobalConfig.KG_MIN_RELEVANCE}  "
           f"min_confidence={GlobalConfig.KG_MIN_CONFIDENCE}")
     return True
 
 
 if __name__ == "__main__":
-    print("=== Configuration V4 ===")
+    print("=== Configuration V5 ===")
     print(f"Tickers  : {GlobalConfig.TICKERS}")
-    print(f"Date     : {GlobalConfig.START_DATE} → {GlobalConfig.END_DATE}")
+    print(f"Date     : {GlobalConfig.START_DATE} -> {GlobalConfig.END_DATE}")
     print(f"News dim : {TrainConfig.news_embed_dim} (Voyage-3-large)")
     print(f"use_gnn  : {TrainConfig.use_gnn}")
     print(f"KG thresholds: rel>={GlobalConfig.KG_MIN_RELEVANCE}  conf>={GlobalConfig.KG_MIN_CONFIDENCE}")

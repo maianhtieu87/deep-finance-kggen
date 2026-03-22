@@ -34,13 +34,6 @@ class StableGatedCrossAttention(nn.Module):
         super().__init__()
         
         # ===== STEP 1: Multi-Head Cross-Attention (Eq. 8-9) =====
-        # Internally processes M heads in PARALLEL:
-        # for m in range(num_heads):
-        #     Q_m = primary @ W_Q[m]
-        #     K_m = aux @ W_K[m]
-        #     V_m = aux @ W_V[m]
-        #     attn_m = softmax(Q_m @ K_m^T / √d) @ V_m
-        # output = concat(attn_1, ..., attn_M) @ W_O
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=dim,
             num_heads=num_head,
@@ -56,6 +49,12 @@ class StableGatedCrossAttention(nn.Module):
         # W_b: Generate gate signal from primary (stable) modality
         self.W_b = nn.Linear(dim, dim)
         self.bias_b = nn.Parameter(torch.zeros(dim))
+
+        # ✅ NEW: Initialize gate bias for safer start
+        nn.init.constant_(self.W_b.bias, 1.0)
+        # Gate ≈ sigmoid(1) ≈ 0.73 instead of ≈0
+        # This prevents early-stage suppression of auxiliary signals
+        # GNN must still learn meaningful gating later
         
         # ===== STEP 3: Normalization =====
         self.norm = nn.LayerNorm(dim)
@@ -73,61 +72,34 @@ class StableGatedCrossAttention(nn.Module):
         
         Returns:
             output: Gated fusion result (B, T, D)
-        
-        Process:
-            1. Unstable fusion via multi-head cross-attention
-            2. Stable selection via gating from primary
-            3. Residual connection + normalization
         """
         
         # ========================================
         # STEP 1: UNSTABLE FUSION (Eq. 8-9)
         # ========================================
-        # Multi-head cross-attention:
-        # - Query: from Primary (what we trust)
-        # - Key/Value: from Auxiliary (what we want to filter)
-        # 
-        # Output: H^l_{unstable} = MHA(Q=primary, K=aux, V=aux)
         H_unstable, _ = self.cross_attn(
-            query=primary,      # (B, T, D) - Reliable signal
-            key=aux,            # (B, T, D) - Noisy signal
-            value=aux,          # (B, T, D)
-            need_weights=False  # Don't return attention weights
-        )  # → (B, T, D)
+            query=primary,
+            key=aux,
+            value=aux,
+            need_weights=False
+        )
         
         # ========================================
         # STEP 2: STABLE GATING (Eq. 10-11)
         # ========================================
         
-        # Eq. 10a: Transform unstable features
-        # H_a = H_unstable @ W_a + b_a
-        H_a = self.W_a(H_unstable) + self.bias_a  # (B, T, D)
+        # Transform unstable features
+        H_a = self.W_a(H_unstable) + self.bias_a
         
-        # Eq. 10b: Generate gate from PRIMARY modality
-        # H_b = Sigmoid(Primary @ W_b + b_b)
-        # 
-        # Gate interpretation:
-        # - H_b → 1: Auxiliary is reliable, keep it
-        # - H_b → 0: Auxiliary is noisy, filter it out
-        H_b = torch.sigmoid(self.W_b(primary) + self.bias_b)  # (B, T, D)
+        # Generate gate from primary modality
+        H_b = torch.sigmoid(self.W_b(primary) + self.bias_b)
         
-        # Eq. 11: Gated selection (Element-wise product)
-        # H_gated = H_a ⊙ H_b
-        #
-        # ⚠️ KEY DIFFERENCE from Highway Networks:
-        # - Highway: output = (1-gate)*old + gate*new
-        # - MSGCA:   output = gate * new  (only keep gated part)
-        #
-        # Why MSGCA is better:
-        # - Explicitly filters noise via primary guidance
-        # - Prevents "leaky residual" from noisy modality
-        H_gated = H_a * H_b  # (B, T, D)
+        # Element-wise gated selection
+        H_gated = H_a * H_b
         
         # ========================================
         # STEP 3: RESIDUAL + NORMALIZATION
         # ========================================
-        # Add residual from primary (stable baseline)
-        # Normalize for training stability
         output = self.norm(primary + self.dropout(H_gated))
         
         return output

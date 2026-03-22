@@ -1,5 +1,16 @@
-# extract_corpus.py — V3.2
-"""Stage A: LLM Extraction. Uses apply_quality_filters() chain at cache-save."""
+# extract_corpus.py — V3.6
+"""
+Stage A: LLM Extraction.
+
+V3.6 changes vs V3.4:
+  - Cross-article dedup + caps applied on merged triple list after
+    all articles for (ticker, date) are collected:
+      all_triples = smart_dedup_triples(all_triples)   # Fix A, C
+      all_triples = limit_signals_per_source(all_triples)  # Fix B
+    Catches same-event duplicates that come from N different articles
+    reporting the same stock drop or guidance cut on the same day.
+  - _save_cache version bumped to v3.6.
+"""
 from __future__ import annotations
 import argparse, hashlib, json, os, re, sys, time
 from collections import defaultdict
@@ -9,8 +20,9 @@ from configs.config import GlobalConfig
 from data_pipeline.kg.extractor_batch import (
     AsyncConcurrentExtractor, GeminiBatchAPIExtractor,
     detect_primary_ticker, build_combined_text, split_text_chunks,
-    dedup_triples, apply_quality_filters,
-    rescore_triples_for_ticker, _sha1, _norm, _filter_and_clamp, _parse_tickers,
+    dedup_triples, apply_quality_filters, smart_dedup_triples, limit_signals_per_source,
+    filter_triples_for_ticker, _sha1, _norm, _filter_and_clamp, _parse_tickers,
+    tag_triples_source,
 )
 
 def _cache_path(cache_dir, sha1): return os.path.join(cache_dir, f"{sha1}.json")
@@ -22,7 +34,7 @@ def _load_cache(cache_dir, sha1):
     except Exception: return None
 def _save_cache(cache_dir, sha1, triples, meta=None):
     os.makedirs(cache_dir, exist_ok=True)
-    payload = {"triples": triples, "_v": "v3.2"}
+    payload = {"triples": triples, "_v": "v3.6"}
     if meta: payload["_meta"] = meta
     with open(_cache_path(cache_dir, sha1), "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False)
@@ -53,7 +65,14 @@ def normalize_news_df(df):
     return df
 
 def extract_and_cache_per_article(day_df, ticker, date_str, extractor, cache_dir, min_relevance, min_confidence):
-    """Extract with apply_quality_filters() chain at cache-save point."""
+    """
+    Extract triples for (ticker, date).
+
+    Per-article: apply_quality_filters() handles within-article dedup + caps.
+    Cross-article merge: smart_dedup_triples() + limit_signals_per_source()
+    applied on the merged list to catch cross-article duplicates
+    (e.g. WMT -9.3% and WMT -9.2% from 2 different articles covering same drop).
+    """
     sha1_to_meta, sha1_to_raw, cache_hits = {}, {}, 0
     for _, row in day_df.iterrows():
         title   = _norm(str(row.get("title","")   or ""))
@@ -83,20 +102,29 @@ def extract_and_cache_per_article(day_df, ticker, date_str, extractor, cache_dir
         for (sha1, _), triples in zip(chunk_jobs, results): sha1_chunks[sha1].extend(triples or [])
         for h in uncached:
             merged  = _filter_and_clamp(sha1_chunks[h], min_relevance, min_confidence)
-            # ── QUALITY FILTER CHAIN (Bug 1 + REGULATES + RELATES_TO + analyst cap) ──
-            deduped = apply_quality_filters(merged)
+            deduped = apply_quality_filters(merged)   # per-article filters
+            deduped = tag_triples_source(deduped, h)  # traceability
             sha1_to_raw[h] = deduped
             _save_cache(cache_dir, h, deduped, meta=sha1_to_meta[h])
     else:
         if sha1_to_meta: print(f"  [{ticker} {date_str}] all {cache_hits} article(s) from cache")
 
+    # ── Merge all articles for this (ticker, date) ────────────────────────
     all_triples = []
     for h, raw in sha1_to_raw.items():
         if not raw: continue
         meta = sha1_to_meta[h]
-        rescored = rescore_triples_for_ticker(raw, meta["primary_ticker"], ticker, min_relevance, meta["full_text"], meta["all_tickers"])
-        rescored = [t for t in rescored if float(t.get("confidence",0)) >= min_confidence]
-        all_triples.extend(rescored)
+        filtered = filter_triples_for_ticker(raw, meta["primary_ticker"], ticker, min_relevance)
+        filtered = [t for t in filtered if float(t.get("confidence",0)) >= min_confidence]
+        all_triples.extend(filtered)
+
+    # ── Cross-article dedup + caps (V3.6) ─────────────────────────────────
+    # smart_dedup catches same-event duplicates across articles using
+    # _normalize_object_for_dedup (Fix A: stock %, Fix C: guidance strings).
+    # limit_signals_per_source re-applies caps on the merged pool
+    # (Fix B: analyst COMP price target cap=1 per firm across all articles).
+    all_triples = smart_dedup_triples(all_triples)
+    all_triples = limit_signals_per_source(all_triples)
     return dedup_triples(all_triples)
 
 def run_stage_a(news_df, cache_dir, use_gemini_batch=False, max_concurrent=None, min_relevance=None, min_confidence=None, ticker_filter=None, date_prefix=None):

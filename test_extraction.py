@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_extraction.py — V4 Pipeline with apply_quality_filters chain."""
+"""test_extraction.py — V4 Pipeline (V3.6 filter logic)"""
 from __future__ import annotations
 import argparse, hashlib, json, os, random, re, sys, textwrap, time
 from collections import defaultdict
@@ -14,9 +14,9 @@ from configs.config import GlobalConfig
 from data_pipeline.kg.extractor_batch import (
     AsyncConcurrentExtractor, GeminiBatchAPIExtractor,
     build_combined_text, detect_primary_ticker, split_text_chunks,
-    dedup_triples, apply_quality_filters,
-    rescore_triples_for_ticker, _sha1, _norm, _parse_tickers,
-    _filter_and_clamp, TICKER_NAME_MAP,
+    dedup_triples, apply_quality_filters, smart_dedup_triples, limit_signals_per_source,
+    filter_triples_for_ticker, _sha1, _norm, _parse_tickers,
+    _filter_and_clamp, TICKER_NAME_MAP, tag_triples_source,
 )
 
 DEFAULT_PARQUET = os.path.join(GlobalConfig.INTERIM_PATH, "concatenated_news_filtered.parquet")
@@ -34,7 +34,7 @@ def _save_cache(cache_dir, sha1, triples):
     if not cache_dir: return
     os.makedirs(cache_dir, exist_ok=True)
     with open(_cache_path(cache_dir, sha1), "w", encoding="utf-8") as f:
-        json.dump({"triples": triples, "_v": "v3.2"}, f, ensure_ascii=False)
+        json.dump({"triples": triples, "_v": "v3.6"}, f, ensure_ascii=False)
 
 def load_and_normalize(parquet_path):
     df = pd.read_parquet(parquet_path)
@@ -88,7 +88,14 @@ def sample_by_tickers(df, tickers, seed=None):
     return result
 
 def extract_one(ticker, date_str, day_df, extractor, cache_dir, min_relevance, min_confidence):
-    """Extract with apply_quality_filters() at cache-save point."""
+    """
+    Extract triples for (ticker, date).
+
+    Per-article: apply_quality_filters() handles within-article dedup + caps.
+    Cross-article merge: smart_dedup_triples() + limit_signals_per_source()
+    applied on the merged list to catch cross-article duplicates
+    (e.g. WMT -9.3% and WMT -9.2% from 2 different articles covering same drop).
+    """
     titles   = day_df["title"].fillna("").tolist()
     all_tickers_day = list({t for ts in day_df["_all_tickers"] for t in ts})
     sha1_to_meta, sha1_to_raw, cache_hits = {}, {}, 0
@@ -121,21 +128,30 @@ def extract_one(ticker, date_str, day_df, extractor, cache_dir, min_relevance, m
         for (h, _), triples in zip(chunk_jobs, results): sha1_chunks[h].extend(triples or [])
         for h in uncached:
             merged  = _filter_and_clamp(sha1_chunks[h], min_relevance, min_confidence)
-            # ── QUALITY FILTER CHAIN ────────────────────────────────────────────
-            deduped = apply_quality_filters(merged)
+            deduped = apply_quality_filters(merged)   # per-article filters
+            deduped = tag_triples_source(deduped, h)  # traceability
             sha1_to_raw[h] = deduped
             _save_cache(cache_dir, h, deduped)
     else:
         print(f"  All {cache_hits} article(s) from cache")
 
+    # ── Merge all articles for this (ticker, date) ────────────────────────
     all_raw = []
     for h, raw in sha1_to_raw.items():
         if not raw: continue
         meta = sha1_to_meta[h]
-        rs   = rescore_triples_for_ticker(raw, meta["primary"], ticker, min_relevance, meta["full_text"], meta["all_t"])
-        rs   = [t for t in rs if float(t.get("confidence",0)) >= min_confidence]
-        all_raw.extend(rs)
-    final = dedup_triples(all_raw)
+        filtered = filter_triples_for_ticker(raw, meta["primary"], ticker, min_relevance)
+        filtered = [t for t in filtered if float(t.get("confidence",0)) >= min_confidence]
+        all_raw.extend(filtered)
+
+    # ── Cross-article dedup + caps (V3.6) ─────────────────────────────────
+    # smart_dedup catches same-event duplicates across articles using
+    # _normalize_object_for_dedup (Fix A: stock %, Fix C: guidance strings).
+    # limit_signals_per_source re-applies caps on the merged pool
+    # (Fix B: analyst COMP price target cap=1 per firm across all articles).
+    all_raw = smart_dedup_triples(all_raw)
+    all_raw = limit_signals_per_source(all_raw)
+    final   = dedup_triples(all_raw)
 
     cross = {}
     for target in all_tickers_day:
@@ -144,7 +160,7 @@ def extract_one(ticker, date_str, day_df, extractor, cache_dir, min_relevance, m
         for h, raw in sha1_to_raw.items():
             if not raw: continue
             meta = sha1_to_meta[h]
-            rs2.extend(rescore_triples_for_ticker(raw, meta["primary"], target, min_relevance, meta["full_text"], meta["all_t"]))
+            rs2.extend(filter_triples_for_ticker(raw, meta["primary"], target, min_relevance))
         cross[target] = dedup_triples([t for t in rs2 if float(t.get("confidence",0)) >= min_confidence])
 
     return {"ticker": ticker, "date": date_str, "n_articles": len(titles), "n_unique": len(sha1_to_meta),
@@ -168,7 +184,8 @@ def print_triple(i, t):
     rel = t.get("relation","?")
     cf, rv, imp = float(t.get("confidence",0)), float(t.get("relevance_to_ticker",0)), float(t.get("price_impact_score",0))
     rsn = t.get("reasoning","")
-    print(f"\n  #{i+1} [{_grp(rel)}]  {s.get('name','?')} —{rel}→ {o.get('name','?')}")
+    src = t.get("_src", "?")
+    print(f"\n  #{i+1} [{_grp(rel)}] [{src}]  {s.get('name','?')} —{rel}→ {o.get('name','?')}")
     print(f"       conf={cf:.2f} {_bar(cf)}  rel={rv:.2f} {_bar(rv)}  impact={imp:+.2f} {_impact(imp)}")
     if rsn: print(textwrap.fill(rsn, 64, initial_indent="       -> ", subsequent_indent="          "))
 
@@ -176,20 +193,20 @@ def print_result(r, show_cross=True):
     t, d = r["ticker"], r["date"]
     print(f"\n{'='*66}\n  {t}  |  {d}")
     print(f"  {r['n_articles']} articles  ->  {r['n_unique']} unique  ->  {r['n_chunks']} chunks  |  cache_hits={r['cache_hits']}  |  {r['elapsed']:.1f}s")
-    print(f"  Primary triples after rescore: {len(r['triples'])}")
+    print(f"  Primary triples after filter: {len(r['triples'])}")
     if not r["triples"]: print("  (no triples)")
     for i, tri in enumerate(r["triples"]): print_triple(i, tri)
     if show_cross:
         ce = {k:v for k,v in r["cross"].items() if v}
         if ce:
-            print(f"\n  Cross-ticker:")
+            print(f"\n  Cross-ticker (mention-only):")
             for ct, ct_triples in sorted(ce.items()):
                 avg_rel = sum(float(x.get("relevance_to_ticker",0)) for x in ct_triples) / len(ct_triples)
                 print(f"    {ct}: {len(ct_triples)} triples  avg_rel={avg_rel:.2f}")
 
 def print_summary(results, total_elapsed):
     print(f"\n{chr(9473)*66}")
-    print(f"  SUMMARY  —  V4 pipeline (chunk-based, title×3, tier2=0.75)")
+    print(f"  SUMMARY  —  V4 pipeline V3.6 (cross-article dedup + analyst PT cap)")
     print(f"{chr(9473)*66}")
     print(f"  Days tested : {len(results)}  Total time  : {total_elapsed:.1f}s\n")
     print(f"  {'Ticker':6}  {'Date':12}  {'Arts':>4}  {'Chunks':>6}  {'Triples':>7}  {'Avg impact':>11}")
@@ -215,7 +232,7 @@ def print_summary(results, total_elapsed):
     print(f"{chr(9473)*66}\n")
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Test extraction V4")
+    p = argparse.ArgumentParser(description="Test extraction V4 (V3.6)")
     p.add_argument("--days",     type=int,   default=None)
     p.add_argument("--tickers",  nargs="+",  default=None)
     p.add_argument("--filter",   default=None)
@@ -237,7 +254,7 @@ def main():
     if args.days is None and args.tickers is None:
         print("Need --days N or --tickers T1 T2 ..."); sys.exit(1)
     print("="*66)
-    print("  Test Extraction — V4 Pipeline")
+    print("  Test Extraction — V4 Pipeline (V3.6)")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  Thresholds: min_relevance={args.min_relevance}  min_confidence={args.min_confidence}")
     print("="*66)
@@ -272,8 +289,10 @@ def main():
     if args.save:
         try:
             with open(args.save, "w", encoding="utf-8") as f:
-                json.dump({"meta": {"timestamp": datetime.now().isoformat(), "min_relevance": args.min_relevance, "min_confidence": args.min_confidence},
-                           "results": [{k:v for k,v in r.items() if k != "cross"} for r in results]}, f, ensure_ascii=False, indent=2, default=str)
+                json.dump({"run_info": {"timestamp": datetime.now().isoformat(),
+                           "min_relevance": args.min_relevance, "min_confidence": args.min_confidence},
+                           "results": [{k:v for k,v in r.items() if k != "cross"} for r in results]},
+                          f, ensure_ascii=False, indent=2, default=str)
             print(f"Saved: {args.save}")
         except Exception as e: print(f"Save failed: {e}")
 

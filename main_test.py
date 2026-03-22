@@ -2,12 +2,7 @@
 """
 Pipeline orchestrator V4.
 
-Luồng:
-  Phase A: Price + Macro data (Yahoo + FRED)
-  Phase B: News alignment
-  Phase B.1: Stage A — LLM extraction (extract_corpus.py)  [nếu cần]
-  Phase B.2: Voyage embedding (embed_news.py)              [nếu cần]
-  Phase C: Build unified_dataset.pkl (builder.py V4)
+V3.4 change: removed window_days from _run_embed (rolling window removed).
 """
 
 import os
@@ -23,7 +18,6 @@ from data_pipeline.builder import DatasetBuilder
 
 
 def _check_news_embeddings(emb_path: str, n_sample: int = 5) -> bool:
-    """Sanity check news_embeddings.json format."""
     if not os.path.exists(emb_path):
         print(f"  news_embeddings.json not found: {emb_path}")
         return False
@@ -33,7 +27,6 @@ def _check_news_embeddings(emb_path: str, n_sample: int = 5) -> bool:
         if not isinstance(obj, dict) or len(obj) == 0:
             print("  news_embeddings.json is empty.")
             return False
-        # Check a sample
         sample_dates = list(obj.keys())[:n_sample]
         ok = 0
         for d in sample_dates:
@@ -61,7 +54,7 @@ def run_pipeline():
         print(f"News file not found: {EXISTING_NEWS_PATH}")
         return
 
-    # ── Phase A: Price + Macro ────────────────────────────────────────────────
+    # Phase A: Price + Macro
     print("\n--- Phase A: Price + Macro ---")
     yahoo = YahooFetcher()
     os.makedirs(GlobalConfig.RAW_PRICE_PATH, exist_ok=True)
@@ -82,7 +75,7 @@ def run_pipeline():
     trading_dates = list(processed_price_macro.keys())
     print(f"  {len(trading_dates)} trading days")
 
-    # ── Phase B: News alignment ───────────────────────────────────────────────
+    # Phase B: News alignment
     print("\n--- Phase B: News alignment ---")
     news_proc = NewsProcessor()
     processed_news = pd.read_parquet(EXISTING_NEWS_PATH)
@@ -96,7 +89,7 @@ def run_pipeline():
     aligned_news = news_proc.align_to_trading_days(processed_news, trading_dates)
     print(f"  After alignment: {len(aligned_news)} records")
 
-    # ── Phase B.1: Stage A — LLM extraction (optional) ───────────────────────
+    # Phase B.1: Stage A — LLM extraction (optional)
     print("\n--- Phase B.1: LLM extraction (Stage A) ---")
     cache_dir = GlobalConfig.kg_cache_dir()
     cache_files = []
@@ -132,7 +125,7 @@ def run_pipeline():
         else:
             print("  Skipping extraction. News embeddings will be zeros.")
 
-    # ── Phase B.2: Voyage embedding (embed_news.py) ───────────────────────────
+    # Phase B.2: Voyage embedding
     print("\n--- Phase B.2: Voyage embedding ---")
     emb_path = os.path.join(
         GlobalConfig.INTERIM_PATH, "kg_embeddings", "news_embeddings.json"
@@ -159,7 +152,7 @@ def run_pipeline():
             print("  VOYAGE_API_KEY not set — embeddings will be zeros.")
             print("  Set key and run: python embed_news.py")
 
-    # ── Phase C: Build unified dataset ───────────────────────────────────────
+    # Phase C: Build unified dataset
     print("\n--- Phase C: Building unified_dataset.pkl ---")
     builder = DatasetBuilder()
 
@@ -191,6 +184,7 @@ def run_pipeline():
 
 
 def _run_embed(news_df, cache_dir, emb_path):
+    """V3.4: window_days parameter removed from run_embed_news."""
     from embed_news import run_embed_news
     voyage_cache = GlobalConfig.kg_voyage_cache_dir()
     run_embed_news(
@@ -198,7 +192,6 @@ def _run_embed(news_df, cache_dir, emb_path):
         cache_dir=cache_dir,
         output_path=emb_path,
         voyage_cache=voyage_cache,
-        window_days=GlobalConfig.KG_WINDOW_EMBED,
         min_relevance=GlobalConfig.KG_MIN_RELEVANCE,
         min_confidence=GlobalConfig.KG_MIN_CONFIDENCE,
     )

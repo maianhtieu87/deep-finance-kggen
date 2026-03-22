@@ -51,8 +51,8 @@ Group A \u2014 Direct Action:
   APPOINTS   Leadership appointment or removal
 
 Group B \u2014 Causal Impact:
-  POS_IMPACTS   Entity A improves Entity B\'s financials or outlook
-  NEG_IMPACTS   Entity A worsens Entity B\'s financials or outlook
+  POS_IMPACTS   Entity A improves Entity B's financials or outlook
+  NEG_IMPACTS   Entity A worsens Entity B's financials or outlook
   COMPETES_WITH Direct market competition for same revenue/customers
   REGULATES     [regulator] REGULATES [regulated entity] \u2014 direction is critical:
                 Subject MUST be ORG_GOV or ORG_REG. Object is COMP or PRODUCT.
@@ -184,37 +184,7 @@ FEW_SHOT_EXAMPLES = [
              "reasoning": "CFO guidance raise is strongest sustained re-rating signal."},
         ],
     },
-    {
-        "input": (
-            "Rivian cut 35% material cost on vans built for major shareholder Amazon. "
-            "Rivian posted Q1 net loss $1.5B; cash fell to $8B. "
-            "Tesla price cuts pressure smaller EV makers including Rivian."
-        ),
-        "ticker": "AMZN",
-        "article_type": "TYPE B \u2014 Supply Chain",
-        "output": [
-            {"subject": {"name": "Rivian", "type": "COMP"}, "relation": "SUPPLIES_TO",
-             "object": {"name": "Amazon", "type": "COMP"},
-             "confidence": 0.97, "price_impact_score": 0.20, "relevance_to_ticker": 0.85,
-             "reasoning": "Rivian is key AMZN van supplier; stability affects logistics."},
-            {"subject": {"name": "Rivian", "type": "COMP"}, "relation": "CUTS",
-             "object": {"name": "van material cost -35%", "type": "ECON_IND"},
-             "confidence": 0.95, "price_impact_score": 0.25, "relevance_to_ticker": 0.82,
-             "reasoning": "Cost cut improves Rivian viability; AMZN ~18% stake benefits."},
-            {"subject": {"name": "Rivian", "type": "COMP"}, "relation": "ANNOUNCES",
-             "object": {"name": "Q1 loss $1.5B cash $8B", "type": "ECON_IND"},
-             "confidence": 0.95, "price_impact_score": -0.30, "relevance_to_ticker": 0.80,
-             "reasoning": "Cash burn risks AMZN's ~18% investment value."},
-            {"subject": {"name": "Amazon", "type": "COMP"}, "relation": "CONTROLS",
-             "object": {"name": "Rivian", "type": "COMP"},
-             "confidence": 0.90, "price_impact_score": -0.15, "relevance_to_ticker": 0.85,
-             "reasoning": "AMZN major shareholder; Rivian distress is contingent liability."},
-            {"subject": {"name": "Tesla", "type": "COMP"}, "relation": "NEG_IMPACTS",
-             "object": {"name": "Rivian", "type": "COMP"},
-             "confidence": 0.85, "price_impact_score": -0.20, "relevance_to_ticker": 0.65,
-             "reasoning": "Tesla price cuts raise Rivian failure risk, threatening AMZN stake."},
-        ],
-    },
+
     {
         "input": (
             "EU's Irish Data Protection Commission fined Meta \u20ac1.2B for GDPR violations. "
@@ -241,38 +211,11 @@ FEW_SHOT_EXAMPLES = [
             },
         ],
     },
+
     {
         "input": (
-            "Amazon Q1 net sales $143.3B beat $142.5B estimate, +13% YoY. "
-            "AWS annualized run rate exceeded $100B. "
-            "CEO Jassy: capex will meaningfully increase for AI. "
-            "Amazon cut 200 AWS jobs citing overlapping roles."
-        ),
-        "ticker": "AMZN",
-        "article_type": "TYPE A \u2014 Earnings",
-        "output": [
-            {"subject": {"name": "Amazon", "type": "COMP"}, "relation": "ANNOUNCES",
-             "object": {"name": "Q1 sales $143.3B beat $142.5B", "type": "ECON_IND"},
-             "confidence": 0.97, "price_impact_score": 0.65, "relevance_to_ticker": 1.0,
-             "reasoning": "13% revenue beat drives AMZN analyst estimate revisions upward."},
-            {"subject": {"name": "AWS", "type": "PRODUCT"}, "relation": "ANNOUNCES",
-             "object": {"name": "AWS run rate $100B+", "type": "ECON_IND"},
-             "confidence": 0.95, "price_impact_score": 0.60, "relevance_to_ticker": 1.0,
-             "reasoning": "AWS $100B+ signals re-acceleration of AMZN highest-margin segment."},
-            {"subject": {"name": "Andy Jassy", "type": "PERSON"}, "relation": "SIGNALS",
-             "object": {"name": "AMZN AI capex 2024", "type": "CONCEPT"},
-             "confidence": 0.90, "price_impact_score": 0.45, "relevance_to_ticker": 1.0,
-             "reasoning": "CEO capex signal confirms strong AWS demand pipeline."},
-            {"subject": {"name": "Amazon", "type": "COMP"}, "relation": "CUTS",
-             "object": {"name": "AWS workforce 200 jobs", "type": "ECON_IND"},
-             "confidence": 0.88, "price_impact_score": -0.20, "relevance_to_ticker": 1.0,
-             "reasoning": "Job cuts mild negative on execution risk despite efficiency framing."},
-        ],
-    },
-    {
-        "input": (
-            "Netflix CEO Reed Hastings praised Jeff Bezos\' business philosophy. "
-            "Hastings said he adopted Bezos\' risk-taking approach to greenlight shows. "
+            "Netflix CEO Reed Hastings praised Jeff Bezos' business philosophy. "
+            "Hastings said he adopted Bezos' risk-taking approach to greenlight shows. "
             "No financial guidance or product announcements were made."
         ),
         "ticker": "NFLX",
