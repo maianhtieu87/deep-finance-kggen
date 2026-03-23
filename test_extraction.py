@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_extraction.py — V4 Pipeline (V3.6 filter logic)"""
+"""test_extraction.py — V5 Pipeline (ticker_aliases + no-chunk default)"""
 from __future__ import annotations
 import argparse, hashlib, json, os, random, re, sys, textwrap, time
 from collections import defaultdict
@@ -13,7 +13,7 @@ if ROOT not in sys.path: sys.path.insert(0, ROOT)
 from configs.config import GlobalConfig
 from data_pipeline.kg.extractor_batch import (
     AsyncConcurrentExtractor, GeminiBatchAPIExtractor,
-    build_combined_text, detect_primary_ticker, split_text_chunks,
+    build_combined_text, detect_primary_ticker, get_article_pieces,
     dedup_triples, apply_quality_filters, smart_dedup_triples, limit_signals_per_source,
     filter_triples_for_ticker, _sha1, _norm, _parse_tickers,
     _filter_and_clamp, TICKER_NAME_MAP, tag_triples_source,
@@ -34,7 +34,7 @@ def _save_cache(cache_dir, sha1, triples):
     if not cache_dir: return
     os.makedirs(cache_dir, exist_ok=True)
     with open(_cache_path(cache_dir, sha1), "w", encoding="utf-8") as f:
-        json.dump({"triples": triples, "_v": "v3.6"}, f, ensure_ascii=False)
+        json.dump({"triples": triples, "_v": "v5"}, f, ensure_ascii=False)
 
 def load_and_normalize(parquet_path):
     df = pd.read_parquet(parquet_path)
@@ -91,10 +91,10 @@ def extract_one(ticker, date_str, day_df, extractor, cache_dir, min_relevance, m
     """
     Extract triples for (ticker, date).
 
+    V5: Uses get_article_pieces() which defaults to full-article (no chunking).
     Per-article: apply_quality_filters() handles within-article dedup + caps.
-    Cross-article merge: smart_dedup_triples() + limit_signals_per_source()
-    applied on the merged list to catch cross-article duplicates
-    (e.g. WMT -9.3% and WMT -9.2% from 2 different articles covering same drop).
+    Cross-article: smart_dedup_triples() (with ticker_aliases normalization)
+    + limit_signals_per_source() (with PT/rating classification).
     """
     titles   = day_df["title"].fillna("").tolist()
     all_tickers_day = list({t for ts in day_df["_all_tickers"] for t in ts})
@@ -113,23 +113,29 @@ def extract_one(ticker, date_str, day_df, extractor, cache_dir, min_relevance, m
         else: sha1_to_raw[h] = None
 
     uncached = [h for h, v in sha1_to_raw.items() if v is None]
-    n_chunks, elapsed = 0, 0.0
+    n_pieces, elapsed = 0, 0.0
     if uncached:
-        chunk_jobs = []
+        piece_jobs = []
         for h in uncached:
-            for chunk in split_text_chunks(sha1_to_meta[h]["full_text"]):
-                chunk_jobs.append((h, {"text": chunk, "ticker": sha1_to_meta[h]["primary"], "date": date_str}))
-            n_chunks += len(split_text_chunks(sha1_to_meta[h]["full_text"]))
-        print(f"  Extracting: {len(uncached)} articles -> {n_chunks} chunks")
+            pieces = get_article_pieces(sha1_to_meta[h]["full_text"])
+            for piece in pieces:
+                piece_jobs.append((h, {"text": piece, "ticker": sha1_to_meta[h]["primary"], "date": date_str}))
+            n_pieces += len(pieces)
+
+        if n_pieces == len(uncached):
+            print(f"  Extracting: {len(uncached)} articles (full-text, no chunking)")
+        else:
+            print(f"  Extracting: {len(uncached)} articles -> {n_pieces} pieces (chunking enabled)")
+
         t0 = time.time()
-        results = extractor.extract_batch([j[1] for j in chunk_jobs])
+        results = extractor.extract_batch([j[1] for j in piece_jobs])
         elapsed = time.time() - t0
-        sha1_chunks = defaultdict(list)
-        for (h, _), triples in zip(chunk_jobs, results): sha1_chunks[h].extend(triples or [])
+        sha1_pieces = defaultdict(list)
+        for (h, _), triples in zip(piece_jobs, results): sha1_pieces[h].extend(triples or [])
         for h in uncached:
-            merged  = _filter_and_clamp(sha1_chunks[h], min_relevance, min_confidence)
-            deduped = apply_quality_filters(merged)   # per-article filters
-            deduped = tag_triples_source(deduped, h)  # traceability
+            merged  = _filter_and_clamp(sha1_pieces[h], min_relevance, min_confidence)
+            deduped = apply_quality_filters(merged)
+            deduped = tag_triples_source(deduped, h)
             sha1_to_raw[h] = deduped
             _save_cache(cache_dir, h, deduped)
     else:
@@ -144,11 +150,7 @@ def extract_one(ticker, date_str, day_df, extractor, cache_dir, min_relevance, m
         filtered = [t for t in filtered if float(t.get("confidence",0)) >= min_confidence]
         all_raw.extend(filtered)
 
-    # ── Cross-article dedup + caps (V3.6) ─────────────────────────────────
-    # smart_dedup catches same-event duplicates across articles using
-    # _normalize_object_for_dedup (Fix A: stock %, Fix C: guidance strings).
-    # limit_signals_per_source re-applies caps on the merged pool
-    # (Fix B: analyst COMP price target cap=1 per firm across all articles).
+    # ── Cross-article dedup + caps ────────────────────────────────────────
     all_raw = smart_dedup_triples(all_raw)
     all_raw = limit_signals_per_source(all_raw)
     final   = dedup_triples(all_raw)
@@ -164,7 +166,7 @@ def extract_one(ticker, date_str, day_df, extractor, cache_dir, min_relevance, m
         cross[target] = dedup_triples([t for t in rs2 if float(t.get("confidence",0)) >= min_confidence])
 
     return {"ticker": ticker, "date": date_str, "n_articles": len(titles), "n_unique": len(sha1_to_meta),
-            "cache_hits": cache_hits, "n_chunks": n_chunks if uncached else 0,
+            "cache_hits": cache_hits, "n_pieces": n_pieces if uncached else 0,
             "elapsed": elapsed, "triples": final, "cross": cross}
 
 def _bar(v, w=10): return "█"*max(0,min(w,round(abs(v)*w))) + "░"*max(0,w-max(0,min(w,round(abs(v)*w))))
@@ -191,8 +193,9 @@ def print_triple(i, t):
 
 def print_result(r, show_cross=True):
     t, d = r["ticker"], r["date"]
+    n_pieces = r.get("n_pieces", r.get("n_chunks", 0))
     print(f"\n{'='*66}\n  {t}  |  {d}")
-    print(f"  {r['n_articles']} articles  ->  {r['n_unique']} unique  ->  {r['n_chunks']} chunks  |  cache_hits={r['cache_hits']}  |  {r['elapsed']:.1f}s")
+    print(f"  {r['n_articles']} articles  ->  {r['n_unique']} unique  ->  {n_pieces} pieces  |  cache_hits={r['cache_hits']}  |  {r['elapsed']:.1f}s")
     print(f"  Primary triples after filter: {len(r['triples'])}")
     if not r["triples"]: print("  (no triples)")
     for i, tri in enumerate(r["triples"]): print_triple(i, tri)
@@ -205,16 +208,18 @@ def print_result(r, show_cross=True):
                 print(f"    {ct}: {len(ct_triples)} triples  avg_rel={avg_rel:.2f}")
 
 def print_summary(results, total_elapsed):
+    chunking = "chunking" if getattr(GlobalConfig, 'KG_ENABLE_CHUNKING', False) else "full-article"
     print(f"\n{chr(9473)*66}")
-    print(f"  SUMMARY  —  V4 pipeline V3.6 (cross-article dedup + analyst PT cap)")
+    print(f"  SUMMARY  —  V5 pipeline ({chunking} + ticker_aliases dedup)")
     print(f"{chr(9473)*66}")
     print(f"  Days tested : {len(results)}  Total time  : {total_elapsed:.1f}s\n")
-    print(f"  {'Ticker':6}  {'Date':12}  {'Arts':>4}  {'Chunks':>6}  {'Triples':>7}  {'Avg impact':>11}")
+    print(f"  {'Ticker':6}  {'Date':12}  {'Arts':>4}  {'Pieces':>6}  {'Triples':>7}  {'Avg impact':>11}")
     print(f"  {'-'*62}")
     for r in results:
         ts = r["triples"]
+        n_pieces = r.get("n_pieces", r.get("n_chunks", 0))
         imp_s = f"{sum(float(t.get('price_impact_score',0)) for t in ts)/len(ts):+.2f} {_impact(sum(float(t.get('price_impact_score',0)) for t in ts)/len(ts))}" if ts else "  n/a"
-        print(f"  {r['ticker']:6}  {r['date']:12}  {r['n_articles']:>4}  {r['n_chunks']:>6}  {len(ts):>7}  {imp_s}")
+        print(f"  {r['ticker']:6}  {r['date']:12}  {r['n_articles']:>4}  {n_pieces:>6}  {len(ts):>7}  {imp_s}")
     all_triples = [t for r in results for t in r["triples"]]
     if all_triples:
         from collections import Counter
@@ -232,7 +237,7 @@ def print_summary(results, total_elapsed):
     print(f"{chr(9473)*66}\n")
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Test extraction V4 (V3.6)")
+    p = argparse.ArgumentParser(description="Test extraction V5")
     p.add_argument("--days",     type=int,   default=None)
     p.add_argument("--tickers",  nargs="+",  default=None)
     p.add_argument("--filter",   default=None)
@@ -253,8 +258,10 @@ def main():
     args = parse_args()
     if args.days is None and args.tickers is None:
         print("Need --days N or --tickers T1 T2 ..."); sys.exit(1)
+
+    chunking = "chunking" if getattr(GlobalConfig, 'KG_ENABLE_CHUNKING', False) else "full-article"
     print("="*66)
-    print("  Test Extraction — V4 Pipeline (V3.6)")
+    print(f"  Test Extraction — V5 Pipeline ({chunking})")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  Thresholds: min_relevance={args.min_relevance}  min_confidence={args.min_confidence}")
     print("="*66)

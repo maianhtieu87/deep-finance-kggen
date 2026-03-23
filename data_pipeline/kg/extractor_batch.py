@@ -1,27 +1,28 @@
-# data_pipeline/kg/extractor_batch.py — V3.6
+# data_pipeline/kg/extractor_batch.py — V5
 """
-V3.6 changes vs V3.5:
-  Fix A — _normalize_object_for_dedup(): stock price % normalization.
-    "WMT shares -9.3%" / "WMT stock -9.2%" / "Shares -9.03%" → same bucket.
-    Requires explicit ticker name OR shares/stock keyword to avoid
-    matching guidance % strings like "Q2 EPS guidance -8 to -9%".
+V5 changes vs V4.1:
 
-  Fix B — limit_signals_per_source(): cap analyst COMP price target actions.
-    Analyst firms typed COMP (e.g. Goldman Sachs, Stifel) that CUTS/SIGNALS/RAISES
-    a "price target" object are capped at max_per_analyst_pt=1 per firm.
-    Does NOT affect COMP CUTS for real events (guidance, workforce, costs).
+  **ticker_aliases integration:**
+    - TICKER_NAME_MAP, ALL_TICKER_NAMES_PATTERN, normalize_entity_name
+      now imported from configs.ticker_aliases (Single Source of Truth)
+    - Removed: hardcoded TICKER_NAME_MAP, _NAME_TO_TICKER, _ALL_TICKER_NAMES_PATTERN
+    - Removed: _normalize_subject_for_dedup() — replaced by normalize_entity_name()
+    - _normalize_object_for_dedup() uses ALL_TICKER_NAMES_PATTERN for ALL tickers
+    - smart_dedup_triples() uses normalize_entity_name() for subject key
 
-  Fix C — _normalize_object_for_dedup(): guidance string normalization.
-    "guidance Q2 and FY" / "Q2 profit guidance" / "FY23 guidance" / "guidance"
-    → all collapse to canonical "guidance" when no % sign is present.
-    "Q2 EPS guidance -8 to -9%" kept as-is (has %, contains actual data).
+  **P0 — No chunking (full-article extraction):**
+    - prepare_article_text() replaces split_text_chunks() as default
+    - Gemini Flash 2.0 handles 1M tokens; finance articles rarely exceed 15K chars
+    - Fallback chunking available via GlobalConfig.KG_ENABLE_CHUNKING=True
 
-V3.5 carried over:
-  - tag_triples_source(triples, sha1): _src=sha1[:8] traceability field.
-  - P0: LIMIT_RELS_PERSON includes CUTS (analyst PERSON PT cuts capped at 2).
-  - P1: monetary unit normalization ($88M → $88m etc).
-  - CHUNK_SIZE=5000, CHUNK_OVERLAP=0.
-  - filter_triples_for_ticker() mention-only cross-ticker filter.
+  **P1 — Improved analyst cap logic:**
+    - limit_signals_per_source() caps by (firm_name, action_type)
+    - Separate caps: PT actions + rating actions
+    - Prevents bypass where "Hold rating" didn't contain "price target"
+
+  Carried over from V3.6:
+  - tag_triples_source(), LIMIT_RELS_PERSON includes CUTS,
+    monetary normalization, filter_triples_for_ticker() mention-only.
 """
 from __future__ import annotations
 import asyncio, json, os, re, time, hashlib
@@ -29,6 +30,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from google import genai
 from google.genai import types
 from configs.config import GlobalConfig
+from configs.ticker_aliases import (
+    TICKER_NAME_MAP,
+    ALL_TICKER_NAMES_PATTERN,
+    normalize_entity_name,
+)
 from .prompts import (
     FINDKG_LITE_SYSTEM_PROMPT, FINDKG_LITE_USER_PROMPT, FEW_SHOT_EXAMPLES,
     VALID_ENTITY_TYPES, VALID_RELATIONS,
@@ -80,8 +86,44 @@ def _build_few_shot_str():
 
 _FEW_SHOT_STR = _build_few_shot_str()
 
-CHUNK_SIZE    = 5000
-CHUNK_OVERLAP = 0
+
+# ── ARTICLE TEXT PREPARATION (V5: no-chunk default) ───────────────────────
+
+def prepare_article_text(text: str, max_chars: int = None) -> List[str]:
+    """
+    Prepare article text for LLM extraction.
+
+    Default: send full article as single piece (no chunking).
+    Gemini Flash 2.0 handles 1M tokens (~4M chars).
+    Finance articles rarely exceed 15K chars.
+
+    Only truncates if text exceeds max_chars.
+    Returns list with single element for API compatibility.
+    """
+    if max_chars is None:
+        max_chars = getattr(GlobalConfig, 'KG_MAX_ARTICLE_CHARS', 15000)
+
+    text = text.strip()
+    if not text:
+        return []
+
+    if len(text) <= max_chars:
+        return [text]
+
+    # Truncate at sentence boundary
+    truncated = text[:max_chars]
+    for sep in (". ", "! ", "? ", "\n"):
+        pos = truncated.rfind(sep)
+        if pos > max_chars * 0.8:
+            truncated = truncated[:pos + len(sep)]
+            break
+
+    return [truncated]
+
+
+# Legacy chunking — only used if GlobalConfig.KG_ENABLE_CHUNKING=True
+CHUNK_SIZE    = getattr(GlobalConfig, 'KG_CHUNK_SIZE', 5000)
+CHUNK_OVERLAP = getattr(GlobalConfig, 'KG_CHUNK_OVERLAP', 0)
 
 def _split_at_sentence_boundary(text, max_chars):
     if len(text) <= max_chars: return len(text)
@@ -92,6 +134,7 @@ def _split_at_sentence_boundary(text, max_chars):
     return max_chars
 
 def split_text_chunks(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    """Legacy chunking — only used if GlobalConfig.KG_ENABLE_CHUNKING=True."""
     text = text.strip()
     if len(text) <= chunk_size: return [text]
     chunks, start = [], 0
@@ -103,6 +146,20 @@ def split_text_chunks(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
         start = start + end - overlap
         if start < 0: start = 0
     return chunks if chunks else [text[:chunk_size]]
+
+
+def get_article_pieces(text: str) -> List[str]:
+    """
+    Route to correct text preparation based on config.
+
+    Default: no-chunking (full article).
+    Set GlobalConfig.KG_ENABLE_CHUNKING=True for legacy chunking.
+    """
+    if getattr(GlobalConfig, 'KG_ENABLE_CHUNKING', False):
+        return split_text_chunks(text)
+    else:
+        return prepare_article_text(text)
+
 
 def build_combined_text(titles, contents):
     h = "\n".join(f"- {t}" for t in titles if t and t.strip())
@@ -134,17 +191,6 @@ def _filter_and_clamp(raw, min_relevance, min_confidence):
 # ── SOURCE TAGGING ────────────────────────────────────────────────────────────
 
 def tag_triples_source(triples: List[Dict], sha1: str) -> List[Dict]:
-    """
-    Tag each triple with _src = first 8 chars of the article SHA-1.
-
-    Traceability: given _src='a3f2bc91', open
-    data/interim/kg_article_cache/a3f2bc91*.json → read '_meta.full_text'.
-
-    Call AFTER apply_quality_filters() and BEFORE _save_cache():
-        deduped = apply_quality_filters(merged)
-        deduped = tag_triples_source(deduped, sha1)
-        _save_cache(cache_dir, sha1, deduped, ...)
-    """
     src = sha1[:8]
     for t in triples:
         t["_src"] = src
@@ -160,44 +206,54 @@ def dedup_triples(triples):
             seen.add(key); out.append(t)
     return out
 
+_LEGAL_SUFFIX_RE = re.compile(
+    r',?\s*(Inc\.?|Corp\.?|Corporation|Co\.?|Company|Ltd\.?|Limited|Group|Platforms?|Holdings?|Services?|LLC|LLP|PLC|S\.A\.|N\.V\.)\.?\s*$',
+    re.IGNORECASE)
+
+def _norm_name_selfloop(name):
+    if not name: return ""
+    n = name
+    for _ in range(3):
+        stripped = _LEGAL_SUFFIX_RE.sub('', n).strip()
+        if stripped == n.strip():
+            break
+        n = stripped
+    return re.sub(r'\s+', ' ', n).strip().lower()
+
+
 def _normalize_object_for_dedup(name: str) -> str:
     """
     Canonical form for fuzzy dedup of triple objects.
-    Applies Fix A, B (monetary), C in order — each rule is independent.
+
+    V5: Stock % pattern uses ALL_TICKER_NAMES_PATTERN from ticker_aliases
+    (matches all 9 tickers, not hardcoded WMT).
     """
     if not name:
         return ""
     n = name.lower()
 
     # ── Numeric formatting ──────────────────────────────────────────────────
-    # Remove thousands comma: 10,000 → 10000
     n = re.sub(r'(\d),(\d)', r'\1\2', n)
 
-    # ── Fix B (monetary units) ──────────────────────────────────────────────
-    # $88 million / $88M → $88m  |  $1.2 billion / $1.2B → $1.2b
+    # ── Monetary units ──────────────────────────────────────────────────────
     n = re.sub(r'\$\s*(\d+\.?\d*)\s*billion', r'$\1b', n, flags=re.IGNORECASE)
     n = re.sub(r'\$\s*(\d+\.?\d*)\s*million', r'$\1m', n, flags=re.IGNORECASE)
     n = re.sub(r'\$\s*(\d+\.?\d*)\s*b\b',     r'$\1b', n, flags=re.IGNORECASE)
     n = re.sub(r'\$\s*(\d+\.?\d*)\s*m\b',     r'$\1m', n, flags=re.IGNORECASE)
 
-    # ── Fix A (stock price % movements) ────────────────────────────────────
-    # "WMT shares -9.3%" / "WMT stock -9.2%" / "shares -9.03%" → "wmt stock -9pct"
-    # Requires explicit ticker OR shares/stock keyword — avoids matching
-    # guidance strings like "Q2 EPS guidance -8 to -9%".
+    # ── Stock price % movements (scalable for ALL tickers) ─────────────────
     n = re.sub(
-        r'(?:wmt|walmart|shares?|stock)\s*(?:shares?|stock|price)?\s*([+-]?\d+\.?\d*)\s*%',
-        lambda m: f'wmt stock {round(float(m.group(1)))}pct',
+        r'(?:' + ALL_TICKER_NAMES_PATTERN + r'|shares?|stock)'
+        r'\s*(?:shares?|stock|price)?\s*([+-]?\d+\.?\d*)\s*%',
+        lambda m: f'stock {round(float(m.group(1)))}pct',
         n, flags=re.IGNORECASE,
     )
 
-    # ── Fix C (guidance/outlook strings without specific numbers) ───────────
-    # "guidance Q2 and FY" / "Q2 profit guidance" / "FY23 guidance" → "guidance"
-    # "Q2 EPS guidance -8 to -9%" is kept as-is because it contains '%'.
+    # ── Guidance/outlook strings without specific numbers ──────────────────
     if re.search(r'\b(guid|outlook|forecast)\w*', n) and '%' not in n:
         n = 'guidance'
 
-    # ── Trailing workforce unit words ───────────────────────────────────────
-    # "10000 workers" / "10000 employees" → "10000"
+    # ── Trailing unit words ────────────────────────────────────────────────
     n = re.sub(
         r'\b(units?|shares?|vehicles?|cars?|trucks?|vans?|jobs?|employees?|workers?|people|staff|posts?|items?|pieces?)\s*$',
         '', n, flags=re.IGNORECASE,
@@ -205,22 +261,33 @@ def _normalize_object_for_dedup(name: str) -> str:
 
     return re.sub(r'\s+', ' ', n).strip()
 
+
 def smart_dedup_triples(triples):
-    """Fuzzy dedup: resolve cross-article same-event duplicates."""
+    """
+    Fuzzy dedup: resolve cross-article same-event duplicates.
+
+    V5: Uses normalize_entity_name() from ticker_aliases for subject key.
+    "Walmart"/"WMT"/"Walmart Inc." all → "wmt" → same key → merge.
+    """
     if not triples: return []
+
+    # Pass 1: exact dedup
     exact_seen, exact_deduped = set(), []
     for t in triples:
         key = (t.get("subject",{}).get("name",""), t.get("relation",""), t.get("object",{}).get("name",""))
         if key not in exact_seen:
             exact_seen.add(key); exact_deduped.append(t)
+
+    # Pass 2: fuzzy dedup with normalized subject + object
     fuzzy = {}
     for t in exact_deduped:
         k = (
-            t.get("subject",{}).get("name","").lower().strip(),
+            normalize_entity_name(t.get("subject",{}).get("name","")),
             t.get("relation",""),
             _normalize_object_for_dedup(t.get("object",{}).get("name","")),
         )
         fuzzy.setdefault(k, []).append(t)
+
     result = []
     for _, group in fuzzy.items():
         if len(group) == 1:
@@ -234,15 +301,6 @@ def smart_dedup_triples(triples):
     return result
 
 # ── POST-EXTRACTION QUALITY FILTERS ──────────────────────────────────────────
-
-_LEGAL_SUFFIX_RE = re.compile(
-    r',?\s*(Inc\.?|Corp\.?|Corporation|Co\.?|Company|Ltd\.?|Limited|Group|Platforms?|Holdings?|Services?|LLC|LLP|PLC|S\.A\.|N\.V\.)\.?\s*$',
-    re.IGNORECASE)
-
-def _norm_name_selfloop(name):
-    if not name: return ""
-    n = _LEGAL_SUFFIX_RE.sub('', name).strip().lower()
-    return re.sub(r'\s+', ' ', n).strip()
 
 def fix_regulates_direction(triples):
     """Flip reversed REGULATES (COMP→ORG_REG) and drop semantic self-loops."""
@@ -264,11 +322,6 @@ def fix_regulates_direction(triples):
     return result
 
 def post_filter_triples(triples, min_rel_relates_to=0.75):
-    """
-    1. RELATES_TO + ECON_IND → promote to ANNOUNCES.
-    2. RELATES_TO at rel < 0.75 → drop.
-    3. abs(impact) < 0.05 AND rel < 0.60 → drop.
-    """
     result = []
     for t in triples:
         rel  = t.get("relation","")
@@ -282,35 +335,69 @@ def post_filter_triples(triples, min_rel_relates_to=0.75):
         result.append(t)
     return result
 
+
+def _is_analyst_action(subj_type: str, rel: str, obj_name: str) -> Tuple[bool, str]:
+    """
+    Detect analyst firm actions and classify them.
+
+    Returns (is_analyst_action, action_type):
+      - (True, "pt")      if object contains "price target" or "$X from/to"
+      - (True, "rating")  if object contains rating keywords
+      - (True, "other")   if COMP with CUTS/SIGNALS/RAISES but no clear subtype
+      - (False, "")       otherwise
+    """
+    if subj_type != "COMP":
+        return False, ""
+    if rel not in {"CUTS", "SIGNALS", "RAISES"}:
+        return False, ""
+
+    obj_lower = obj_name.lower()
+
+    # Price target detection
+    if re.search(r'\bprice\s*target\b', obj_lower):
+        return True, "pt"
+    if re.search(r'\btarget\s*\$', obj_lower):
+        return True, "pt"
+    if re.search(r'\$\d+.*(?:from|to|→)', obj_lower):
+        return True, "pt"
+
+    # Rating detection
+    rating_keywords = (
+        r'\b(hold|buy|sell|overweight|underweight|neutral|outperform|'
+        r'underperform|equal.?weight|sector.?perform|market.?perform|'
+        r'strong.?buy|strong.?sell|accumulate|reduce)\b'
+    )
+    if re.search(rating_keywords, obj_lower):
+        return True, "rating"
+
+    return True, "other"
+
+
 def limit_signals_per_source(
     triples: List[Dict],
-    max_per_person:       int = 2,
-    max_per_regulator:    int = 2,
-    max_comp_signals:     int = 2,
-    max_per_analyst_pt:   int = 1,
+    max_per_person:          int = 2,
+    max_per_regulator:       int = 2,
+    max_comp_signals:        int = 2,
+    max_per_analyst_pt:      int = None,
+    max_per_analyst_rating:  int = None,
 ) -> List[Dict]:
     """
     Cap noise from repeated sources.
 
-    PERSON subjects — max 2 of {SIGNALS, RAISES, ANNOUNCES, CUTS} per person.
-      Covers analyst PERSON PT cuts + exec statements.
-
-    ORG_REG/ORG_GOV — max 2 REGULATES per regulatory body.
-
-    COMP subjects, SIGNALS — max 2 SIGNALS per company.
-      Prevents TA price-level spam (Market Clubhouse pattern).
-
-    COMP subjects, price target actions (Fix B) — max 1 per analyst firm.
-      Triggered when relation in {CUTS, SIGNALS, RAISES} AND object contains
-      "price target". Prevents 15 analyst COMP CUTS flooding one day.
-      Does NOT affect genuine company events (COMP CUTS guidance/workforce).
+    V5: Analyst COMP actions capped by (firm_name, action_type).
+    Separate caps for PT actions and rating actions.
+    Prevents bypass where "Hold rating" didn't contain "price target".
 
     Sort by confidence DESC → keep highest-quality triples within each cap.
     """
+    if max_per_analyst_pt is None:
+        max_per_analyst_pt = getattr(GlobalConfig, 'KG_MAX_PER_ANALYST_FIRM', 1)
+    if max_per_analyst_rating is None:
+        max_per_analyst_rating = getattr(GlobalConfig, 'KG_MAX_PER_ANALYST_RATING', 1)
+
     LIMIT_RELS_PERSON    = {"SIGNALS", "RAISES", "ANNOUNCES", "CUTS"}
     LIMIT_RELS_REGULATOR = {"REGULATES"}
     LIMIT_RELS_COMP_SIG  = {"SIGNALS"}
-    LIMIT_RELS_ANALYST_PT = {"CUTS", "SIGNALS", "RAISES"}   # Fix B
     REGULATOR_TYPES      = {"ORG_GOV", "ORG_REG"}
 
     indexed_sorted = sorted(
@@ -318,62 +405,64 @@ def limit_signals_per_source(
         key=lambda x: float(x[1].get("confidence", 0)),
         reverse=True,
     )
-    person_count:     Dict[str, int] = {}
-    reg_count:        Dict[str, int] = {}
-    comp_sig_count:   Dict[str, int] = {}
-    analyst_pt_count: Dict[str, int] = {}   # Fix B
+    person_count:        Dict[str, int] = {}
+    reg_count:           Dict[str, int] = {}
+    comp_sig_count:      Dict[str, int] = {}
+    analyst_pt_count:    Dict[str, int] = {}
+    analyst_rating_count:Dict[str, int] = {}
+    analyst_other_count: Dict[str, int] = {}
     keep: set = set()
 
     for orig_i, t in indexed_sorted:
         rel       = t.get("relation", "")
         subj_name = t.get("subject", {}).get("name", "")
         subj_type = t.get("subject", {}).get("type", "")
-        obj_name  = t.get("object",  {}).get("name", "").lower()
+        obj_name  = t.get("object",  {}).get("name", "")
+
+        # Normalize subject for consistent counting
+        subj_key = normalize_entity_name(subj_name)
 
         # ── PERSON cap ──────────────────────────────────────────────────────
         if rel in LIMIT_RELS_PERSON and subj_type == "PERSON":
-            if person_count.get(subj_name, 0) >= max_per_person:
+            if person_count.get(subj_key, 0) >= max_per_person:
                 continue
-            person_count[subj_name] = person_count.get(subj_name, 0) + 1
+            person_count[subj_key] = person_count.get(subj_key, 0) + 1
 
         # ── Regulator cap ───────────────────────────────────────────────────
         elif rel in LIMIT_RELS_REGULATOR and subj_type in REGULATOR_TYPES:
-            if reg_count.get(subj_name, 0) >= max_per_regulator:
+            if reg_count.get(subj_key, 0) >= max_per_regulator:
                 continue
-            reg_count[subj_name] = reg_count.get(subj_name, 0) + 1
+            reg_count[subj_key] = reg_count.get(subj_key, 0) + 1
 
-        # ── Fix B: analyst COMP price target cap ────────────────────────────
-        # Check BEFORE generic COMP SIGNALS cap so the two rules don't conflict.
-        # "price target" in object name distinguishes analyst PT actions from
-        # real company events (COMP CUTS guidance / COMP ANNOUNCES earnings).
-        elif (rel in LIMIT_RELS_ANALYST_PT
-              and subj_type == "COMP"
-              and bool(re.search(r'\bprice\s*target\b', obj_name))):
-            if analyst_pt_count.get(subj_name, 0) >= max_per_analyst_pt:
-                continue
-            analyst_pt_count[subj_name] = analyst_pt_count.get(subj_name, 0) + 1
+        # ── Analyst COMP actions — capped by (firm, action_type) ───────────
+        else:
+            is_analyst, action_type = _is_analyst_action(subj_type, rel, obj_name)
 
-        # ── COMP SIGNALS cap (TA price level spam) ───────────────────────────
-        elif rel in LIMIT_RELS_COMP_SIG and subj_type == "COMP":
-            if comp_sig_count.get(subj_name, 0) >= max_comp_signals:
-                continue
-            comp_sig_count[subj_name] = comp_sig_count.get(subj_name, 0) + 1
+            if is_analyst:
+                if action_type == "pt":
+                    if analyst_pt_count.get(subj_key, 0) >= max_per_analyst_pt:
+                        continue
+                    analyst_pt_count[subj_key] = analyst_pt_count.get(subj_key, 0) + 1
+                elif action_type == "rating":
+                    if analyst_rating_count.get(subj_key, 0) >= max_per_analyst_rating:
+                        continue
+                    analyst_rating_count[subj_key] = analyst_rating_count.get(subj_key, 0) + 1
+                else:
+                    if analyst_other_count.get(subj_key, 0) >= max_per_analyst_pt:
+                        continue
+                    analyst_other_count[subj_key] = analyst_other_count.get(subj_key, 0) + 1
+
+            # ── COMP SIGNALS cap (TA price level spam) ───────────────────
+            elif rel in LIMIT_RELS_COMP_SIG and subj_type == "COMP":
+                if comp_sig_count.get(subj_key, 0) >= max_comp_signals:
+                    continue
+                comp_sig_count[subj_key] = comp_sig_count.get(subj_key, 0) + 1
 
         keep.add(orig_i)
 
     return [t for i, t in enumerate(triples) if i in keep]
 
 def apply_quality_filters(triples: List[Dict]) -> List[Dict]:
-    """
-    Full quality chain:
-      smart_dedup → fix_regulates_direction → post_filter_triples → limit_signals_per_source
-
-    tag_triples_source() is NOT called here — SHA-1 is only known at the
-    call site. Pattern:
-        deduped = apply_quality_filters(merged)
-        deduped = tag_triples_source(deduped, sha1)
-        _save_cache(cache_dir, sha1, deduped, ...)
-    """
     triples = smart_dedup_triples(triples)
     triples = fix_regulates_direction(triples)
     triples = post_filter_triples(triples)
@@ -382,16 +471,6 @@ def apply_quality_filters(triples: List[Dict]) -> List[Dict]:
 
 # ── TICKER DETECTION & CROSS-TICKER FILTER ───────────────────────────────────
 
-TICKER_NAME_MAP: Dict[str, List[str]] = {
-    "TSLA": ["Tesla","TSLA"], "AAPL": ["Apple","AAPL"], "AMZN": ["Amazon","AMZN"],
-    "MSFT": ["Microsoft","MSFT"], "GOOGL": ["Google","Alphabet","GOOGL"],
-    "GOOG": ["Google","Alphabet","GOOG"], "META": ["Meta","Facebook","META"],
-    "BA": ["Boeing","BA"], "JPM": ["JPMorgan","JP Morgan","JPM"],
-    "WMT": ["Walmart","WMT"], "NVDA": ["Nvidia","NVDA"], "NFLX": ["Netflix","NFLX"],
-    "INTC": ["Intel","INTC"], "AMD": ["AMD","Advanced Micro"],
-    "RIVN": ["Rivian","RIVN"], "LCID": ["Lucid","LCID"],
-    "GM": ["General Motors","GM"], "F": ["Ford","F Motor"],
-}
 TITLE_WEIGHT = 3
 
 def detect_primary_ticker(title, content, tickers):
@@ -411,7 +490,6 @@ def detect_primary_ticker(title, content, tickers):
         if counts[t] == best: return t
 
 def _ticker_mentioned_in_triple(ticker: str, triple: Dict) -> bool:
-    """Check if ticker (or any known name) appears in subject or object name."""
     tl = ticker.lower()
     sn = triple.get("subject",{}).get("name","").lower()
     on = triple.get("object",{}).get("name","").lower()
@@ -426,14 +504,6 @@ def filter_triples_for_ticker(
     target_ticker: str,
     min_relevance: float = None,
 ) -> List[Dict]:
-    """
-    Simplified cross-ticker filter.
-
-    Same ticker  → return triples unchanged.
-    Cross-ticker → keep only triples where target company is explicitly
-                   mentioned in subject or object name, AND rel >= min_relevance.
-    No relevance adjustment, no price_impact zeroing. _src preserved.
-    """
     if min_relevance is None:
         min_relevance = GlobalConfig.KG_MIN_RELEVANCE
     if primary_ticker.upper() == target_ticker.upper():
@@ -463,23 +533,61 @@ class AsyncConcurrentExtractor:
             temperature=temperature, max_output_tokens=2048)
 
     async def _extract_one_async(self, idx, article, semaphore):
+        """
+        Extract triples from one article with retry on 429.
+
+        Retry logic:
+          - Max retries from GlobalConfig.KG_ASYNC_MAX_RETRIES (default 3)
+          - Backoff: KG_ASYNC_BACKOFF_BASE (default 10) * 2^attempt + jitter
+          - Inter-request delay: KG_ASYNC_REQUEST_DELAY (default 1.0s)
+          - Only retry on 429/RESOURCE_EXHAUSTED; other errors fail immediately
+        """
+        max_retries   = getattr(GlobalConfig, 'KG_ASYNC_MAX_RETRIES', 3)
+        backoff_base  = getattr(GlobalConfig, 'KG_ASYNC_BACKOFF_BASE', 10.0)
+        request_delay = getattr(GlobalConfig, 'KG_ASYNC_REQUEST_DELAY', 1.0)
+
         async with semaphore:
             prompt = build_user_prompt(
                 article.get("text",""), article.get("ticker","UNKNOWN"), article.get("date",""))
-            try:
-                response = await asyncio.to_thread(
-                    self.client.models.generate_content,
-                    model=self.model, contents=prompt, config=self._gen_config)
-                return idx, _filter_and_clamp(json.loads(response.text), self.min_relevance, self.min_confidence)
-            except Exception as e:
-                print(f"  Async extract error idx={idx}: {e}"); return idx, []
+
+            last_err = None
+            for attempt in range(max_retries + 1):  # 0, 1, 2, 3 = 4 total tries
+                try:
+                    # Inter-request delay to spread out calls
+                    if request_delay > 0:
+                        await asyncio.sleep(request_delay)
+
+                    response = await asyncio.to_thread(
+                        self.client.models.generate_content,
+                        model=self.model, contents=prompt, config=self._gen_config)
+                    return idx, _filter_and_clamp(
+                        json.loads(response.text), self.min_relevance, self.min_confidence)
+
+                except Exception as e:
+                    last_err = e
+                    err_str = str(e)
+                    is_rate_limit = "429" in err_str or "RESOURCE_EXHAUSTED" in err_str
+
+                    if is_rate_limit and attempt < max_retries:
+                        import random as _rand
+                        wait = backoff_base * (2 ** attempt) + _rand.uniform(0, 2)
+                        print(f"  429 idx={idx} attempt={attempt+1}/{max_retries} — retry in {wait:.0f}s")
+                        await asyncio.sleep(wait)
+                        continue
+                    else:
+                        # Non-retryable error or max retries exceeded
+                        print(f"  Extract FAILED idx={idx}: {e}")
+                        return idx, None  # None = real failure (not empty [])
+
+            print(f"  Extract FAILED idx={idx} after {max_retries} retries: {last_err}")
+            return idx, None
 
     def extract_batch(self, articles):
         if not articles: return []
         async def _run_all():
             sem = asyncio.Semaphore(self.max_concurrent)
             return await asyncio.gather(*[self._extract_one_async(i, a, sem) for i, a in enumerate(articles)])
-        print(f"  AsyncConcurrentExtractor: {len(articles)} chunks, max_concurrent={self.max_concurrent}")
+        print(f"  AsyncConcurrentExtractor: {len(articles)} articles, max_concurrent={self.max_concurrent}")
         t0 = time.time()
         try:
             loop = asyncio.get_event_loop()
@@ -491,16 +599,25 @@ class AsyncConcurrentExtractor:
                 pairs = loop.run_until_complete(_run_all())
         except RuntimeError:
             pairs = asyncio.run(_run_all())
-        print(f"  Done in {time.time()-t0:.1f}s  ({sum(1 for _,t in pairs if t is not None)}/{len(articles)} succeeded)")
+
+        # Count actual successes (None = failed, [] = success with 0 triples)
+        n_success = sum(1 for _, t in pairs if t is not None)
+        n_failed  = sum(1 for _, t in pairs if t is None)
+        if n_failed > 0:
+            print(f"  Done in {time.time()-t0:.1f}s  ({n_success}/{len(articles)} succeeded, {n_failed} FAILED)")
+        else:
+            print(f"  Done in {time.time()-t0:.1f}s  ({n_success}/{len(articles)} succeeded)")
+
         results = [[] for _ in articles]
-        for idx, triples in pairs: results[idx] = triples or []
+        for idx, triples in pairs:
+            results[idx] = triples if triples is not None else []
         return results
 
 # ── GEMINI BATCH API EXTRACTOR ────────────────────────────────────────────────
 
 class GeminiBatchAPIExtractor:
     def __init__(self, api_key=None, model=MODEL_ID, min_relevance=None, min_confidence=None,
-                 poll_interval_secs=30, max_wait_secs=86400, display_name="findkg-lite-v3"):
+                 poll_interval_secs=30, max_wait_secs=86400, display_name="findkg-lite-v5"):
         self.min_relevance  = min_relevance  if min_relevance  is not None else GlobalConfig.KG_MIN_RELEVANCE
         self.min_confidence = min_confidence if min_confidence is not None else GlobalConfig.KG_MIN_CONFIDENCE
         self.poll_interval  = poll_interval_secs
@@ -522,7 +639,7 @@ class GeminiBatchAPIExtractor:
                 "generation_config": _GEN_CONFIG_DICT,
             },
         } for i, a in enumerate(articles)]
-        print(f"  GeminiBatchAPIExtractor: submitting {len(inline_requests)} chunks")
+        print(f"  GeminiBatchAPIExtractor: submitting {len(inline_requests)} articles")
         batch_job = self.client.batches.create(
             model=self.model, src=inline_requests, config={"display_name": self.display_name})
         print(f"  Job: {batch_job.name}  State: {batch_job.state.name}")

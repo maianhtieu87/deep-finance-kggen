@@ -1,10 +1,12 @@
 # configs/config.py
 """
-Configuration V5 — 9-ticker universe.
+Configuration V5.1 — 9-ticker universe.
 
-V5 changes vs V4:
-  - Remove KG_WINDOW_EMBED (rolling window removed from embed_news.py)
-  - CHUNK_SIZE 3000→5000, CHUNK_OVERLAP 200→0 (in extractor_batch.py)
+V5.1 changes vs V5:
+  - KG_MAX_ARTICLE_CHARS = 15000 (replaces CHUNK_SIZE/CHUNK_OVERLAP — no more chunking)
+  - KG_MAX_PER_ANALYST_FIRM = 1 (cap analyst COMP actions per firm)
+  - KG_MAX_PER_ANALYST_RATING = 1 (cap analyst rating actions per firm)
+  - KG_NORMALIZE_SUBJECT = True (enable subject normalization in smart_dedup)
 """
 import os
 from datetime import datetime
@@ -55,8 +57,27 @@ class GlobalConfig:
     KG_MIN_RELEVANCE  = 0.50   # skip triple if relevance_to_ticker < this
     KG_MIN_CONFIDENCE = 0.65   # skip triple if confidence < this
     KG_MAX_CONCURRENT = 5      # async concurrent Gemini API calls
-    # KG_WINDOW_EMBED removed in V5 — embed_news.py embeds each day independently
 
+    # ── V5.1: Article handling (replaces chunk-based approach) ────────────
+    KG_MAX_ARTICLE_CHARS  = 15000  # max chars per article sent to LLM
+                                    # Gemini Flash 2.0 handles 1M tokens (~4M chars)
+                                    # Most finance articles are 1K-8K chars
+                                    # No chunking needed below this limit
+    KG_ENABLE_CHUNKING    = False   # Set True to fallback to chunking for very long docs
+    KG_CHUNK_SIZE         = 5000    # Only used if KG_ENABLE_CHUNKING=True
+    KG_CHUNK_OVERLAP      = 0       # Only used if KG_ENABLE_CHUNKING=True
+
+    # ── V5.1: Dedup & quality control ─────────────────────────────────────
+    KG_NORMALIZE_SUBJECT     = True  # normalize subject names in smart_dedup
+    KG_MAX_PER_ANALYST_FIRM  = 1     # max PT actions per analyst firm (COMP)
+    KG_MAX_PER_ANALYST_RATING = 1    # max rating actions per analyst firm (COMP)
+
+    KG_MAX_CONCURRENT = 5      # async concurrent Gemini API calls
+    # ── V5: Async retry config (tránh mất data khi 429) ──────────────────
+    KG_ASYNC_MAX_RETRIES   = 3     # retry tối đa khi gặp 429
+    KG_ASYNC_BACKOFF_BASE  = 10.0  # backoff: 10s, 20s, 40s (exponential)
+    KG_ASYNC_REQUEST_DELAY = 1.0   # delay giữa mỗi request (giảm burst)
+    
     # Voyage embedding
     EMBED_MODEL       = "voyage-3-large"
     MAX_RETRIES       = 6
@@ -181,18 +202,21 @@ def validate_config() -> bool:
         for e in errors:
             print(f"  - {e}")
         return False
-    print("Configuration validated (V5 — Voyage direct embedding, no rolling window)")
+    print("Configuration validated (V5.1 — no chunking, subject normalization)")
     print(f"  KG thresholds: min_relevance={GlobalConfig.KG_MIN_RELEVANCE}  "
           f"min_confidence={GlobalConfig.KG_MIN_CONFIDENCE}")
+    print(f"  Article handling: max_chars={GlobalConfig.KG_MAX_ARTICLE_CHARS}  "
+          f"chunking={'ON' if GlobalConfig.KG_ENABLE_CHUNKING else 'OFF'}")
     return True
 
 
 if __name__ == "__main__":
-    print("=== Configuration V5 ===")
+    print("=== Configuration V5.1 ===")
     print(f"Tickers  : {GlobalConfig.TICKERS}")
     print(f"Date     : {GlobalConfig.START_DATE} -> {GlobalConfig.END_DATE}")
     print(f"News dim : {TrainConfig.news_embed_dim} (Voyage-3-large)")
     print(f"use_gnn  : {TrainConfig.use_gnn}")
     print(f"KG thresholds: rel>={GlobalConfig.KG_MIN_RELEVANCE}  conf>={GlobalConfig.KG_MIN_CONFIDENCE}")
+    print(f"Article  : max_chars={GlobalConfig.KG_MAX_ARTICLE_CHARS}  chunking={GlobalConfig.KG_ENABLE_CHUNKING}")
     print()
     validate_config()

@@ -1,15 +1,15 @@
-# extract_corpus.py — V3.6
+# extract_corpus.py — V4.1
 """
 Stage A: LLM Extraction.
 
-V3.6 changes vs V3.4:
-  - Cross-article dedup + caps applied on merged triple list after
-    all articles for (ticker, date) are collected:
-      all_triples = smart_dedup_triples(all_triples)   # Fix A, C
-      all_triples = limit_signals_per_source(all_triples)  # Fix B
-    Catches same-event duplicates that come from N different articles
-    reporting the same stock drop or guidance cut on the same day.
-  - _save_cache version bumped to v3.6.
+V4.1 changes vs V3.6:
+  - Default: NO CHUNKING. Full article sent to LLM in single call.
+    Gemini Flash 2.0 handles 1M tokens; finance articles rarely exceed 15K chars.
+    Eliminates cross-chunk contradiction, duplication, and context loss.
+    Fallback chunking available via GlobalConfig.KG_ENABLE_CHUNKING=True.
+  - Uses get_article_pieces() instead of split_text_chunks() directly.
+  - Cross-article dedup uses V4.1 subject normalization.
+  - _save_cache version bumped to v4.1.
 """
 from __future__ import annotations
 import argparse, hashlib, json, os, re, sys, time
@@ -19,7 +19,7 @@ import pandas as pd
 from configs.config import GlobalConfig
 from data_pipeline.kg.extractor_batch import (
     AsyncConcurrentExtractor, GeminiBatchAPIExtractor,
-    detect_primary_ticker, build_combined_text, split_text_chunks,
+    detect_primary_ticker, build_combined_text, get_article_pieces,
     dedup_triples, apply_quality_filters, smart_dedup_triples, limit_signals_per_source,
     filter_triples_for_ticker, _sha1, _norm, _filter_and_clamp, _parse_tickers,
     tag_triples_source,
@@ -34,7 +34,7 @@ def _load_cache(cache_dir, sha1):
     except Exception: return None
 def _save_cache(cache_dir, sha1, triples, meta=None):
     os.makedirs(cache_dir, exist_ok=True)
-    payload = {"triples": triples, "_v": "v3.6"}
+    payload = {"triples": triples, "_v": "v4.1"}
     if meta: payload["_meta"] = meta
     with open(_cache_path(cache_dir, sha1), "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False)
@@ -68,10 +68,10 @@ def extract_and_cache_per_article(day_df, ticker, date_str, extractor, cache_dir
     """
     Extract triples for (ticker, date).
 
+    V4.1: Default is NO CHUNKING — each article is sent as a single piece.
     Per-article: apply_quality_filters() handles within-article dedup + caps.
     Cross-article merge: smart_dedup_triples() + limit_signals_per_source()
-    applied on the merged list to catch cross-article duplicates
-    (e.g. WMT -9.3% and WMT -9.2% from 2 different articles covering same drop).
+    applied on the merged list to catch cross-article duplicates.
     """
     sha1_to_meta, sha1_to_raw, cache_hits = {}, {}, 0
     for _, row in day_df.iterrows():
@@ -93,15 +93,25 @@ def extract_and_cache_per_article(day_df, ticker, date_str, extractor, cache_dir
     uncached = [h for h, v in sha1_to_raw.items() if v is None]
     if uncached:
         print(f"  [{ticker} {date_str}] cache_hits={cache_hits} to_extract={len(uncached)}")
-        chunk_jobs = []
+        piece_jobs = []
         for h in uncached:
-            for chunk in split_text_chunks(sha1_to_meta[h]["full_text"]):
-                chunk_jobs.append((h, {"text": chunk, "ticker": sha1_to_meta[h]["primary_ticker"], "date": sha1_to_meta[h]["date"]}))
-        results = extractor.extract_batch([j[1] for j in chunk_jobs])
-        sha1_chunks = defaultdict(list)
-        for (sha1, _), triples in zip(chunk_jobs, results): sha1_chunks[sha1].extend(triples or [])
+            # V4.1: get_article_pieces() returns [full_text] by default (no chunking)
+            # Falls back to chunking only if GlobalConfig.KG_ENABLE_CHUNKING=True
+            for piece in get_article_pieces(sha1_to_meta[h]["full_text"]):
+                piece_jobs.append((h, {"text": piece, "ticker": sha1_to_meta[h]["primary_ticker"], "date": sha1_to_meta[h]["date"]}))
+
+        n_pieces = len(piece_jobs)
+        n_articles = len(uncached)
+        if n_pieces == n_articles:
+            print(f"  Extracting: {n_articles} articles (full-text, no chunking)")
+        else:
+            print(f"  Extracting: {n_articles} articles -> {n_pieces} pieces (chunking enabled)")
+
+        results = extractor.extract_batch([j[1] for j in piece_jobs])
+        sha1_pieces = defaultdict(list)
+        for (sha1, _), triples in zip(piece_jobs, results): sha1_pieces[sha1].extend(triples or [])
         for h in uncached:
-            merged  = _filter_and_clamp(sha1_chunks[h], min_relevance, min_confidence)
+            merged  = _filter_and_clamp(sha1_pieces[h], min_relevance, min_confidence)
             deduped = apply_quality_filters(merged)   # per-article filters
             deduped = tag_triples_source(deduped, h)  # traceability
             sha1_to_raw[h] = deduped
@@ -118,11 +128,7 @@ def extract_and_cache_per_article(day_df, ticker, date_str, extractor, cache_dir
         filtered = [t for t in filtered if float(t.get("confidence",0)) >= min_confidence]
         all_triples.extend(filtered)
 
-    # ── Cross-article dedup + caps (V3.6) ─────────────────────────────────
-    # smart_dedup catches same-event duplicates across articles using
-    # _normalize_object_for_dedup (Fix A: stock %, Fix C: guidance strings).
-    # limit_signals_per_source re-applies caps on the merged pool
-    # (Fix B: analyst COMP price target cap=1 per firm across all articles).
+    # ── Cross-article dedup + caps (V4.1: with subject normalization) ─────
     all_triples = smart_dedup_triples(all_triples)
     all_triples = limit_signals_per_source(all_triples)
     return dedup_triples(all_triples)
@@ -138,13 +144,20 @@ def run_stage_a(news_df, cache_dir, use_gemini_batch=False, max_concurrent=None,
     if len(df) == 0: print("No data after filter."); return {}
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key: raise RuntimeError("GEMINI_API_KEY not set.")
+
+    chunking_mode = "chunking" if getattr(GlobalConfig, 'KG_ENABLE_CHUNKING', False) else "full-article"
+
     if use_gemini_batch:
         extractor = GeminiBatchAPIExtractor(api_key=api_key, min_relevance=_mr, min_confidence=_mc)
         print("Extractor: GeminiBatchAPIExtractor")
     else:
         extractor = AsyncConcurrentExtractor(api_key=api_key, min_relevance=_mr, min_confidence=_mc, max_concurrent=_conc)
         print(f"Extractor: AsyncConcurrentExtractor (max_concurrent={_conc})")
+
     print(f"Thresholds: min_relevance={_mr}  min_confidence={_mc}")
+    print(f"Mode: {chunking_mode}  max_chars={GlobalConfig.KG_MAX_ARTICLE_CHARS}")
+    print(f"Subject normalization: {getattr(GlobalConfig, 'KG_NORMALIZE_SUBJECT', True)}")
+
     tickers = sorted(df["equity"].unique())
     print(f"\nStage A: {len(tickers)} tickers x {df['date'].nunique()} dates\nCache: {cache_dir}\n")
     summary = {}
@@ -166,7 +179,14 @@ def main():
     p.add_argument("--ticker", default=None)
     p.add_argument("--date",   default=None)
     p.add_argument("--news",   default=None)
+    p.add_argument("--enable-chunking", action="store_true",
+                   help="Enable legacy chunking (default: full-article mode)")
     args = p.parse_args()
+
+    # Override chunking config from CLI
+    if args.enable_chunking:
+        GlobalConfig.KG_ENABLE_CHUNKING = True
+
     news_path = args.news or os.path.join(GlobalConfig.INTERIM_PATH, "concatenated_news_filtered.parquet")
     if not os.path.exists(news_path): print(f"Not found: {news_path}"); sys.exit(1)
     df = pd.read_parquet(news_path)

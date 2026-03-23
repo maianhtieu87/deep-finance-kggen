@@ -2,14 +2,14 @@
 """
 Stage A.5 — News Embedding
 
-V3.4 changes:
+V5 change vs V3.4:
+  - TICKER_NAME_MAP imported from configs.ticker_aliases (Single Source of Truth)
+  - Removed hardcoded TICKER_NAME_MAP duplicate
+
+V3.4 (carried over):
   1. Rolling window REMOVED — each day embedded independently.
-     Model's 20-day training window handles temporal dependency.
   2. triples_to_text: impact/conf/rel metadata REMOVED from text.
-     Voyage embeds semantic content of events, not LLM self-assessments.
   3. Cross-ticker: mention-only filter replaces rescore_for_ticker.
-     Same-ticker → keep all. Cross-ticker → only if target mentioned in triple.
-     No price_impact zeroing, no relevance adjustment.
 
 Luồng:
   extract_corpus.py  →  embed_news.py  →  main_test.py  →  main.py
@@ -43,6 +43,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from configs.config import GlobalConfig
+from configs.ticker_aliases import TICKER_NAME_MAP
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -175,22 +176,10 @@ def _load_article_cache(cache_dir: str, sha1: str) -> Optional[List[Dict]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TICKER HELPERS  (self-contained, no import from extractor_batch)
+# TICKER HELPERS
+# V5: TICKER_NAME_MAP imported from configs.ticker_aliases (top of file)
 # ─────────────────────────────────────────────────────────────────────────────
 
-TICKER_NAME_MAP: Dict[str, List[str]] = {
-    "TSLA":  ["Tesla", "TSLA"],   "AAPL":  ["Apple", "AAPL"],
-    "AMZN":  ["Amazon", "AMZN"],  "MSFT":  ["Microsoft", "MSFT"],
-    "GOOGL": ["Google", "Alphabet", "GOOGL"],
-    "GOOG":  ["Google", "Alphabet", "GOOG"],
-    "META":  ["Meta", "Facebook", "META"],
-    "BA":    ["Boeing", "BA"],    "JPM":   ["JPMorgan", "JP Morgan", "JPM"],
-    "WMT":   ["Walmart", "WMT"],  "NVDA":  ["Nvidia", "NVDA"],
-    "NFLX":  ["Netflix", "NFLX"], "INTC":  ["Intel", "INTC"],
-    "AMD":   ["AMD", "Advanced Micro"],
-    "RIVN":  ["Rivian", "RIVN"],  "LCID":  ["Lucid", "LCID"],
-    "GM":    ["General Motors", "GM"], "F": ["Ford", "F Motor"],
-}
 TITLE_WEIGHT = 3
 
 def detect_primary_ticker(title: str, content: str, tickers: List[str]) -> str:
@@ -226,19 +215,6 @@ def _ticker_mentioned_in_triple(ticker: str, triple: Dict) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def triples_to_text(triples: List[Dict], ticker: str) -> str:
-    """
-    Convert triples to embedding text.
-
-    Format: "TARGET: {ticker} | {subject} {RELATION} {object}. {reasoning} | ..."
-
-    Sorted by |price_impact_score| descending so strongest signals appear first
-    (important if Voyage truncates long texts).
-
-    V3.4: impact/conf/rel numeric metadata REMOVED.
-    Rationale: Voyage was trained on natural language, not on LLM self-scoring
-    metadata. The semantic content of events (subject+relation+object+reasoning)
-    is what Voyage can embed meaningfully.
-    """
     if not triples:
         return ""
 
@@ -275,16 +251,6 @@ def get_day_triples(
     min_relevance: float,
     min_confidence: float,
 ) -> List[Dict]:
-    """
-    Read SHA-1 cache for all articles in day_df, filter triples for ticker.
-
-    Same-ticker articles (primary == ticker): keep all triples passing thresholds.
-    Cross-ticker articles (primary != ticker): keep only triples that mention
-        ticker explicitly in subject or object name.
-
-    No rescore, no relevance adjustment, no price_impact zeroing.
-    Returns deduplicated list of triples for this (ticker, date).
-    """
     sha1_to_meta: Dict[str, Dict] = {}
     sha1_to_raw:  Dict[str, Optional[List]] = {}
 
@@ -300,7 +266,7 @@ def get_day_triples(
 
         h = _sha1(full_text)
         if h in sha1_to_raw:
-            continue  # already registered this article
+            continue
 
         primary = str(row.get("primary_ticker") or ticker)
         sha1_to_meta[h] = {"primary_ticker": primary}
@@ -313,14 +279,12 @@ def get_day_triples(
         primary = sha1_to_meta[h]["primary_ticker"]
 
         if primary.upper() == ticker.upper():
-            # Same ticker — keep all triples that pass thresholds
             filtered = [
                 t for t in raw
                 if float(t.get("confidence", 0)) >= min_confidence
                 and float(t.get("relevance_to_ticker", 0)) >= min_relevance
             ]
         else:
-            # Cross-ticker — only keep triples mentioning target explicitly
             filtered = [
                 t for t in raw
                 if _ticker_mentioned_in_triple(ticker, t)
@@ -330,7 +294,6 @@ def get_day_triples(
 
         all_triples.extend(filtered)
 
-    # Dedup by (subject, relation, object)
     seen: set = set()
     deduped: List[Dict] = []
     for t in all_triples:
@@ -360,18 +323,11 @@ def run_embed_news(
     ticker_filter:  Optional[str] = None,
     date_prefix:    Optional[str] = None,
 ) -> str:
-    """
-    Read cache triples → per-day text → Voyage embed → news_embeddings.json.
-
-    V3.4: No rolling window. Each (ticker, date) embedded independently.
-    The model's 20-day training window handles temporal context.
-    """
     if min_relevance  is None: min_relevance  = GlobalConfig.KG_MIN_RELEVANCE
     if min_confidence is None: min_confidence = GlobalConfig.KG_MIN_CONFIDENCE
 
     voyage = VoyageEmbedder(cache_dir=voyage_cache)
 
-    # ── Normalize DataFrame ───────────────────────────────────────────────────
     df = news_df.copy()
     if "headline" in df.columns and "title" not in df.columns:
         df = df.rename(columns={"headline": "title"})
@@ -402,7 +358,6 @@ def run_embed_news(
         axis=1,
     )
 
-    # Explode per ticker, restore _all_tickers
     df = df.explode("_all_tickers").rename(columns={"_all_tickers": "equity"})
     df = df[df["equity"].notna() & (df["equity"] != "")].reset_index(drop=True)
     df["_all_tickers"] = df[ticker_col].apply(_parse_tickers)
@@ -413,11 +368,10 @@ def run_embed_news(
         df = df[df["date"].astype(str).str.startswith(date_prefix)]
 
     tickers = sorted(df["equity"].unique())
-    print(f"\nEmbed news V3.4: {len(tickers)} tickers (no rolling window)")
+    print(f"\nEmbed news V5: {len(tickers)} tickers (no rolling window)")
     print(f"Cache dir : {cache_dir}")
     print(f"Output    : {output_path}\n")
 
-    # ── Build (ticker, date) → text mapping ──────────────────────────────────
     ticker_date_text: Dict[Tuple[str, str], str] = {}
     miss_count = 0
 
@@ -429,7 +383,6 @@ def run_embed_news(
             date_str = str(d)
             day_df   = df_t[df_t["date"] == d]
 
-            # V3.4: no rolling window — embed each day independently
             triples = get_day_triples(
                 day_df=day_df,
                 ticker=ticker,
@@ -447,7 +400,6 @@ def run_embed_news(
     print(f"Days with no cache entries : {miss_count}")
     print(f"Total (ticker, date) pairs : {len(ticker_date_text)}")
 
-    # ── Batch embed (deduplicate texts first) ─────────────────────────────────
     unique_texts = list(set(ticker_date_text.values()))
     non_empty    = [t for t in unique_texts if t]
     empty_vec    = [0.0] * 1024
@@ -459,7 +411,6 @@ def run_embed_news(
     else:
         text_to_emb = {}
 
-    # ── Build output {"YYYY-MM-DD": {"TSLA": [...]}} ─────────────────────────
     output: Dict[str, Dict[str, List[float]]] = defaultdict(dict)
     for (ticker, date_str), text in ticker_date_text.items():
         emb = text_to_emb.get(text, empty_vec)
@@ -475,7 +426,7 @@ def run_embed_news(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stage A.5 — Embed news triples via Voyage (V3.4)")
+    parser = argparse.ArgumentParser(description="Stage A.5 — Embed news triples via Voyage (V5)")
     parser.add_argument("--news",       default=None,  help="Path to news parquet")
     parser.add_argument("--cache-dir",  default=None,  help="SHA-1 cache dir (default: GlobalConfig)")
     parser.add_argument("--output",     default=None,  help="Output JSON path (default: GlobalConfig)")
