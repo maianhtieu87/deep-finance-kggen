@@ -339,6 +339,16 @@ def run_embed_news(
     if "content" not in df.columns: df["content"] = ""
     if "title"   not in df.columns: df["title"]   = ""
 
+    # Auto-detect date column
+    if "date" not in df.columns:
+        DATE_CANDS = ["created_at", "createdAt", "published_at", "publishedAt",
+                      "publish_date", "pub_date", "Date", "DATE", "timestamp", "time", "news_date"]
+        date_col = next((c for c in DATE_CANDS if c in df.columns), None)
+        if date_col is None:
+            date_col = next((c for c in df.columns if any(k in c.lower() for k in ("date", "time", "publish", "creat"))), None)
+        if date_col is not None:
+            df = df.rename(columns={date_col: "date"})
+
     df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
     df = df.dropna(subset=["date"])
 

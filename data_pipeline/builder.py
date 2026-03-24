@@ -1,12 +1,10 @@
 # data_pipeline/builder.py
 """
-V4 — DatasetBuilder
+V5.2 — DatasetBuilder
 
-Thay đổi so với V3:
-  - Đọc news_embeddings.json (output của embed_news.py) thay vì embedded_kg.json
-  - "news_embedding" key chứa 1024D Voyage vector — đây là gì data_loader sẽ dùng
-  - "kg_tensor" key không còn được dùng nữa (bỏ GATv2 pipeline)
-  - Fusion order: price → news_embedding (1024D) → macro → filing
+V5.2 change vs V4:
+  - REMOVED kg_tensor key entirely (GATv2 pipeline deleted since V4)
+  - Cleaner output: only price, macro, news, news_embedding, filing_q, filing_k
 
 Format news_embeddings.json:
   {"YYYY-MM-DD": {"TSLA": [0.12, -0.34, ...], "AAPL": [...]}}
@@ -25,7 +23,7 @@ class DatasetBuilder:
         price_macro_dict,
         news_df,
         filing_path,
-        embedding_path,       # path to news_embeddings.json (from embed_news.py)
+        embedding_path,
     ):
         """
         Sync price + macro + news_embedding (1024D) + filings.
@@ -68,7 +66,7 @@ class DatasetBuilder:
             with open(embedding_path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
             for k, v in raw.items():
-                embedding_data[str(k)[:10]] = v  # key = "YYYY-MM-DD"
+                embedding_data[str(k)[:10]] = v
             print(f"  Loaded {len(embedding_data)} dates")
         else:
             print(f"  news_embeddings.json not found at {embedding_path}")
@@ -121,10 +119,7 @@ class DatasetBuilder:
                         else:
                             synchronized_data[date_obj]["news_embedding"][clean_ticker] = []
 
-            # 2.5 kg_tensor: kept as empty dict (GATv2 pipeline removed)
-            synchronized_data[date_obj]["kg_tensor"] = {}
-
-            # 2.6 Filings
+            # 2.5 Filings
             date_filings = filing_df[filing_df["filedAt"] == date_dt]
             synchronized_data[date_obj]["filing_q"] = {}
             synchronized_data[date_obj]["filing_k"] = {}

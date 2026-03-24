@@ -1,12 +1,9 @@
 # data_pipeline/processors/news_processor.py
 """
-V4 — Slim version.
+V5.2 — Slim version.
 
-Removed (no longer in pipeline):
-  - KGGenNewsEmbedder (called build_graphs.py / build_kg.py — both deleted)
-  - VoyageEmbedder inline class (embed_news.py has its own standalone version)
-  - from encoders.kg_graph_encoder import ... (kg_graph_encoder.py deleted)
-  - from data_pipeline.kg.extractor import ... (only needed by KGGenNewsEmbedder)
+V5.2 change: Added auto-detection of date column (created_at, publishedAt, etc.)
+             to avoid crash when column is not literally named "date".
 
 Kept:
   - normalize_news_df()              utility exported for external use
@@ -22,17 +19,41 @@ from data_pipeline.kg.extractor_batch import (
     TICKER_NAME_MAP,
 )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DATE COLUMN AUTO-DETECTION (shared helper)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DATE_CANDIDATES = [
+    "date", "Date", "DATE",
+    "created_at", "createdAt",
+    "published_at", "publishedAt",
+    "publish_date", "pub_date",
+    "timestamp", "time", "news_date",
+]
+
+def _ensure_date_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Auto-detect and rename date column to 'date' if needed."""
+    if "date" in df.columns:
+        return df
+    date_col = next((c for c in _DATE_CANDIDATES if c in df.columns), None)
+    if date_col is None:
+        date_col = next(
+            (c for c in df.columns if any(k in c.lower() for k in ("date", "time", "publish", "creat"))),
+            None,
+        )
+    if date_col is None:
+        raise ValueError(f"Cannot find date column. Has: {list(df.columns)}")
+    return df.rename(columns={date_col: "date"})
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # normalize_news_df — module-level export
-# Used by: (external callers / tests)
-# Not used by: extract_corpus.py (has own inline version),
-#              embed_news.py (has own inline version)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def normalize_news_df(df: pd.DataFrame, symbols_col: str = "symbols") -> pd.DataFrame:
     """
     Standardise raw news DataFrame:
+      - Auto-detect and rename date column
       - Rename headline→title, ticker→equity
       - Parse date
       - Parse _all_tickers list
@@ -59,8 +80,7 @@ def normalize_news_df(df: pd.DataFrame, symbols_col: str = "symbols") -> pd.Data
     if "title" not in df.columns:
         df["title"] = ""
 
-    if "date" not in df.columns:
-        raise ValueError(f"Missing 'date' column. Has: {list(df.columns)}")
+    df = _ensure_date_column(df)
     df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
     df = df.dropna(subset=["date"])
 
@@ -97,7 +117,7 @@ def normalize_news_df(df: pd.DataFrame, symbols_col: str = "symbols") -> pd.Data
 # ─────────────────────────────────────────────────────────────────────────────
 
 class NewsProcessor:
-    """Thin wrapper. Only align_to_trading_days() is used in the V4 pipeline."""
+    """Thin wrapper. Only align_to_trading_days() is used in the V4+ pipeline."""
 
     def align_to_trading_days(self, news_input, trading_days):
         if isinstance(news_input, pd.DataFrame):
@@ -122,8 +142,7 @@ class NewsProcessor:
                     df = df.rename(columns={alt: "content"})
                     break
 
-        if "date" not in df.columns:
-            raise ValueError(f"Missing 'date' column. Has: {list(df.columns)}")
+        df = _ensure_date_column(df)
         df["date"] = pd.to_datetime(df["date"]).dt.date
 
         if trading_days is not None:
