@@ -300,20 +300,26 @@ def _poll_batch_job(client, job_name: str, poll_interval: int = None, max_wait: 
 def _parse_batch_results(batch_job, min_relevance: float, min_confidence: float) -> Dict[str, List]:
     """
     Parse inlined_responses from completed batch job.
-    Returns: {key(=sha1): [triples]}
+    Returns: {sha1: [triples]}
+    Key is stored in resp.metadata["sha1"].
     """
     sha1_triples = defaultdict(list)
-    responses = getattr(batch_job, "response", None)
-    if responses is None:
+    dest = getattr(batch_job, "dest", None)
+    if dest is None:
         return sha1_triples
 
-    inlined = getattr(responses, "inlined_responses", None) or []
+    inlined = getattr(dest, "inlined_responses", None) or []
     parsed, failed = 0, 0
 
     for resp in inlined:
         try:
-            key = resp.key
-            text = resp.response.candidates[0].content.parts[0].text
+            meta = getattr(resp, "metadata", None) or {}
+            key = meta.get("sha1", "")
+            if not key:
+                failed += 1
+                continue
+            response = resp.response
+            text = response.candidates[0].content.parts[0].text
             raw = json.loads(text)
             triples = _filter_and_clamp(raw, min_relevance, min_confidence)
             sha1_triples[key].extend(triples)
@@ -445,22 +451,25 @@ def run_stage_a_batch(
 
         print(f"\n  Chunk {chunk_i+1}/{n_chunks}: {len(still_needed)} articles")
 
-        # ── Build inline requests ─────────────────────────────────────────
+        # ── Build inline requests (typed InlinedRequest objects) ─────────
+        from google.genai import types as genai_types
         inline_requests = []
         for h, meta in still_needed:
             pieces = get_article_pieces(meta["full_text"])
             for piece_i, piece in enumerate(pieces):
                 prompt = build_user_prompt(piece, meta["primary_ticker"], meta["date"])
-                # Key = SHA1 (unique per article; if chunking, append piece index)
                 key = h if len(pieces) == 1 else f"{h}_p{piece_i}"
-                inline_requests.append({
-                    "key": key,
-                    "request": {
-                        "contents": [{"parts": [{"text": prompt}], "role": "user"}],
-                        "system_instruction": {"parts": [{"text": FINDKG_LITE_SYSTEM_PROMPT}]},
-                        "generation_config": _GEN_CONFIG_DICT,
-                    },
-                })
+                inline_requests.append(genai_types.InlinedRequest(
+                    contents=prompt,
+                    config=genai_types.GenerateContentConfig(
+                        system_instruction=FINDKG_LITE_SYSTEM_PROMPT,
+                        response_mime_type="application/json",
+                        response_schema=_GEN_CONFIG_DICT["response_schema"],
+                        temperature=_GEN_CONFIG_DICT["temperature"],
+                        max_output_tokens=_GEN_CONFIG_DICT["max_output_tokens"],
+                    ),
+                    metadata={"sha1": key},
+                ))
 
         print(f"    Submitting {len(inline_requests)} requests...")
 
@@ -469,7 +478,9 @@ def run_stage_a_batch(
             batch_job = client.batches.create(
                 model=model,
                 src=inline_requests,
-                config={"display_name": f"findkg-v5-chunk-{chunk_i+1}-of-{n_chunks}"},
+                config=genai_types.CreateBatchJobConfig(
+                    displayName=f"findkg-v5-chunk-{chunk_i+1}-of-{n_chunks}",
+                ),
             )
         except Exception as e:
             print(f"    Submit FAILED: {e}")

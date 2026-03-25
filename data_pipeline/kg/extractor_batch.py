@@ -630,18 +630,25 @@ class GeminiBatchAPIExtractor:
 
     def extract_batch(self, articles):
         if not articles: return []
-        inline_requests = [{
-            "key": str(i),
-            "request": {
-                "contents": [{"parts": [{"text": build_user_prompt(
-                    a.get("text",""), a.get("ticker","UNKNOWN"), a.get("date",""))}], "role": "user"}],
-                "system_instruction": {"parts": [{"text": FINDKG_LITE_SYSTEM_PROMPT}]},
-                "generation_config": _GEN_CONFIG_DICT,
-            },
-        } for i, a in enumerate(articles)]
+        inline_requests = [
+            types.InlinedRequest(
+                contents=build_user_prompt(
+                    a.get("text",""), a.get("ticker","UNKNOWN"), a.get("date","")),
+                config=types.GenerateContentConfig(
+                    system_instruction=FINDKG_LITE_SYSTEM_PROMPT,
+                    response_mime_type="application/json",
+                    response_schema=RESPONSE_SCHEMA,
+                    temperature=_GEN_CONFIG_DICT["temperature"],
+                    max_output_tokens=_GEN_CONFIG_DICT["max_output_tokens"],
+                ),
+                metadata={"idx": str(i)},
+            )
+            for i, a in enumerate(articles)
+        ]
         print(f"  GeminiBatchAPIExtractor: submitting {len(inline_requests)} articles")
         batch_job = self.client.batches.create(
-            model=self.model, src=inline_requests, config={"display_name": self.display_name})
+            model=self.model, src=inline_requests,
+            config=types.CreateBatchJobConfig(displayName=self.display_name))
         print(f"  Job: {batch_job.name}  State: {batch_job.state.name}")
         terminal = {"JOB_STATE_SUCCEEDED","JOB_STATE_FAILED","JOB_STATE_CANCELLED"}
         elapsed = 0
@@ -653,13 +660,16 @@ class GeminiBatchAPIExtractor:
         if batch_job.state.name != "JOB_STATE_SUCCEEDED":
             print(f"Batch job failed: {batch_job.state.name}"); return [[] for _ in articles]
         results = [[] for _ in articles]
-        for resp in (getattr(batch_job.response, "inlined_responses", None) or []):
-            try:
-                idx = int(resp.key)
-                if 0 <= idx < len(articles):
-                    results[idx] = _filter_and_clamp(
-                        json.loads(resp.response.candidates[0].content.parts[0].text),
-                        self.min_relevance, self.min_confidence)
-            except Exception:
-                pass
+        dest = getattr(batch_job, "dest", None)
+        if dest:
+            for resp in (getattr(dest, "inlined_responses", None) or []):
+                try:
+                    meta = getattr(resp, "metadata", None) or {}
+                    idx = int(meta.get("idx", -1))
+                    if 0 <= idx < len(articles):
+                        results[idx] = _filter_and_clamp(
+                            json.loads(resp.response.candidates[0].content.parts[0].text),
+                            self.min_relevance, self.min_confidence)
+                except Exception:
+                    pass
         return results
