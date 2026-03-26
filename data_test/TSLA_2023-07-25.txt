@@ -1,0 +1,232 @@
+======================================================================
+  Extraction Diagnostic — Multi-Article Concat Validation
+  Log saved to: D:\ProjectNCKH\deep_finance\data_test\TSLA_2023-07-25.txt
+======================================================================
+  Cache: D:\ProjectNCKH\deep_finance\data\interim\kg_article_cache
+  Filter ticker: TSLA
+  Filter date:   2023-07-25
+  Scanning 9467 cache files in D:\ProjectNCKH\deep_finance\data\interim\kg_article_cache...
+  Filtered: 11 / 9467 cache files
+
+──────────────────────────────────────────────────────────────────────
+  CHECK 1: Cache Integrity
+──────────────────────────────────────────────────────────────────────
+  Total files:    11
+  Valid JSON:     11
+  Invalid JSON:   0
+  With triples:   8
+  Empty (0 tri):  3
+  Versions:       {'v5.2': 11}
+  → ✅ PASS
+
+──────────────────────────────────────────────────────────────────────
+  CHECK 2: article_index Stripped (no leak to cache)
+──────────────────────────────────────────────────────────────────────
+  Triples checked:      11
+  Clean (no index):     11
+  Leaked (has index):   0
+  → ✅ PASS
+
+──────────────────────────────────────────────────────────────────────
+  CHECK 3: Triple Quality Stats
+──────────────────────────────────────────────────────────────────────
+  Total triples:        11
+  Avg per article:      1.4
+  Avg confidence:       0.85
+  Avg relevance:        1.00
+  Avg impact:           +0.19
+  Group A (actions):    7
+  Group B (causal):     0
+  Group C (context):    4
+  Group A+B:            64%  ✅ Good
+  Has _src tag:         11/11
+  Has reasoning:        11/11
+
+  Relations:
+    SIGNALS                ████ 4
+    ANNOUNCES              ████ 4
+    INVESTS_IN             █ 1
+    CUTS                   █ 1
+    RAISES                 █ 1
+
+──────────────────────────────────────────────────────────────────────
+  CHECK 4: Multi-Call Consistency
+──────────────────────────────────────────────────────────────────────
+  Articles with 0 triples:  3
+  Articles with >15 triples: 0
+  Max triples/article:      3
+
+  Distribution (triples per article):
+     0 triples: ███ 3
+     1 triples: ██████ 6
+     2 triples: █ 1
+     3 triples: █ 1
+  → ✅ PASS (27% empty)
+
+──────────────────────────────────────────────────────────────────────
+  CHECK 5: Deep Dive (filtered articles)
+──────────────────────────────────────────────────────────────────────
+
+  2023-07-25: 11 articles → 11 triples
+    [0915f851] v=v5.2 ticker=TSLA triples=1
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - Ross Gerber Praises Elon Musk's Tesla FSD: 'Whole Thing Is Just Way Better'
+
+        ARTICLES:
+        In a recent tweet, CEO of Gerber Kawasaki and investor Ross Gerber praised Tesla’s Full Self-Driving (FSD) technology. The tweet comes amidst ongoing discussions about the safety and efficacy of Tesla’s autonomous driving technology. What Happened: Gerber, a known supporter of Tesla Inc. (NASDAQ:TSLA), expressed his optimism about the company’s FSD technology in his tweet. “3 hours of heavy driving on LA freeways today. FSD is so amazing to have in traffic and when clear. Makes traveling by car (road-trip) the best way to go. Then the superchargers are great. The whole Tesla thing is just way better… FSD, charging and sweet EVs,” he wrote in his tweet. See Also: Vinco Ventures, NIO, AMC, Tesla, Cleveland-Cliffs: Top 5 Trending Stocks Today 3 hours of heavy driving on LA freeways today. FSD is so amazing to have in traffic and when clear. Makes traveling by car (road-trip) the best way to go. Then the superchargers are great. The whole Tesla thing is just way better… FSD, charging and sweet EVs. $TSLA— Ross Gerber (@GerberKawasaki) July 24, 2023 Why It Matters: Despite facing safety concerns and scrutiny, Tesla continues to assert that its vehicles, equipped with Autopilot and Full Self-Driving (FSD) technology, are safer than the typical U.S. car. Read Next: AOC Joins Picket Lines With Striking Actors, Writers, Says This Is A Fight Against AI And Wall Street Tesla Photo via Shutterstock. Engineered by Benzinga Neuro, Edited by Pooja Rajkumari The GPT-4 Benzinga Neuro content generation system exploits the extensive Benzinga Ecosystem, including native data, APIs, and more to create comprehensive and timely stories for you. Learn more.
+      ----------------------------------------------------------------------
+      [EXTRACTED TRIPLES]
+      #1 Ross Gerber —SIGNALS→ Tesla FSD 'way better'  (conf=0.80)
+         Reasoning: Gerber's positive review of FSD boosts confidence in Tesla tech.
+
+    [0ef35dc0] v=v5.2 ticker=TSLA triples=3
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - Cathie Wood-Led Ark Investment Management Identifies Tesla's Three Key Growth Catalysts
+
+        ARTICLES:
+        Analysts from Cathie Wood-led Ark Investment Management on Monday listed three updates provided by Tesla Inc (NASDAQ:TSLA) during its second-quarter earnings call that it sees as effective drivers of growth. These updates are important, potential long-term drivers of value creation that Wall Street may have overlooked, the Tesla bulls said. The Three Golden Updates: Robotaxi: Tesla CEO Elon Musk suggested on Wednesday evening that its robotaxi is likely to generate ‘quasi-infinite’ demand. "It’ll be by far the highest units per hour of any vehicle production ever," Musk said. The analysts at ARK see robotaxis accounting for over two-thirds of Tesla’s enterprise value in 2027. Full Self-Driving Software: Discussions are ongoing with a major automaker on licensing its FSD software, Musk said. As per ARK’s foresight, very few traditional automakers can create fully autonomous vehicles. However, Tesla, it believes, has an advantage in terms of data given that its fleet is now gathering more than 2 million miles of FSD data per day. Dojo: According to Musk, Tesla is set to invest over $1 billion in its project Dojo Supercomputer by the end of 2024. Given that NVIDIA cannot supply enough GPUs to meet its needs, Tesla’s investment in Dojo will pay off over time, the analysts said. Further, it Is necessary, they added. Check out more of Benzinga's Future Of Mobility coverage by following this link. Read Next: New Tesla Model 3 For Under $15K? California Man Shares How He Scored Incredible Price
+      ----------------------------------------------------------------------
+      [EXTRACTED TRIPLES]
+      #1 Elon Musk —SIGNALS→ robotaxi 'quasi-infinite' demand  (conf=0.85)
+         Reasoning: Musk's statement on robotaxi demand is a strong positive signal.
+      #2 Ark Investment Management —SIGNALS→ robotaxis 2/3 Tesla value 2027  (conf=0.75)
+         Reasoning: ARK sees robotaxis as major value driver for Tesla.
+      #3 Tesla —INVESTS_IN→ $1B in Dojo Supercomputer  (conf=0.90)
+         Reasoning: Tesla investing $1B in Dojo signals long-term AI commitment.
+
+    [2a683db0] v=v5.2 ticker=TSLA triples=1
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - 2 Legacy Auto Giants Behind Most Vehicle Recalls So Far This Year — Tesla Outside Top 10
+
+        ARTICLES:
+        While many automakers faced recalls this year, Ford Motor Co (NYSE:F) took the lead with the highest number of recalls, impacting a significant number of vehicles. What Happened: According to data from the National Highway Traffic Safety Administration (NHTSA), Ford issued 31 vehicle recalls in 2023, affecting over 4.1 million vehicles. Following closely is Stellantis NV (NYSE:STLA), formerly Chrysler, with 26 recalls impacting 1.7 million vehicles. Ford’s recalls covered various issues, including backover prevention, airbags, powertrain, and hydraulic service brakes. For Stellantis/Chrysler, most recalls were related to the electrical system or powertrain. Who Else? Other manufacturers with a notable number of recalls include BMW of North America, Forest River, Navistar, Nissan North America, Jayco, Mercedes Benz USA, Daimler Trucks North America, Jaguar Land Rover North America, Volkswagen Group of America, and American Honda Motor Co. Interestingly, despite Honda issuing only 11 recalls, it potentially affected 2.9 million vehicles, surpassing even Chrysler’s 26 recalls. In the last month alone, Ford issued four recalls impacting over 1 million vehicles, highlighting the significance of the issue. Tesla Inc (NASDAQ:TSLA), the EV giant, has issued 10 recalls in 2023 so far, impacting approximately 380,000 vehicles. These recalls included vehicles, equipment, tires, and child seats, with both physical fixes and over-the-air updates being implemented. Check out more of Benzinga’s Future Of Mobility coverage by following this link. Read Next: Porsche Taycan Makes Fastest EV Journey From Thailand To Singapore: Here’s How Long It Took Photo by MDart10 on Shutterstock
+      ----------------------------------------------------------------------
+      [EXTRACTED TRIPLES]
+      #1 Tesla —ANNOUNCES→ 10 recalls impacting 380000  (conf=0.90)
+         Reasoning: Tesla's recalls raise safety concerns, potentially impacting sales.
+
+    [42e56bf6] v=v5.2 ticker=TSLA triples=0
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - 'Elon Musk To Appeal Loss In SEC Case To Supreme Court' - Reuters News
+      ----------------------------------------------------------------------
+      [NO TRIPLES EXTRACTED]
+
+    [489ddfc2] v=v5.2 ticker=TSLA triples=1
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - Vinco Ventures, Nio, AMC, Tesla, Cleveland-Cliffs: Top 5 Trending Stocks Today
+
+        ARTICLES:
+        U.S. stocks traded higher toward the end of trading, with the Dow Jones gaining over 180 points on Monday. The Dow traded up 0.52% to 35,411.24 while the NASDAQ rose 0.2% to 14,058.87. The S&P 500 also rose, gaining 0.4% to 4,554.64. These are the top stocks that gained the attention of retail traders and investors throughout the day: Vinco Ventures, Inc. (NASDAQ:BBIG) closed the day with a 53.75% gain at $5.12, hitting an intraday high of $5.87 and a low of $3.18. The stock has been a favorite among retail investors and has gained nearly 100% in the last five days. Vinco Ventures is a digital media and content technology company with an 80% ownership interest in Lomotif Private Limited, a video-sharing social networking platform. NIO Inc. (NYSE:NIO) saw a 10.87% increase to close at $11.73, with an intraday high of $12.05 and a low of $10.84. The stock is trading higher alongside several Chinese names after China announced broad measures aimed at optimizing its business environment. NIO is among several Chinese names rising on the news. AMC Entertainment Holdings Inc (NYSE:AMC) rose by 32.95% to close at $5.85, reaching an intraday high of $6.23 and a low of $4.87. The stock traded higher after the court rejected the company’s proposed settlement with shareholders. AMC sent in a revised settlement on Monday, which is set to go back to the judge on an expedited timeline. Tesla, Inc. (NASDAQ:TSLA) closed the day with a 3.48% increase at $269.06, hitting an intraday high of $269.85 and a low of $254.12. Despite a broader market and tech stock rally, Tesla's stock has been on a downward trend since last Wednesday, even after the company reported better-than-expected earnings and revenue for the second quarter. Tesla remains rangebound amid uncertainties surrounding margins, but the anticipation surrounding Tesla's Cybertruck could offer some support against potential downside risks. Cleveland-Cliffs Inc. (NYSE:CLF) saw a 3.25% increase to close at $16.51, with an intraday high of $16.67 and a low of $16.05. The company reported second-quarter results for the period ended June 30, 2023, with revenues of $6.0 billion, steel shipments of 4.2 million net tons, and net income of $356 million. Cleveland-Cliffs is the largest flat-rolled steel producer in North America and the largest manufacturer of iron ore pellets in North America. Prepare for the day's trading **with top premarket movers and news by Benzinga. Engineered by Benzinga Neuro, Edited by Shivdeep Dhaliwal The GPT-4-based Benzinga Neuro content generation system exploits the extensive Benzinga Ecosystem, including native data, APIs, and more to create comprehensive and timely stories for you. Learn more.
+      ----------------------------------------------------------------------
+      [EXTRACTED TRIPLES]
+      #1 Tesla —ANNOUNCES→ TSLA stock +3.48%  (conf=0.95)
+         Reasoning: TSLA closed up 3.48% despite downward trend after earnings.
+
+    [63a04bfd] v=v5.2 ticker=TSLA triples=2
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - UBS Throws A Speed Bump On Tesla's Road - Should Investors Pump The Brakes Or Keep Their Foot On The Gas?
+
+        ARTICLES:
+        UBS, a globally recognized financial services firm, has downgraded its previously bullish stance on Tesla to a "Neutral" rating, causing investors to reconsider buying. Despite the downgrade, UBS still sees potential in Tesla's future, viewing it as a long-term opportunity while cautioning that the stock is presently priced near perfection. Interestingly, alongside the downgrade, UBS raised their price target for Tesla from $220 to $270. Tesla's stock price has seen a considerable rise, up by 110% year-to-date, even after adjusting for recent corrections. UBS, a leading global financial services firm, has changed its view on Tesla Inc (NASDAQ:TSLA). Previously bullish, they have now downgraded Tesla to a "Neutral" rating. This change has caused investors to hold off on buying, as UBS believes that Tesla's current stock prices already reflect its high demand. Although UBS has downgraded its confidence in Tesla, it's important to highlight that they have not completely lost faith in the company's potential. While the immediate enthusiasm may have cooled, the financial firm still recognizes a long-term opportunity in Tesla's corner. Contrary to the downgrade, they have actually raised their price target for Tesla, increasing it from $220 to $270. The stock price has steadily climbed, even after accounting for recent corrections. Year to date, it has risen by an impressive 110%. This surge reflects the strong confidence that investors have in Tesla's business model and product innovation. The stock price soared by over 28% last month, showcasing its enticing potential for investors. Although there have been fluctuations in the price this month, including a 14% increase at one point, it is currently down by 3% for the month. However, the overall trend is still bullish. In July, the influence of psychology on stock investing became apparent as Tesla's stock came close to a major resistance point of $300, missing this level by just $1. At present, the price is undergoing a pullback and has found support between the 20 and 50 simple moving averages. This is a critical juncture to monitor, as how the stock reacts to these averages may determine its future path. Notably, on Monday, the price rebounded from this support area suggesting future strength. If the stock surpasses and closes above the recent high from July 19th, it would confirm a continuation of the bullish trend, reaffirming high growth expectations for the stock. After the closing bell on Monday, February 24, the stock closed at $269.06, trading up by 3.48%.
+      ----------------------------------------------------------------------
+      [EXTRACTED TRIPLES]
+      #1 UBS —CUTS→ Tesla  (conf=0.80)
+         Reasoning: Downgrade to neutral rating may cause investors to reconsider buying.
+      #2 UBS —RAISES→ price target to $270  (conf=0.90)
+         Reasoning: Raised price target suggests potential for future growth.
+
+    [6708f01e] v=v5.2 ticker=TSLA triples=0
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - Volatility Outlook On Earnings Q2 2023: How Are People Positioning?
+
+        ARTICLES:
+        There has been a lot of noise made over the possibility that earnings will decline rapidly this quarter. I reviewed 16 different large-cap company earnings coming up by using the tools in Volland (https://www.vol.land) and ORATS (https://orats.com/). For the most part, earnings expectations are making a slight comeback this month. Most companies are not bouncing back to levels they were at before the Fed hawkish pivot, but are exceeding the earnings per share (EPS) they had in Q1. Many companies, particularly tech, had many upside revisions to earnings expectations as the quarter advanced. Also, the volatility expected by earnings, bullish or bearish, is down across the board. One odd thing is that selling calls has been the strategy taken to hedge almost all these earnings reports. Calls are being sold across the board, giving clear earnings price targets. Very few of these stocks have many puts being bought to hedge, which again leaves the door open for downside. However, in the case where implied volatility (IV) will decline as event vol moves away, the more likely scenario is an advance to the target presented by the sold calls and then a retreat from that price (sometimes even before the market opens the next day). This happened last week with Tesla, Inc. (NASDAQ:TSLA) and Netflix, Inc. (NASDAQ:NFLX), and today with General Motors Company (NYSE:GM). In all three of these cases, earnings have been remarkably positive, yet the price plummets after the initial surge. This reflects the customer "sold call" method of hedging as dealers need to sell deltas off their increasing long deltas. If the earnings were encouraging and showed true growth for these companies, I would expect the earnings peaks to be revisited eventually. That is the typical pattern of dealer long OTM calls after positive events when there was no put buying as a hedge. Disclaimer: This article is written by Ad Deum Funds, LLC, doing business as Wizard of Ops (“Wizard of Ops”). It is not intended as a source of specific investment advice. The information contained in this article has been carefully selected from sources believed to be reliable as of the time that it was published, but its completeness, accuracy, and usefulness is not guaranteed. Some of the advice and information in this article may be inconsistent or contrary to advice and information published at a prior or subsequent date. Investment contains substantial risks and past performance is not indicative of future performance. Nothing contained herein should be construed as an offer or the solicitation of an offer to buy or sell any stock, security, or other item mentioned in the article. Wizard of Ops bears no responsibility for any loss of principal, failure to obtain desired objectives, or any other outcome related to the advice contained herein. The article is provided “as is”, “where is”, “with all faults”, and “as available”. At any time, Wizard of Ops’ members, officers, directors, employees, contractors, and other representatives may own any stock, securities, or other items mentioned in the article. Wizard of Ops makes no warranty, representation, or guarantee regarding the information or material contained in the article. Under no circumstances shall Wizard of Ops be liable for any direct, indirect, incidental or any other type of damages resulting from any use of or downloading of the article.
+      ----------------------------------------------------------------------
+      [NO TRIPLES EXTRACTED]
+
+    [ae640f68] v=v5.2 ticker=TSLA triples=1
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - Elon Musk's Tesla To Discuss Low-Cost Car With Indian Government — Aims For A Price Below Model 3 in China: Report
+
+        ARTICLES:
+        This story was first published on the Benzinga India portal. Electric car maker Tesla Inc (NASDAQ:TSLA) is set to resume talks with the Indian government to establish a factory in the country to manufacture low-cost EVs, including a new $24,000 (INR 2 million) car. What Happened? Tesla representatives are scheduled to meet India’s commerce minister this month to further discuss the plans, which include setting up an EV supply chain and land allotment for a factory, sources with direct knowledge of the matter told Reuters. Tesla has been looking to make a foray into the Indian market as it makes an effort to diversify beyond China. It was previously reported that the US company plans to build up capacity to manufacture 500,000 cars in the country every year. See Also: Tesla’s India Charge: Can Local Manufacturing Overcome Pricing, Charging Challenges? Tesla has also reportedly been keen on bringing its own supply chain to the country and continues to push for tax breaks in the South Asian nation. Why It Matters: The proposed $24,000 EV model would be 25% cheaper than Tesla’s current lowest-priced offering, the Model 3 sedan in China, which sells for over $32,200 (INR 2.6 million). The company aims to make significant progress in the Indian market and meet the country’s growing demand for electric vehicles. This would be the highest-level meeting between Tesla and Indian government officials since Tesla CEO Elon Musk met with Prime Minister Narendra Modi in June and said he intended to invest significantly in the country. Electric vehicles currently account for less than 2% of total vehicle sales in India, the world’s third-largest market for automobiles. Read Next: Tesla Sets Up For India Entry: Plans For Local Assembly And Vendor Base On The Horizon
+      ----------------------------------------------------------------------
+      [EXTRACTED TRIPLES]
+      #1 Tesla —SIGNALS→ $24000 EV in India  (conf=0.90)
+         Reasoning: Tesla planning low-cost EV for India expands market reach.
+
+    [c604a1b7] v=v5.2 ticker=TSLA triples=1
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - Tesla In FSD Licensing Talks: Enthusiasts Bet Ford Is The Mystery Automaker
+
+        ARTICLES:
+        Tesla Inc (NASDAQ:TSLA) enthusiasts are speculating Ford Motor Co (NYSE:F) might be the "major OEM" Tesla CEO Elon Musk mentioned during the company's second quarter 2023 Earnings Call. What Happened: Musk announced Tesla is in preliminary talks with a major automaker to license its Full Self-Driving (FSD) technology. This follows Musk's previous assertion that Tesla is open to licensing either Autopilot or Full Self-Driving, along with other proprietary technologies. As reported by Teslarati, many Tesla fans have been curious about which automaker Tesla might be in discussions. This speculation was further stoked when a Twitter poll conducted shortly after Musk's announcement showed an overwhelming number of respondents who pointed to Ford as the likely candidate. Why It Matters: Ford's possible involvement is of particular interest given its past collaboration with Tesla. Ford was the first automaker to adopt Tesla’s North American Charging Standard (NACS) connector, followed by General Motors. Contrary to these speculations, automakers such as Mercedes-Benz and General Motors, which already have established self-driving systems, may choose to continue the development of their own technology. Mercedes-Benz's Level 3 system has received approval for operation in certain areas, while General Motors' Super Cruise program has been relatively successful. Rivian is generally considered not to fit the description of a "major OEM." So, it remains to be seen which automaker Tesla is indeed in discussions with for its FSD technology. Photo: Courtesy of Tesla
+      ----------------------------------------------------------------------
+      [EXTRACTED TRIPLES]
+      #1 Elon Musk —ANNOUNCES→ FSD licensing talks  (conf=0.90)
+         Reasoning: FSD licensing could increase revenue.
+
+    [c83ceb52] v=v5.2 ticker=TSLA triples=0
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - Both GM's And Worksport's Game Plans Are On Track
+
+        ARTICLES:
+        While Tesla Inc (NASDAQ:TSLA) continues to rule the EV kingdom and raise the bar, General Motors (NYSE:GM) reported its second quarter results, with both revenue and earnings soaring as well as topping Wall Street estimates. The automaker has also boosted its profit guidance for the second time, pleasing investors with its profit and the fact its EV game plan is on track. Also today, tonneau cover maker Worksport Ltd (NASDAQ:WKSP) revealed It received a substantial purchase order for its advanced hard-folding tonneau covers, on top of its recently reported order of $720,000 for its innovative soft-folding tonneau covers. Worksport Continues Elevating Its Position Worksport has announced today it has received a substantial purchase order of $1,600,000 for its hard folding covers with production expected to kick off in two weeks. Fueled by a soaring momentum, the hard-folding line will only further elevate Worksport’s market positioning as its US facility continues operating at an exceptional pace to ensure timely shipments of soft folding tonneau covers. Worksport’s NY West Seneca facility will be playing an essential role in the launch of its ‘made in the USA’ hard folding covers. The dual success of both product lines and increasing orders affirms Worksport’s strategic direction and the trust it received from the market for its patented technologies that are behind its innovative products. CEO Steven Rossi stated that Worksport continues to work hard on optimizing its efficiency and boosting revenue growth. Meanwhile, Worksport plans to unveil its eagerly anticipated SOLIS solar-powered folding tonneau cover, one that uses collected solar energy to charge its proprietary COR battery system, by the end of the year. By bringing portable off-grid clean energy power to the automotive and EV table, Worksport promises to be among important players who will be shaping the future of all-electric transportation. GM’s Reported Beyond Solid Q2 Results Earlier this month, GM already revealed its second quarter brought its best delivery result since 2020’s fourth quarter as it delivered 691,978 vehicles during the period, translating to a rise of 18.8%. Consequently, for the quarter ended on June 30th, GM’s revenue expanded 25.1% YoY to $44.75 billion, topping Refinitiv’s consensus of $42.64 billion. Net income attributable to shareholders made a skyrocketing jump of 51.7% as it amounted to $2.56 billion. EPS rose 60.5%YoY to $1.83 while when adjusted, EPS rose 67.5% to $1.91. The adjustment relates to a $792 million charge for commercial agreements GM made with LG Electronics and LG Energy Solution, as GM is sharing costs for recalling its Chevrolet Bolt EV models that were previously expected to be paid by LG. GM Uplifted Its Full Year Guidance Once Again By further intensifying its cost-cutting measures through next year, GM will be lowering costs not only by previously aimed $2 billion but by $3 billion by trimming sales and marketing spending, salary employment, among other expenditures. With these cost cutting initiatives and strong financial performance, GM once again lifted its outlook. GM now expects adjusted earnings in a range between $12 billion and $14 billion, while the previous range expected in Q1 was between $11 billion and $13 billion. Adjusted automotive free cash flow was also raised from prior $5.5 billion and $7.5 billion to a new range between $7 billion and $9 billion. Net income attributable to stockholders is expected to be between $9.3 billion to $10.7 billion, while the previously guided range was between $8.4 billion and $9.9 billion. GM CFO Paul Jacobson noted that a more optimistic outlook is the result of stronger-than-expected pricing power and demand along with exemplary capital discipline. GM’s EV Plan Remains On Track As for its EV game plan, GM disclosed more details during its earnings call. It revealed it will be ramping up its output, confirming it is on track to make 100,000 EVs in North America in the remaining half of the year after having met its first goal of 50,000. GM’s new EVs will also be hitting the road this year, namely Silverado EV, Blazer EV, and Equinox EV. Recap While a weakened global economy continues to slow down a lot of tension in the air, both GM and Worksport are going full speed ahead as they execute their ambitious game plans and contribute to creating a new and cleaner future of transportation. DISCLAIMER: This content is for informational purposes only. It is not intended as investing advice.
+      ----------------------------------------------------------------------
+      [NO TRIPLES EXTRACTED]
+
+    [f069e2fc] v=v5.2 ticker=TSLA triples=1
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - 10 Consumer Discretionary Stocks Whale Activity In Today's Session
+
+        ARTICLES:
+        This whale alert can help traders discover the next big trading opportunities. Whales are entities with large sums of money and we track their transactions here at Benzinga on our options activity scanner. Traders will search for circumstances when the market estimation of an option diverges heavily from its normal worth. High amounts of trading activity could push option prices to exaggerated or underestimated levels. Below are some instances of options activity happening in the Consumer Discretionary sector: Symbol PUT/CALL Trade Type Sentiment Exp. Date Strike Price Total Trade Price Open Interest Volume TSLA CALL SWEEP NEUTRAL 07/28/23 $270.00 $27.7K 24.5K 86.2K RIVN CALL SWEEP BEARISH 07/28/23 $24.00 $193.1K 5.2K 3.7K PTON PUT TRADE BULLISH 12/15/23 $6.00 $58.2K 2.8K 1.1K CVNA PUT SWEEP BEARISH 08/11/23 $45.00 $444.9K 2.1K 1.0K LOW CALL TRADE BEARISH 01/19/24 $230.00 $1.5 million 2.7K 788 PHM CALL TRADE BEARISH 08/04/23 $84.00 $27.0K 3 454 LCID CALL SWEEP BULLISH 01/17/25 $5.00 $59.8K 8.7K 419 CWH PUT SWEEP BULLISH 01/19/24 $28.00 $46.0K 1.0K 222 GM PUT SWEEP BEARISH 01/19/24 $45.00 $75.0K 19.9K 221 CZR PUT SWEEP NEUTRAL 12/15/23 $50.00 $43.5K 2.7K 160 Explanation These bullet-by-bullet explanations have been constructed using the accompanying table. • For TSLA (NASDAQ:TSLA), we notice a call option sweep that happens to be neutral, expiring in 3 day(s) on July 28, 2023. This event was a transfer of 56 contract(s) at a $270.00 strike. This particular call needed to be split into 8 different trades to become filled. The total cost received by the writing party (or parties) was $27.7K, with a price of $495.0 per contract. There were 24505 open contracts at this strike prior to today, and today 86221 contract(s) were bought and sold. • Regarding RIVN (NASDAQ:RIVN), we observe a call option sweep with bearish sentiment. It expires in 3 day(s) on July 28, 2023. Parties traded 878 contract(s) at a $24.00 strike. This particular call needed to be split into 3 different trades to become filled. The total cost received by the writing party (or parties) was $193.1K, with a price of $220.0 per contract. There were 5215 open contracts at this strike prior to today, and today 3781 contract(s) were bought and sold. • For PTON (NASDAQ:PTON), we notice a put option trade that happens to be bullish, expiring in 143 day(s) on December 15, 2023. This event was a transfer of 1121 contract(s) at a $6.00 strike. The total cost received by the writing party (or parties) was $58.2K, with a price of $52.0 per contract. There were 2806 open contracts at this strike prior to today, and today 1121 contract(s) were bought and sold. • For CVNA (NYSE:CVNA), we notice a put option sweep that happens to be bearish, expiring in 17 day(s) on August 11, 2023. This event was a transfer of 1000 contract(s) at a $45.00 strike. This particular put needed to be split into 31 different trades to become filled. The total cost received by the writing party (or parties) was $444.9K, with a price of $445.0 per contract. There were 2144 open contracts at this strike prior to today, and today 1037 contract(s) were bought and sold. • For LOW (NYSE:LOW), we notice a call option trade that happens to be bearish, expiring in 178 day(s) on January 19, 2024. This event was a transfer of 788 contract(s) at a $230.00 strike. The total cost received by the writing party (or parties) was $1.5 million, with a price of $1983.0 per contract. There were 2753 open contracts at this strike prior to today, and today 788 contract(s) were bought and sold. • Regarding PHM (NYSE:PHM), we observe a call option trade with bearish sentiment. It expires in 10 day(s) on August 4, 2023. Parties traded 200 contract(s) at a $84.00 strike. The total cost received by the writing party (or parties) was $27.0K, with a price of $135.0 per contract. There were 3 open contracts at this strike prior to today, and today 454 contract(s) were bought and sold. • Regarding LCID (NASDAQ:LCID), we observe a call option sweep with bullish sentiment. It expires in 542 day(s) on January 17, 2025. Parties traded 164 contract(s) at a $5.00 strike. This particular call needed to be split into 7 different trades to become filled. The total cost received by the writing party (or parties) was $59.8K, with a price of $365.0 per contract. There were 8753 open contracts at this strike prior to today, and today 419 contract(s) were bought and sold. • For CWH (NYSE:CWH), we notice a put option sweep that happens to be bullish, expiring in 178 day(s) on January 19, 2024. This event was a transfer of 219 contract(s) at a $28.00 strike. This particular put needed to be split into 15 different trades to become filled. The total cost received by the writing party (or parties) was $46.0K, with a price of $210.0 per contract. There were 1004 open contracts at this strike prior to today, and today 222 contract(s) were bought and sold. • For GM (NYSE:GM), we notice a put option sweep that happens to be bearish, expiring in 178 day(s) on January 19, 2024. This event was a transfer of 100 contract(s) at a $45.00 strike. This particular put needed to be split into 5 different trades to become filled. The total cost received by the writing party (or parties) was $75.0K, with a price of $750.0 per contract. There were 19923 open contracts at this strike prior to today, and today 221 contract(s) were bought and sold. • For CZR (NASDAQ:CZR), we notice a put option sweep that happens to be neutral, expiring in 143 day(s) on December 15, 2023. This event was a transfer of 160 contract(s) at a $50.00 strike. This particular put needed to be split into 24 different trades to become filled. The total cost received by the writing party (or parties) was $43.5K, with a price of $272.0 per contract. There were 2739 open contracts at this strike prior to today, and today 160 contract(s) were bought and sold. Options Alert Terminology - Call Contracts: The right to buy shares as indicated in the contract. - Put Contracts: The right to sell shares as indicated in the contract. - Expiration Date: When the contract expires. One must act on the contract by this date if one wants to use it. - Premium/Option Price: The price of the contract. For more information, visit our Guide to Understanding Options Alerts or read more about unusual options activity. This article was generated by Benzinga's automated content engine and reviewed by an editor.
+      ----------------------------------------------------------------------
+      [EXTRACTED TRIPLES]
+      #1 Tesla —ANNOUNCES→ TSLA call sweep neutral  (conf=0.70)
+         Reasoning: Neutral call sweep suggests limited price movement.
+
+
+══════════════════════════════════════════════════════════════════════
+  SUMMARY
+══════════════════════════════════════════════════════════════════════
+  ✅ PASS  Cache Integrity
+  ✅ PASS  article_index Stripped
+  ✅ PASS  Quality (A+B=64%)
+  ✅ PASS  Multi-Call Consistency
+
+  ✅ ALL CHECKS PASSED
+══════════════════════════════════════════════════════════════════════

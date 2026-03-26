@@ -26,7 +26,7 @@ from data_pipeline.kg.extractor_batch import (
     detect_primary_ticker, build_combined_text, get_article_pieces,
     dedup_triples, apply_quality_filters, smart_dedup_triples, limit_signals_per_source,
     filter_triples_for_ticker, _sha1, _norm, _filter_and_clamp, _parse_tickers,
-    tag_triples_source, build_user_prompt,
+    tag_triples_source, build_user_prompt, build_multi_article_prompt,
     FINDKG_LITE_SYSTEM_PROMPT, _GEN_CONFIG_DICT, MODEL_ID,
 )
 
@@ -95,9 +95,19 @@ def normalize_news_df(df):
 def extract_and_cache_per_article(day_df, ticker, date_str, extractor, cache_dir, min_relevance, min_confidence):
     """
     Extract triples for (ticker, date) using interactive API.
-    Per-article cache: each article saved immediately after extraction.
+
+    V5.3: Multi-article concat optimization.
+    Groups up to KG_MAX_ARTICLES_PER_CALL articles into 1 API call.
+    Results split by article_index → saved to per-article cache (same format as before).
+
+    Backward compatible: old per-article cache files still work (cache hit → skip).
     """
+    max_per_call = getattr(GlobalConfig, 'KG_MAX_ARTICLES_PER_CALL', 10)
+
+    # ── Step 1: Collect articles, check cache (UNCHANGED) ─────────────────
     sha1_to_meta, sha1_to_raw, cache_hits = {}, {}, 0
+    sha1_order = []  # preserve insertion order for stable batching
+
     for _, row in day_df.iterrows():
         title   = _norm(str(row.get("title","")   or ""))
         content = _norm(str(row.get("content","") or ""))
@@ -108,39 +118,117 @@ def extract_and_cache_per_article(day_df, ticker, date_str, extractor, cache_dir
             existing = set(sha1_to_meta[h]["all_tickers"])
             sha1_to_meta[h]["all_tickers"] = list(existing | set(row.get("_all_tickers") or [ticker]))
             continue
-        sha1_to_meta[h] = {"full_text": full_text, "primary_ticker": str(row.get("primary_ticker") or ticker),
-                           "date": date_str, "all_tickers": list(row.get("_all_tickers") or [ticker])}
+        sha1_to_meta[h] = {
+            "full_text": full_text,
+            "primary_ticker": str(row.get("primary_ticker") or ticker),
+            "date": date_str,
+            "all_tickers": list(row.get("_all_tickers") or [ticker]),
+        }
         cached = _load_cache(cache_dir, h)
-        if cached is not None: sha1_to_raw[h] = cached; cache_hits += 1
-        else: sha1_to_raw[h] = None
-
-    uncached = [h for h, v in sha1_to_raw.items() if v is None]
-    if uncached:
-        print(f"  [{ticker} {date_str}] cache_hits={cache_hits} to_extract={len(uncached)}")
-        piece_jobs = []
-        for h in uncached:
-            for piece in get_article_pieces(sha1_to_meta[h]["full_text"]):
-                piece_jobs.append((h, {"text": piece, "ticker": sha1_to_meta[h]["primary_ticker"], "date": sha1_to_meta[h]["date"]}))
-
-        n_pieces = len(piece_jobs)
-        n_articles = len(uncached)
-        if n_pieces == n_articles:
-            print(f"  Extracting: {n_articles} articles (full-text, no chunking)")
+        if cached is not None:
+            sha1_to_raw[h] = cached
+            cache_hits += 1
         else:
-            print(f"  Extracting: {n_articles} articles -> {n_pieces} pieces (chunking enabled)")
+            sha1_to_raw[h] = None
+            sha1_order.append(h)
 
-        results = extractor.extract_batch([j[1] for j in piece_jobs])
-        sha1_pieces = defaultdict(list)
-        for (sha1, _), triples in zip(piece_jobs, results): sha1_pieces[sha1].extend(triples or [])
-        for h in uncached:
-            merged  = _filter_and_clamp(sha1_pieces[h], min_relevance, min_confidence)
-            deduped = apply_quality_filters(merged)
-            deduped = tag_triples_source(deduped, h)
-            sha1_to_raw[h] = deduped
-            _save_cache(cache_dir, h, deduped, meta=sha1_to_meta[h])
+    uncached = sha1_order  # already filtered to None values, in order
+
+    if uncached:
+        # ── Step 2: Group into multi-article batches ──────────────────────
+        batches = []
+        for i in range(0, len(uncached), max_per_call):
+            batches.append(uncached[i:i + max_per_call])
+
+        n_calls = len(batches)
+        n_articles = len(uncached)
+        print(f"  [{ticker} {date_str}] cache_hits={cache_hits} to_extract={n_articles} → {n_calls} API call(s) (max {max_per_call}/call)")
+
+        # ── Step 3: Build multi-article prompts ───────────────────────────
+        multi_jobs = []
+        for batch in batches:
+            if len(batch) == 1:
+                # Single article → use standard prompt (backward compatible)
+                h = batch[0]
+                meta = sha1_to_meta[h]
+                pieces = get_article_pieces(meta["full_text"])
+                for piece in pieces:
+                    multi_jobs.append({
+                        "text": piece,
+                        "ticker": meta["primary_ticker"],
+                        "date": date_str,
+                        "_batch_sha1s": batch,
+                        "_is_single": True,
+                    })
+            else:
+                # Multi-article → build concat prompt
+                articles_with_index = []
+                for idx, h in enumerate(batch):
+                    meta = sha1_to_meta[h]
+                    pieces = get_article_pieces(meta["full_text"])
+                    articles_with_index.append((idx, pieces[0]))  # full article = 1 piece
+
+                prompt = build_multi_article_prompt(articles_with_index, ticker, date_str)
+                multi_jobs.append({
+                    "_raw_prompt": prompt,
+                    "ticker": ticker,
+                    "date": date_str,
+                    "_batch_sha1s": batch,
+                    "_is_single": False,
+                })
+
+        # ── Step 4: Extract (N/max_per_call API calls instead of N) ───────
+        results = extractor.extract_batch(multi_jobs)
+
+        # ── Step 5: Split results by article_index → per-article cache ────
+        for job, triples_list in zip(multi_jobs, results):
+            batch = job["_batch_sha1s"]
+
+            if job.get("_is_single"):
+                # Single article → all triples belong to batch[0]
+                h = batch[0]
+                article_triples = [
+                    {k: v for k, v in t.items() if k != "article_index"}
+                    for t in (triples_list or [])
+                ]
+                merged = _filter_and_clamp(article_triples, min_relevance, min_confidence)
+                deduped = apply_quality_filters(merged)
+                deduped = tag_triples_source(deduped, h)
+                sha1_to_raw[h] = deduped
+                _save_cache(cache_dir, h, deduped, meta=sha1_to_meta[h])
+            else:
+                # Multi-article → split by article_index
+                per_article = defaultdict(list)
+                for t in (triples_list or []):
+                    idx = t.get("article_index", 0)
+                    # Strip article_index before caching (keep cache format clean)
+                    clean_triple = {k: v for k, v in t.items() if k != "article_index"}
+                    if 0 <= idx < len(batch):
+                        per_article[idx].append(clean_triple)
+                    else:
+                        # Fallback: try to match by subject/object mention
+                        assigned = False
+                        subj = t.get("subject", {}).get("name", "").lower()
+                        for fi, fh in enumerate(batch):
+                            if subj and subj in sha1_to_meta[fh]["full_text"].lower():
+                                per_article[fi].append(clean_triple)
+                                assigned = True
+                                break
+                        if not assigned:
+                            per_article[0].append(clean_triple)  # conservative fallback
+
+                for idx, h in enumerate(batch):
+                    article_triples = per_article.get(idx, [])
+                    merged = _filter_and_clamp(article_triples, min_relevance, min_confidence)
+                    deduped = apply_quality_filters(merged)
+                    deduped = tag_triples_source(deduped, h)
+                    sha1_to_raw[h] = deduped
+                    _save_cache(cache_dir, h, deduped, meta=sha1_to_meta[h])
     else:
-        if sha1_to_meta: print(f"  [{ticker} {date_str}] all {cache_hits} article(s) from cache")
+        if sha1_to_meta:
+            print(f"  [{ticker} {date_str}] all {cache_hits} article(s) from cache")
 
+    # ── Step 6: Merge all articles for this (ticker, date) (UNCHANGED) ────
     all_triples = []
     for h, raw in sha1_to_raw.items():
         if not raw: continue

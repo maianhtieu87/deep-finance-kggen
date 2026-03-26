@@ -1,0 +1,281 @@
+======================================================================
+  Extraction Diagnostic — Multi-Article Concat Validation
+  Log saved to: D:\ProjectNCKH\deep_finance\data_test\TSLA_2023-07-27.txt
+======================================================================
+  Cache: D:\ProjectNCKH\deep_finance\data\interim\kg_article_cache
+  Filter ticker: TSLA
+  Filter date:   2023-07-27
+  Scanning 9467 cache files in D:\ProjectNCKH\deep_finance\data\interim\kg_article_cache...
+  Filtered: 15 / 9467 cache files
+
+──────────────────────────────────────────────────────────────────────
+  CHECK 1: Cache Integrity
+──────────────────────────────────────────────────────────────────────
+  Total files:    15
+  Valid JSON:     15
+  Invalid JSON:   0
+  With triples:   9
+  Empty (0 tri):  6
+  Versions:       {'v5.2': 15}
+  → ✅ PASS
+
+──────────────────────────────────────────────────────────────────────
+  CHECK 2: article_index Stripped (no leak to cache)
+──────────────────────────────────────────────────────────────────────
+  Triples checked:      15
+  Clean (no index):     15
+  Leaked (has index):   0
+  → ✅ PASS
+
+──────────────────────────────────────────────────────────────────────
+  CHECK 3: Triple Quality Stats
+──────────────────────────────────────────────────────────────────────
+  Total triples:        15
+  Avg per article:      1.7
+  Avg confidence:       0.81
+  Avg relevance:        0.94
+  Avg impact:           -0.07
+  Group A (actions):    2
+  Group B (causal):     9
+  Group C (context):    4
+  Group A+B:            73%  ✅ Good
+  Has _src tag:         15/15
+  Has reasoning:        15/15
+
+  Relations:
+    COMPETES_WITH          ███████ 7
+    SIGNALS                ████ 4
+    ANNOUNCES              ██ 2
+    NEG_IMPACTS            █ 1
+    SUPPLIES_TO            █ 1
+
+──────────────────────────────────────────────────────────────────────
+  CHECK 4: Multi-Call Consistency
+──────────────────────────────────────────────────────────────────────
+  Articles with 0 triples:  6
+  Articles with >15 triples: 0
+  Max triples/article:      7
+
+  Distribution (triples per article):
+     0 triples: ██████ 6
+     1 triples: ████████ 8
+     7 triples: █ 1
+  → ⚠️ WARNING (>30% empty articles) (40% empty)
+
+──────────────────────────────────────────────────────────────────────
+  CHECK 5: Deep Dive (filtered articles)
+──────────────────────────────────────────────────────────────────────
+
+  2023-07-27: 15 articles → 15 triples
+    [1001717f] v=v5.2 ticker=TSLA triples=0
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - Elon Musk's Fan-Following Dwindles, But Early Tesla Model 3 Owners Remain Loyal, Survey Finds
+
+        ARTICLES:
+        In a recent follow-up survey conducted by Bloomberg, the earliest owners of Tesla‘s original Model 3 reveal a shift in perception of CEO Elon Musk, if not that of the car. Some even cited Musk as the reason for walking away from Tesla to another brand. Musk’s Approval Ratings Drop: In July 2018, Tesla Inc. (NASDAQ:TSLA) made a significant leap, ramping up production of its Model 3 electric car to over 5,000 units per week. This marked the company’s transition into a mature automaker, a move that Musk described as becoming a “real car company.” Following this, a survey was conducted to get a pulse of the first buyers. While the Model 3 continues to receive high praise, the survey indicated a significant drop in Musk’s approval ratings. The most notable change in opinion was the reaction to Musk’s acquisition of Twitter in 2022, which he subsequently renamed X. Many respondents also expressed disappointment with Musk’s controversial tweets and political online disputes. See Also: Cybertruck: Tesla’s Home Run? Analyst Sees EV Pickup as Rolling Billboard That Will Re Model 3 Still a Favorite: Despite the criticism towards Musk, Model 3 owners remain overwhelmingly satisfied with their vehicles. The car’s high level of satisfaction leaves little room for improvement, with many owners expressing their commitment to the brand. The survey also revealed that 96% of Model 3 owners planning to buy a new vehicle in the next few years are considering electric options. Read Next: Tesla And The Boy Who Cried FSD Reportedly Under Investigation By California Attorney General Image by canadianPhotographer56 on Shutterstock Engineered by Benzinga Neuro, Edited by Pooja Rajkumari The GPT-4 Benzinga Neuro content generation system exploits the extensive Benzinga Ecosystem, including native data, APIs, and more to create comprehensive and timely stories for you. Learn more.
+      ----------------------------------------------------------------------
+      [NO TRIPLES EXTRACTED]
+
+    [15058831] v=v5.2 ticker=TSLA triples=1
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - Tesla Created A Top-Secret Group To Suppress Customer Complaints: Report
+
+        ARTICLES:
+        Tesla Inc (NASDAQ:TSLA) reportedly created a secret group to minimize and suppress thousands of customer complaints regarding the driving range of Tesla cars. The car would reportedly display a driving range, say 300 miles, but it would only be getting a portion of those miles, sometimes as low as half, a Thursday Reuters report said. Tesla then created a team to cancel appointments for people who had scheduled maintenance visits to diagnose the driving range problem. The team would text customers, telling them that a remote diagnosis of the car’s battery determined that everything was OK, and that they didn’t need to come in any longer. “Last summer, the company quietly created a 'Diversion Team' in Las Vegas to cancel as many range-related appointments as possible,” the Reuters article stated. Related Link: Tesla's V4 Superchargers Could Add 115 Miles of Range In 5 Minutes Company Culture: The Reuters report described the top-secret team as if it were a buzzing sales team: celebrating "victories" by banging a xylophone and sometimes even standing on desks to celebrate a "case closed" when someone’s service had been canceled. If Tesla cars are unable to live up to their promised driving range, it would be part of a larger theme in which Tesla and its CEO Elon Musk have not been able to deliver on promises. Musk said Tesla drivers would have full-self driving in 2017, accoridng to Gizmodo — and again in 2018, and the year after. Eventually, FSD did become available, but not until 2022. He also said there would be one million Tesla robo-taxis by 2020. Many Tesla customers have complained that their cars have taken longer than promised to be delivered, or that they have been delivered with imperfections. South Korean regulators fined Tesla for incorrectly displaying driving range, particularly in cold weather, in which drivers were only getting about half of the miles advertised. It’s typical for electric cars to lose some range in colder conditions. Read Also: Elon Musk's Fan-Following Dwindles, But Early Tesla Model 3 Owners Remain Loyal, Survey Finds Photo: Shutterstock
+      ----------------------------------------------------------------------
+      [EXTRACTED TRIPLES]
+      #1 Tesla —NEG_IMPACTS→ customer complaints  (conf=0.70)
+         Reasoning: Tesla created a top-secret group to suppress customer complaints.
+
+    [18d06f07] v=v5.2 ticker=TSLA triples=0
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - Tesla's V4 Superchargers Could Add 115 Miles Of Range In 5 Minutes
+
+        ARTICLES:
+        Tesla Inc's (NASDAQ:TSLA) V4 Superchargers are set to deliver greater charging speeds with the ability to add 115 miles of range in just five minutes at full power. This marks a significant increase from the current limit of 250kW to an impressive 350kW. The information was confirmed in a planning submission for a new charging site in Swindon, U.K., as reported by NotATeslaApp. The submission also indicated that all charging units would be usable by any EV driver irrespective of whether they have a Tesla app or account. During the Tesla Semi unveiling event, both Tesla CEO Elon Musk and Tesla Semi Program Manager Dan Priestley confirmed that the Cybertruck would be compatible with the same charging technology as the Tesla Semi. The Semi charger setup allows up to 1MW of DC fast-charging, made possible through Tesla’s innovative “immersion cooling technology.” The V4 Superchargers were first displayed at the Goodwood Festival of Speed in the U.K., where it was observed that they had a built-in space for a screen and contactless payment terminal. This feature allows for seamless payment by non-Tesla EV owners who wish to charge their vehicles at the Supercharger station, without the need for a Tesla app on their phone. This development aligns with European regulations that discourage the need for an app to use an EV charging station. The first operational V4 Supercharger was inaugurated in Harderwijk, Netherlands earlier this year. Photo: Courtesy of Tesla
+      ----------------------------------------------------------------------
+      [NO TRIPLES EXTRACTED]
+
+    [1de7ccd5] v=v5.2 ticker=TSLA triples=1
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - Indonesia Woos Tesla, BYD And Other Automakers With Favorable Incentives For EV Production
+
+        ARTICLES:
+        Tesla Inc. (NASDAQ:TSLA) is among several automakers being courted by Indonesia as the country intensifies its efforts to attract global automakers, Teslarati reports. Indonesia’s Attractive Incentives: High-level discussions have been taking place between Tesla CEO Elon Musk and Indonesian officials, including President Joko "Jokowi" Widodo and Senior Cabinet Minister Luhut Pandjaitan, since 2020. The country’s rich nickel reserves, crucial for battery production, have been a significant part of the negotiations. “Tomorrow, we are going to finalize incentives that we are going to give to any EV investment in Indonesia,” said Pandjaitan, indicating the country’s readiness to compete with others like Vietnam and Thailand for the investments of major automakers. Indonesia is reportedly planning to offer substantial incentives to companies, including Tesla and BYD Co Ltd (OTC:BYDDF) (OTC:BYDDY), and is willing to benchmark their offers against other countries vying for the same companies. Read Also: Elon Musk’s Tesla Cybertruck Spotted Testing On Californian Streets With Calibration Equipment Image via Shutterstock Engineered by Benzinga Neuro, Edited by Pooja Rajkumari The GPT-4 Benzinga Neuro content generation system exploits the extensive Benzinga Ecosystem, including native data, APIs, and more to create comprehensive and timely stories for you. Learn more.
+      ----------------------------------------------------------------------
+      [EXTRACTED TRIPLES]
+      #1 Indonesia —SIGNALS→ favorable incentives  (conf=0.70)
+         Reasoning: Indonesia woos Tesla with incentives for EV production.
+
+    [1e868477] v=v5.2 ticker=TSLA triples=1
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - Looking For A Pure-Play Nickel ETF? Sprotts' NIKL Fund Holds 28 Miners, Including One Supplier To Tesla, GM
+
+        ARTICLES:
+        With the transition to clean energy running in full gear, the minerals and metals powering the EV battery supply chain are in focus. While the lithium sector has remained popular with investors, Nickel plays a crucial role as a key element in the rechargeable batteries utilized in hybrid and electric vehicles, as well as clean energy storage solutions. Increasing the nickel content in electric vehicle batteries extends their range. Sprott Nickel Miners ETF (NASDAQ:NIKL) tracks 28 nickel mining companies and corresponds to the total return performance of the Nasdaq-listed Sprott Nickel Miners Index. NIKL is the only pure-play ETF focusing on nickel miners, who will be critical in supplying the mineral, which is essential to EV batteries and clean energy infrastructure. The three largest holdings within NIKL are Nickel Industries Ltd, weighted at 12.56%, Vale SA (NYSE:VALE), weighted at 10.33% and IGO Ltd, which is weighted at 10.32%. Vale, which supplies nickel to Tesla, Inc (NASDAQ:TSLA) and General Motors Company (NYSE:GM), plans to sell a 10% stake in its base metals business. On July 20, RBC Capital analyst Tyler Broda reiterated an Outperform rating on Vale and maintained a price target of $15 after increasing the price target from $13 in June. Want direct analysis? Find me in the BZ Pro lounge! Click here for a free trial. The NIKL Chart: NIKL was dropping about 1.4% on Thursday, continuing in a downtrend that began after the ETF reached an all-time high of $23.19 on July 13. Within its downtrend, NIKL has made a series of lower highs and lower lows, with the most recent lower high formed on Wednesday at $21.91 and the most recent confirmed lower low printed at the $21.67 mark on Monday. On Thursday, NIKL gapped down to open the trading session and was continuing to fall intraday, causing the ETF to print a bearish kicker candlestick. The candlestick suggests lower prices could come again on Friday. If NIKL continues to fall, the ETF is likely to find support at the 50-day simple moving average. The area is difficult for a stock to break through on the first attempt and may provide the support needed to cause a bounce. The recent downturn has been taking place on lower-than-average volume, which indicates consolidation rather than fear selling. This also suggests a rebound is likely on the horizon. NIKL has resistance above at $21.86 and at $22.53 and support below at $21.32 and at $20.80. Read More: 'Copper Will See It's Value Soar' Says Expert: Mining M&A Season Heats Up With All Eyes On EV Metals
+      ----------------------------------------------------------------------
+      [EXTRACTED TRIPLES]
+      #1 Vale —SUPPLIES_TO→ Tesla  (conf=0.80)
+         Reasoning: Vale supplies nickel to Tesla.
+
+    [2e470449] v=v5.2 ticker=TSLA triples=1
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - Cybertruck, Tesla's 'Home Run?' Analyst Sees EV Pickup As 'Rolling Billboard' That Will 'Really Catapult' Stock
+
+        ARTICLES:
+        Tesla, Inc.'s (NASDAQ:TSLA) Cybertruck launch is generating a storm of excitement on social media, and one bullish investor is adding to the fervor. What Happened: Gary Black from Future Fund recently reiterated his positive stance on the electrified pickup truck, calling it “big, bold, and gorgeous” during a CNBC interview. With a staggering 1.9 million pre-orders, Black believes the Cybertruck, priced below $50,000, will become a “rolling billboard,” captivating onlookers and driving even more orders for other Tesla models. “And people going to see it, they’ll be like, wow!” he said, adding that people will go to the website and order a Model 3 or Model Y or Model S or even a Cybertruck. He predicts the Cybertruck won’t cannibalize existing products as it targets pickup truck enthusiasts in their 40s and 50s. “So it’s going to be a home run for Tesla and it’s going to really catapult the stock,” he said. See Also: Best Electric Vehicle Stocks Cybertruck's Positioning: The Cybertruck’s impressive specs add to its appeal, Black said, adding that it boasts incredible power, going from 0 to 60 mph in just 2.5 seconds and matching an F-150 pickup truck’s towing capacity. “I’m a big guy, I’m 6′ 2″ you know, and I stand next to it, and the thing just dwarfs me. It’s huge but it’s beautiful when you look at it,” he said. “There is nothing else on the market like it.” With a range of 300 to 500 miles, depending on the trim, the vehicle’s massive battery offers exceptional value for pickup truck owners. CT Potential: Black envisions the Cybertruck’s success not only in the U.S. but also in Europe and Asia, creating a halo effect for Tesla’s entire lineup, much like the Model Y launch did in 2020. Its launch, according to Black, will have the same effect as the Model Y launch, which in 2020 pushed up volume growth from 36% in 2020 to 87% in 2021 and the stock seven-fold. Tesla ended Wednesday’s session down 0.35% at $264.35, according to Benzinga Pro data. Check out more of Benzinga’s Future Of Mobility coverage by following this link. Read Next: Tesla Drives Past Toyota To Take Lead In California’s Auto Market Race Photo via Shutterstock
+      ----------------------------------------------------------------------
+      [EXTRACTED TRIPLES]
+      #1 Gary Black —SIGNALS→ Cybertruck catapult stock  (conf=0.75)
+         Reasoning: Analyst predicts Cybertruck will drive orders for other Tesla models.
+
+    [354860c5] v=v5.2 ticker=TSLA triples=1
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - 'Tesla partner Panasonic weighs supplying EV batteries to Subaru' -Nikkei Asia
+      ----------------------------------------------------------------------
+      [EXTRACTED TRIPLES]
+      #1 Panasonic —SIGNALS→ supplying EV batteries to Subaru  (conf=0.65)
+         Reasoning: Tesla partner Panasonic weighs supplying EV batteries to Subaru.
+
+    [35bbb153] v=v5.2 ticker=TSLA triples=0
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - Tesla Created Secret Team To Suppress Thousands Of Driving Range Complaints
+      ----------------------------------------------------------------------
+      [NO TRIPLES EXTRACTED]
+
+    [75130e2d] v=v5.2 ticker=TSLA triples=1
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - What's Going On With Tesla Stock Today?
+
+        ARTICLES:
+        Tesla, Inc. (NASDAQ:TSLA) shares are moving on Thursday. Tesla filed a U.S. Patent application for neural networks for embedded devices and will be opening a new showroom in Connecticut this fall. What To Know: A new Tesla electric vehicle sales and delivery center will open this fall at The Shops at Mohegan Sun in Connecticut. The showroom and sales center will be located on Mohegan tribal land, skirting a law which bans direct-to-consumer automobile sales in the state of Connecticut. TSLA shares are up more than 65% over the past year amid excitement in the electric vehicle industry. Over the last three months, shares of Xpeng, Inc. (NYSE:XPEV) are up over 125% and shares of Nio, Inc. (NYSE:NIO) are up over 70%. Related News: XPeng, Volkswagen EV Collaboration: What's Going On? TSLA Price Action: According to Benzinga Pro, TSLA shares are trading 0.73% higher at $266.27 at the time of publication. Image: valentin_b90 from Pixabay
+      ----------------------------------------------------------------------
+      [EXTRACTED TRIPLES]
+      #1 Tesla —ANNOUNCES→ TSLA shares +0.73%  (conf=0.95)
+         Reasoning: TSLA shares are moving on Thursday, up 0.73%.
+
+    [90a6409c] v=v5.2 ticker=TSLA triples=0
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - Tesla Showroom To Come Up On Tribal Land In Connecticut To Skirt State Ban On Direct Sales
+
+        ARTICLES:
+        A new Tesla Inc (NASDAQ:TSLA) showroom will come up this fall in Connecticut despite the state’s ban on direct sales. That’s because the EV maker will use a loophole that exists on tribal land. What Happened: The sales and delivery center will be located at The Shops at Mohegan Sun which offers nearly 40 shops and boutiques in a two-story atrium spanning 130,000 square feet. The showroom will be on the sovereign tribal land of the Mohegan tribe across from Todd English's Tuscany restaurant and will enable interested buyers to take home the model Y,3, or S. Vehicle deliveries will take place at Sky Tower valet with test drives made possible around the resort, Mohegan Sun said in a statement. We're amping up our game! ⚡🔌🚗 This fall, Mohegan Sun will be opening a state-of-the-art @Tesla Electric Vehicle (EV) Showroom! The unique Tesla Sales & Delivery Center will be located in The Shops at Mohegan Sun. For more information, visit https://t.co/i2nwWXSFSt pic.twitter.com/Z5UtDatLsq— Mohegan Sun ☀️ (@MoheganSun) July 26, 2023 President & General Manager of Mohegan Sun Jeff Hamilton expressed excitement about the new showroom and said, "This endeavor with Tesla marks an electrifying milestone in Mohegan Sun's commitment to fostering impactful relationships, promoting environmental sustainability and offering cutting-edge experiences for our millions of annual guests, each of which are core goals of Mohegan Sun and the Mohegan Tribe." Why It Matters: The new showroom could be deemed a walk-around of the Connecticut state law against direct sales. Tesla, however, relies on a direct sales model, unlike most other automakers that rely on franchised dealerships. Tesla has been trying to get direct-to-customer auto sales legalized in Connecticut to no positive end owing to staunch opposition from car dealers to the “Tesla bill.” Connecticut is not the only one. Other states with a ban on direct sales include Louisiana and Texas, among others. Tesla used a similar strategy of setting up on land owned by Native American tribes to open in New York last month and before in New Mexico. Check out more of Benzinga’s Future Of Mobility coverage by following this link. Read Next: ‘Mind-Blowing,’ Says Elon Musk After Testing Tesla FSD V12 Alpha Build
+      ----------------------------------------------------------------------
+      [NO TRIPLES EXTRACTED]
+
+    [9d0d4f07] v=v5.2 ticker=TSLA triples=1
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - Elon Musk's Tesla Cybertruck Spotted Testing On Californian Streets With Calibration Equipment
+
+        ARTICLES:
+        The much-anticipated Tesla Cybertruck, introduced recently by CEO Elon Musk, has been spotted again, this time with calibration equipment attached, Teslarati reports. Calibration in Progress: The sighting of the Cybertruck, with its distinctive angular design, has sparked speculation about the development progress. See Also: Why Tesla’s Cybertruck Can Become A $30 Billion Business Overnight, According To One Tech Chronicler Tesla has previously used this type of calibration testing to check how well their other car models work. Before they began delivering the Model Y in early 2020, they tested cars equipped with calibration tools on California highways. This helped Tesla gather important information on things such as how well the car’s frame performs and how the wheels interact with the road. NEW: @Tesla Testing and Calibration Cybertruck in Cali.📹 by TikTok u/orangespicelvr@elonmusk pic.twitter.com/1zymagYZGa— S.E. Robinson, Jr. (@SERobinsonJr) July 25, 2023 Anticipation Builds: The Cybertruck, announced by Tesla Inc. (NASDAQ:TSLA) in 2019, has been the subject of intense interest and speculation. The latest sighting comes at a time of increased scrutiny of safety standards maintained by Tesla vehicles. Read Next: Cathie Wood’s China Breakup: Why Ark’s Flagship ETF Exited From Alibaba And Other Stocks Image By Mike Mareen On Shutterstock Engineered by Benzinga Neuro, Edited by Pooja Rajkumari The GPT-4 Benzinga Neuro content generation system exploits the extensive Benzinga Ecosystem, including native data, APIs, and more to create comprehensive and timely stories for you. Learn more.
+      ----------------------------------------------------------------------
+      [EXTRACTED TRIPLES]
+      #1 Tesla —ANNOUNCES→ Cybertruck calibration  (conf=0.80)
+         Reasoning: Cybertruck calibration suggests progress towards production, positive signal.
+
+    [d2d0f471] v=v5.2 ticker=TSLA triples=1
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - 'Mind-Blowing,' Says Elon Musk After Testing Tesla FSD V12 Alpha Build
+
+        ARTICLES:
+        EV giant Tesla Inc (NASDAQ:TSLA) seemingly has an alpha build of Full Self-Driving (FSD) version 12 ready under wraps and undergoing testing. What Happened: “I tested the version 12 alpha build today,” CEO Elon Musk wrote. “It is mind-blowing.” The CEO was responding to an X.com user who shared their feedback on FSD Beta. “Wow. FSD Beta is getting freakishly good,” the user wrote. I tested the version 12 alpha build today. It is mind-blowing.— Elon Musk (@elonmusk) July 27, 2023 Last month, Musk said that version 12 would no longer be beta, hinting that it would achieve full autonomy by then. Currently, FSD is in beta mode meaning it is still being tested and requires active driver supervision. Musk has previously also said that v12 is reserved for when FSD is end-to-end AI. Why It Matters: Earlier this month, Musk said at the 2023 World Artificial Intelligence Conference that Tesla is “very close” to achieving full self-driving capability. "I have been wrong about this prediction in the past, but I feel we are closer to it than we ever have been," Musk said. Check out more of Benzinga’s Future Of Mobility coverage by following this link. Read More: European Automakers Forge Power-Packed Partnerships In China To Conquer Booming EV Market (Created with artificial intelligence on MidJourney and Jonathan Weiss on Shutterstock)
+      ----------------------------------------------------------------------
+      [EXTRACTED TRIPLES]
+      #1 Elon Musk —SIGNALS→ FSD V12 alpha mind-blowing  (conf=0.90)
+         Reasoning: Musk's positive feedback on FSD V12 alpha build signals progress.
+
+    [d5aaa74b] v=v5.2 ticker=TSLA triples=0
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - 10 Consumer Discretionary Stocks Whale Activity In Today's Session
+
+        ARTICLES:
+        This whale alert can help traders discover the next big trading opportunities. Whales are entities with large sums of money and we track their transactions here at Benzinga on our options activity scanner. Traders often look for circumstances when the market estimation of an option diverges away from its normal worth. Abnormal amounts of trading activity could push option prices to hyperbolic or underperforming levels. Below are some instances of options activity happening in the Consumer Discretionary sector: Symbol PUT/CALL Trade Type Sentiment Exp. Date Strike Price Total Trade Price Open Interest Volume TSLA CALL SWEEP BEARISH 07/28/23 $270.00 $31.2K 26.1K 129.6K RIVN CALL TRADE NEUTRAL 08/18/23 $30.00 $54.4K 32.6K 5.5K FTCH PUT TRADE BULLISH 01/19/24 $4.00 $185.0K 15.0K 5.0K NKE CALL SWEEP BULLISH 01/19/24 $120.00 $27.7K 5.4K 1.4K NCLH CALL SWEEP NEUTRAL 08/04/23 $20.00 $42.0K 521 423 DHI PUT SWEEP BEARISH 08/04/23 $126.00 $34.3K 26 286 FND PUT SWEEP BEARISH 08/18/23 $110.00 $64.0K 179 220 PHM PUT SWEEP BEARISH 08/18/23 $85.00 $29.4K 61 138 CMG PUT SWEEP BULLISH 08/04/23 $1925.00 $25.4K 12 40 HELE PUT SWEEP BULLISH 07/28/23 $139.00 $26.1K 272 11 Explanation These bullet-by-bullet explanations have been constructed using the accompanying table. • For TSLA (NASDAQ:TSLA), we notice a call option sweep that happens to be bearish, expiring in 1 day(s) on July 28, 2023. This event was a transfer of 429 contract(s) at a $270.00 strike. This particular call needed to be split into 10 different trades to become filled. The total cost received by the writing party (or parties) was $31.2K, with a price of $72.0 per contract. There were 26157 open contracts at this strike prior to today, and today 129679 contract(s) were bought and sold. • Regarding RIVN (NASDAQ:RIVN), we observe a call option trade with neutral sentiment. It expires in 22 day(s) on August 18, 2023. Parties traded 400 contract(s) at a $30.00 strike. The total cost received by the writing party (or parties) was $54.4K, with a price of $136.0 per contract. There were 32692 open contracts at this strike prior to today, and today 5540 contract(s) were bought and sold. • Regarding FTCH (NYSE:FTCH), we observe a put option trade with bullish sentiment. It expires in 176 day(s) on January 19, 2024. Parties traded 5000 contract(s) at a $4.00 strike. The total cost received by the writing party (or parties) was $185.0K, with a price of $37.0 per contract. There were 15006 open contracts at this strike prior to today, and today 5000 contract(s) were bought and sold. • For NKE (NYSE:NKE), we notice a call option sweep that happens to be bullish, expiring in 176 day(s) on January 19, 2024. This event was a transfer of 63 contract(s) at a $120.00 strike. This particular call needed to be split into 5 different trades to become filled. The total cost received by the writing party (or parties) was $27.7K, with a price of $440.0 per contract. There were 5433 open contracts at this strike prior to today, and today 1465 contract(s) were bought and sold. • Regarding NCLH (NYSE:NCLH), we observe a call option sweep with neutral sentiment. It expires in 8 day(s) on August 4, 2023. Parties traded 200 contract(s) at a $20.00 strike. This particular call needed to be split into 7 different trades to become filled. The total cost received by the writing party (or parties) was $42.0K, with a price of $210.0 per contract. There were 521 open contracts at this strike prior to today, and today 423 contract(s) were bought and sold. • Regarding DHI (NYSE:DHI), we observe a put option sweep with bearish sentiment. It expires in 8 day(s) on August 4, 2023. Parties traded 286 contract(s) at a $126.00 strike. This particular put needed to be split into 36 different trades to become filled. The total cost received by the writing party (or parties) was $34.3K, with a price of $120.0 per contract. There were 26 open contracts at this strike prior to today, and today 286 contract(s) were bought and sold. • Regarding FND (NYSE:FND), we observe a put option sweep with bearish sentiment. It expires in 22 day(s) on August 18, 2023. Parties traded 200 contract(s) at a $110.00 strike. This particular put needed to be split into 37 different trades to become filled. The total cost received by the writing party (or parties) was $64.0K, with a price of $320.0 per contract. There were 179 open contracts at this strike prior to today, and today 220 contract(s) were bought and sold. • For PHM (NYSE:PHM), we notice a put option sweep that happens to be bearish, expiring in 22 day(s) on August 18, 2023. This event was a transfer of 137 contract(s) at a $85.00 strike. This particular put needed to be split into 18 different trades to become filled. The total cost received by the writing party (or parties) was $29.4K, with a price of $215.0 per contract. There were 61 open contracts at this strike prior to today, and today 138 contract(s) were bought and sold. • Regarding CMG (NYSE:CMG), we observe a put option sweep with bullish sentiment. It expires in 8 day(s) on August 4, 2023. Parties traded 8 contract(s) at a $1925.00 strike. This particular put needed to be split into 4 different trades to become filled. The total cost received by the writing party (or parties) was $25.4K, with a price of $3180.0 per contract. There were 12 open contracts at this strike prior to today, and today 40 contract(s) were bought and sold. • For HELE (NASDAQ:HELE), we notice a put option sweep that happens to be bullish, expiring in 1 day(s) on July 28, 2023. This event was a transfer of 273 contract(s) at a $139.00 strike. This particular put needed to be split into 7 different trades to become filled. The total cost received by the writing party (or parties) was $26.1K, with a price of $100.0 per contract. There were 272 open contracts at this strike prior to today, and today 11 contract(s) were bought and sold. Options Alert Terminology - Call Contracts: The right to buy shares as indicated in the contract. - Put Contracts: The right to sell shares as indicated in the contract. - Expiration Date: When the contract expires. One must act on the contract by this date if one wants to use it. - Premium/Option Price: The price of the contract. For more information, visit our Guide to Understanding Options Alerts or read more news on unusual options activity. This article was generated by Benzinga's automated content engine and reviewed by an editor.
+      ----------------------------------------------------------------------
+      [NO TRIPLES EXTRACTED]
+
+    [e0aa98f2] v=v5.2 ticker=TSLA triples=7
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - Tesla Competitors Make Move: BMW, GM, Honda, And More Join Forces To Challenge Elon Musk's EV Charger Dominance
+
+        ARTICLES:
+        Seven automakers now seek to develop a new charging network joint venture in a bid to develop charging infrastructure across the country and compete with EV giant Tesla’s supercharger network. What Happened: The seven automakers include BMW Group (OTCPK: BMWYY), General Motors (NYSE:GM), Honda (NYSE:HMC), Hyundai (OTCPK: HYMTF), Kia, Mercedes-Benz Group (OTCPK: MBGYY), and Stellantis NV (NYSE:STLA). Together, they seek to install at least 30,000 high-powered charge points in urban and highway locations which offer both Combined Charging System (CCS) and Tesla’s North American Charging Standard (NACS) connectors. They hope to power the network solely using renewable energy. “With U.S. electric vehicle sales expected to exceed 50% of total U.S. sales by 2030, the expansion of reliable charging infrastructure will become even more critical to widespread electric vehicle adoption,” the companies said in a joint statement. Of the seven players expected to be part of the venture, General Motors and Mercedes Benz have already decided to adopt Tesla’s North American charging plug standard to give their customers access to Tesla’s network which has almost 18,000 superchargers. The Expected Timeline: While the joint venture is expected to be established this year given regulatory approvals, the first stations are expected to open in the summer of 2024 in the United States and later in Canada. “We believe that a charging network at scale is vital to protecting freedom of mobility for all, especially as we work to achieve our ambitious carbon neutrality plan. A strong charging network should be available for all – under the same conditions – and be built together with a win-win spirit,” Stellantis CEO Carlos Tavares said. Check out more of Benzinga's Future Of Mobility coverage by following this link. Read More: Waymo To Laser Focus On Ride-Hailing, Halt Alternate Development Plans
+      ----------------------------------------------------------------------
+      [EXTRACTED TRIPLES]
+      #1 BMW Group —COMPETES_WITH→ Tesla  (conf=0.85)
+         Reasoning: Automakers join forces to challenge Tesla's charging network dominance.
+      #2 General Motors —COMPETES_WITH→ Tesla  (conf=0.85)
+         Reasoning: Automakers join forces to challenge Tesla's charging network dominance.
+      #3 Honda —COMPETES_WITH→ Tesla  (conf=0.85)
+         Reasoning: Automakers join forces to challenge Tesla's charging network dominance.
+      #4 Hyundai —COMPETES_WITH→ Tesla  (conf=0.85)
+         Reasoning: Automakers join forces to challenge Tesla's charging network dominance.
+      #5 Kia —COMPETES_WITH→ Tesla  (conf=0.85)
+         Reasoning: Automakers join forces to challenge Tesla's charging network dominance.
+      #6 Mercedes-Benz Group —COMPETES_WITH→ Tesla  (conf=0.85)
+         Reasoning: Automakers join forces to challenge Tesla's charging network dominance.
+      #7 Stellantis NV —COMPETES_WITH→ Tesla  (conf=0.85)
+         Reasoning: Automakers join forces to challenge Tesla's charging network dominance.
+
+    [ee0dafd5] v=v5.2 ticker=TSLA triples=0
+
+      [ORIGINAL CONTENT]
+      ----------------------------------------------------------------------
+        HEADLINES:
+        - Tesla Filed U.S. Patent Application #20230237331: NEURAL NETWORKS FOR EMBEDDED DEVICES
+      ----------------------------------------------------------------------
+      [NO TRIPLES EXTRACTED]
+
+
+══════════════════════════════════════════════════════════════════════
+  SUMMARY
+══════════════════════════════════════════════════════════════════════
+  ✅ PASS  Cache Integrity
+  ✅ PASS  article_index Stripped
+  ✅ PASS  Quality (A+B=73%)
+  ⚠️ WARNING (>30% empty articles)  Multi-Call Consistency
+
+  ⚠️ SOME CHECKS NEED REVIEW
+══════════════════════════════════════════════════════════════════════

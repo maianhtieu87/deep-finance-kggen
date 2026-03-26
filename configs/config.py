@@ -67,6 +67,7 @@ class GlobalConfig:
     KG_NORMALIZE_SUBJECT      = True
     KG_MAX_PER_ANALYST_FIRM   = 1
     KG_MAX_PER_ANALYST_RATING = 1
+    KG_MAX_ARTICLES_PER_CALL  = 10    # max articles concat per LLM call (cost optimization)
 
     # ── V5.2: Async retry config (tránh mất data khi 429) ────────────────
     KG_ASYNC_MAX_RETRIES   = 3
@@ -79,7 +80,7 @@ class GlobalConfig:
     KG_BATCH_MAX_WAIT      = 86400  # 24h max wait per batch job
 
     # ── Voyage embedding ──────────────────────────────────────────────────
-    EMBED_MODEL       = "voyage-3-large"
+    EMBED_MODEL       = "voyage-finance-2"
     MAX_RETRIES       = 6
     BACKOFF_BASE      = 30
     MAX_TEXTS_PER_REQ = 40
@@ -215,7 +216,7 @@ if __name__ == "__main__":
     print("=== Configuration V5.2 ===")
     print(f"Tickers  : {GlobalConfig.TICKERS}")
     print(f"Date     : {GlobalConfig.START_DATE} -> {GlobalConfig.END_DATE}")
-    print(f"News dim : {TrainConfig.news_embed_dim} (Voyage-3-large)")
+    print(f"News dim : {TrainConfig.news_embed_dim} (Voyage-finance-2)")
     print(f"use_gnn  : {TrainConfig.use_gnn}")
     print(f"KG thresholds: rel>={GlobalConfig.KG_MIN_RELEVANCE}  conf>={GlobalConfig.KG_MIN_CONFIDENCE}")
     print(f"Article  : max_chars={GlobalConfig.KG_MAX_ARTICLE_CHARS}  chunking={GlobalConfig.KG_ENABLE_CHUNKING}")

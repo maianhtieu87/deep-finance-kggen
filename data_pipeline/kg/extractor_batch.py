@@ -57,9 +57,10 @@ RESPONSE_SCHEMA = {
             "confidence": {"type": "NUMBER"},
             "price_impact_score": {"type": "NUMBER"},
             "relevance_to_ticker": {"type": "NUMBER"},
+            "article_index": {"type": "INTEGER"},
             "reasoning": {"type": "STRING"},
         },
-        "required": ["subject", "relation", "object", "confidence", "price_impact_score", "relevance_to_ticker"],
+        "required": ["subject", "relation", "object", "confidence", "price_impact_score", "relevance_to_ticker", "article_index"],
     },
 }
 
@@ -67,7 +68,7 @@ _GEN_CONFIG_DICT = {
     "response_mime_type": "application/json",
     "response_schema": RESPONSE_SCHEMA,
     "temperature": 0.1,
-    "max_output_tokens": 2048,
+    "max_output_tokens": 8192,
 }
 
 def _norm(s): return re.sub(r"\s+", " ", (s or "")).strip()
@@ -174,6 +175,44 @@ def build_user_prompt(text, ticker, news_date, sector=None):
         def __missing__(self, key): return ""
     user_part = FINDKG_LITE_USER_PROMPT.format_map(_SafeDict(ticker=ticker, news_date=news_date, news_text=text, sector=""))
     return f"EXAMPLES (study these carefully):\n\n{_FEW_SHOT_STR}\n\n{'='*60}\n\nNOW EXTRACT FROM THIS NEW ARTICLE:\n\n{user_part}"
+
+
+def build_multi_article_prompt(articles_with_index: List[Tuple[int, str]], ticker: str, news_date: str) -> str:
+    """
+    Build prompt for multi-article extraction (up to KG_MAX_ARTICLES_PER_CALL articles).
+
+    articles_with_index: [(0, "HEADLINES:\n...\nARTICLES:\n..."), (1, "..."), ...]
+
+    Reuses FINDKG_LITE_USER_PROMPT template with combined article text.
+    Appends multi-article instruction for article_index attribution.
+    """
+    # Build combined text with article markers
+    blocks = []
+    for idx, text in articles_with_index:
+        blocks.append(f"[ARTICLE {idx}]\n{text}")
+    combined = "\n\n---\n\n".join(blocks)
+
+    class _SafeDict(dict):
+        def __missing__(self, key): return ""
+
+    user_part = FINDKG_LITE_USER_PROMPT.format_map(_SafeDict(
+        ticker=ticker, news_date=news_date, news_text=combined, sector=""))
+
+    # Append article_index attribution instruction
+    user_part += (
+        "\n\n━━━ MULTI-ARTICLE NOTE ━━━\n"
+        "The text above contains MULTIPLE articles marked [ARTICLE 0], [ARTICLE 1], etc.\n"
+        "For EACH triple, set \"article_index\" to the article number it primarily comes from.\n"
+        "Apply extraction rules to EACH article independently.\n"
+        "If an article is TYPE D with no financial content, extract 0 triples from it."
+    )
+
+    return (
+        f"EXAMPLES (study these carefully):\n\n{_FEW_SHOT_STR}\n\n"
+        f"{'='*60}\n\n"
+        f"NOW EXTRACT FROM THESE {len(articles_with_index)} ARTICLES (same ticker, same date):\n\n"
+        f"{user_part}"
+    )
 
 def _filter_and_clamp(raw, min_relevance, min_confidence):
     if not isinstance(raw, list): return []
@@ -530,11 +569,17 @@ class AsyncConcurrentExtractor:
             system_instruction=FINDKG_LITE_SYSTEM_PROMPT,
             response_mime_type="application/json",
             response_schema=RESPONSE_SCHEMA,
-            temperature=temperature, max_output_tokens=2048)
+            temperature=temperature, max_output_tokens=8192)
 
     async def _extract_one_async(self, idx, article, semaphore):
         """
-        Extract triples from one article with retry on 429.
+        Extract triples from one or multiple articles with retry on 429.
+
+        Supports two modes:
+          - Single article: article has "text", "ticker", "date"
+            → build_user_prompt() wraps with few-shot
+          - Multi-article: article has "_raw_prompt" (pre-built by build_multi_article_prompt)
+            → use prompt directly, skip build_user_prompt()
 
         Retry logic:
           - Max retries from GlobalConfig.KG_ASYNC_MAX_RETRIES (default 3)
@@ -547,8 +592,12 @@ class AsyncConcurrentExtractor:
         request_delay = getattr(GlobalConfig, 'KG_ASYNC_REQUEST_DELAY', 1.0)
 
         async with semaphore:
-            prompt = build_user_prompt(
-                article.get("text",""), article.get("ticker","UNKNOWN"), article.get("date",""))
+            # Multi-article: use pre-built prompt; Single-article: build from template
+            if article.get("_raw_prompt"):
+                prompt = article["_raw_prompt"]
+            else:
+                prompt = build_user_prompt(
+                    article.get("text",""), article.get("ticker","UNKNOWN"), article.get("date",""))
 
             last_err = None
             for attempt in range(max_retries + 1):  # 0, 1, 2, 3 = 4 total tries
