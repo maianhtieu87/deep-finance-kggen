@@ -83,6 +83,20 @@ def run_pipeline():
 
     if "headline" in processed_news.columns and "title" not in processed_news.columns:
         processed_news = processed_news.rename(columns={"headline": "title"})
+
+    if "date" not in processed_news.columns and processed_news.index.name and "date" in processed_news.index.name.lower():
+        processed_news = processed_news.reset_index()
+
+    if "date" not in processed_news.columns:
+        DATE_CANDS = ["created_at", "createdAt", "published_at", "publishedAt",
+                      "publish_date", "pub_date", "Date", "DATE", "timestamp", "time", "news_date"]
+        date_col = next((c for c in DATE_CANDS if c in processed_news.columns), None)
+        if date_col:
+            processed_news = processed_news.rename(columns={date_col: "date"})
+        else:
+            print("🚨 Các cột hiện có trong processed_news:", processed_news.columns.tolist())
+            raise KeyError("Không tìm thấy cột chứa ngày tháng trong data news!")
+  
     if not pd.api.types.is_datetime64_any_dtype(processed_news["date"]):
         processed_news["date"] = pd.to_datetime(processed_news["date"]).dt.date
 

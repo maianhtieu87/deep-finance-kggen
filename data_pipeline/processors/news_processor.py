@@ -132,8 +132,14 @@ class NewsProcessor:
             raise TypeError(f"Expected DataFrame or path, got {type(news_input)}")
 
         # Column normalisation
-        if "equity" not in df.columns and "ticker" in df.columns:
-            df = df.rename(columns={"ticker": "equity"})
+        #if "equity" not in df.columns and "ticker" in df.columns:
+            #df = df.rename(columns={"ticker": "equity"})
+            
+        if "equity" not in df.columns:
+            if "symbols" in df.columns:
+                df = df.rename(columns={"symbols": "equity"})
+            elif "ticker" in df.columns:
+                df = df.rename(columns={"ticker": "equity"})    
         if "title" not in df.columns and "headline" in df.columns:
             df = df.rename(columns={"headline": "title"})
         if "content" not in df.columns:
