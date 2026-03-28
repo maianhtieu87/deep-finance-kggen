@@ -1,39 +1,49 @@
-# embed_news.py
+#!/usr/bin/env python3
+# embed_news_full.py — V7 (Unified: SHA1 + Meta-based cache reading)
 """
-Stage A.5 — News Embedding
+Stage A.5 — News Embedding (UNIFIED VERSION)
 
-V5 change vs V3.4:
-  - TICKER_NAME_MAP imported from configs.ticker_aliases (Single Source of Truth)
-  - Removed hardcoded TICKER_NAME_MAP duplicate
+V7 changes vs V6 (embed_news_batch.py):
+  Hỗ trợ CẢ HAI loại cache:
 
-V3.4 (carried over):
-  1. Rolling window REMOVED — each day embedded independently.
-  2. triples_to_text: impact/conf/rel metadata REMOVED from text.
-  3. Cross-ticker: mention-only filter replaces rescore_for_ticker.
+  1. New-format cache (V5.2+, extract_corpus.py V5.2+):
+     File có _meta field → {"triples": [...], "_meta": {"date": ..., "primary_ticker": ...}, "_v": "v5.2"}
+     → Đọc bằng preload_cache_directory() (fast, 1 scan/lần)
+     → Hỗ trợ multi-article concat files (extract V5.3)
 
-Luồng:
-  extract_corpus.py  →  embed_news.py  →  main_test.py  →  main.py
+  2. Old-format cache (trước V5.2):
+     File chỉ có {"triples": [...]} không có _meta
+     → Đọc bằng SHA1-based fallback (tính SHA1 từ title+content trong DataFrame)
+     → Tương thích hoàn toàn với embed_news.py V5
 
-Output: data/interim/kg_embeddings/news_embeddings.json
-Format: {"YYYY-MM-DD": {"TSLA": [1024D vector], "AAPL": [...]}}
+  Quy tắc ưu tiên:
+    - Mỗi (date, ticker): thử meta-based trước
+    - Nếu trống → fallback SHA1-based
+    - Kết quả merge và dedup
+
+  Output: {"YYYY-MM-DD": {"TICKER": [1024D vector]}}
+  Format giống hệt V5 và V6 — backward compatible.
 
 Usage:
-    python embed_news.py
-    python embed_news.py --ticker TSLA
-    python embed_news.py --date 2022-06
+    python embed_news.py                         # toàn bộ
+    python embed_news.py --ticker TSLA           # 1 ticker
+    python embed_news.py --ticker TSLA --date 2022
+    python embed_news.py --ticker TSLA --force-sha1  # chỉ dùng SHA1 (debug)
+    python embed_news.py --ticker TSLA --force-meta  # chỉ dùng _meta (debug)
+    python embed_news.py --check-cache           # kiểm tra cache stats (không embed)
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import sys
 import time
-import hashlib
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 import requests
@@ -51,7 +61,7 @@ from configs.ticker_aliases import TICKER_NAME_MAP
 # ─────────────────────────────────────────────────────────────────────────────
 
 class VoyageEmbedder:
-    """Simple rate-limited Voyage embedder with disk cache."""
+    """Rate-limited Voyage embedder với disk cache (SHA1-keyed)."""
 
     def __init__(self, cache_dir: str):
         self.api_key = os.getenv("VOYAGE_API_KEY", GlobalConfig.VOYAGE_API_KEY)
@@ -61,7 +71,7 @@ class VoyageEmbedder:
         self.max_texts    = getattr(GlobalConfig, "MAX_TEXTS_PER_REQ", 40)
         self.max_retries  = getattr(GlobalConfig, "MAX_RETRIES", 6)
         self.backoff_base = getattr(GlobalConfig, "BACKOFF_BASE", 30)
-        payment_added = bool(getattr(GlobalConfig, "PAYMENT_ADDED", True))
+        payment_added     = bool(getattr(GlobalConfig, "PAYMENT_ADDED", True))
         rl = GlobalConfig.VOYAGE_RATE_LIMITS[payment_added]
         self.base_sleep = float(rl.get("SLEEP", 1.0))
         self.rpm        = int(rl.get("RPM", 50))
@@ -77,14 +87,15 @@ class VoyageEmbedder:
 
     def _load(self, text: str) -> Optional[List[float]]:
         p = self._cache_path(text)
-        if os.path.exists(p):
-            try:
-                with open(p) as f:
-                    emb = json.load(f).get("embedding")
-                if isinstance(emb, list) and len(emb) > 0:
-                    return emb
-            except Exception:
-                pass
+        if not os.path.exists(p):
+            return None
+        try:
+            with open(p) as f:
+                emb = json.load(f).get("embedding")
+            if isinstance(emb, list) and len(emb) > 0:
+                return emb
+        except Exception:
+            pass
         return None
 
     def _save(self, text: str, emb: List[float]):
@@ -100,13 +111,19 @@ class VoyageEmbedder:
             time.sleep(wait)
 
     def embed_texts(self, texts: List[str]) -> List[List[float]]:
-        out, miss_i, miss_t = [None] * len(texts), [], []
+        out: List[Optional[List[float]]] = [None] * len(texts)
+        miss_i, miss_t = [], []
         for i, t in enumerate(texts):
             t = (t or "").strip()
-            if not t: out[i] = [0.0] * 1024; continue
+            if not t:
+                out[i] = [0.0] * 1024
+                continue
             cached = self._load(t)
-            if cached is not None: out[i] = cached
-            else: miss_i.append(i); miss_t.append(t)
+            if cached is not None:
+                out[i] = cached
+            else:
+                miss_i.append(i)
+                miss_t.append(t)
 
         if not miss_t:
             return [o if o is not None else [0.0] * 1024 for o in out]
@@ -114,36 +131,38 @@ class VoyageEmbedder:
         url     = "https://api.voyageai.com/v1/embeddings"
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
 
-        def chunks(lst, n):
-            for i in range(0, len(lst), n): yield lst[i: i + n]
+        def _chunks(lst, n):
+            for i in range(0, len(lst), n):
+                yield lst[i: i + n]
 
         pos = 0
-        for batch_texts in chunks(miss_t, self.max_texts):
+        for batch_texts in _chunks(miss_t, self.max_texts):
             batch_idx = miss_i[pos: pos + len(batch_texts)]
             pos += len(batch_texts)
             payload = {"model": self.model, "input": batch_texts}
             for attempt in range(self.max_retries):
                 try:
                     self._rpm_guard()
-                    if self.base_sleep > 0: time.sleep(self.base_sleep)
+                    if self.base_sleep > 0:
+                        time.sleep(self.base_sleep)
                     r = requests.post(url, headers=headers, json=payload, timeout=(15, 120))
                     self._req_times.append(time.time())
                     if r.status_code == 429:
                         wait = self.backoff_base * (2 ** attempt) + 2.0
                         print(f"  429 rate limit — sleep {wait:.0f}s")
-                        time.sleep(wait); continue
+                        time.sleep(wait)
+                        continue
                     r.raise_for_status()
-                    embs = r.json().get("data", [])
-                    for bi, item in enumerate(embs):
+                    for bi, item in enumerate(r.json().get("data", [])):
                         emb = item.get("embedding", [])
-                        idx = batch_idx[bi]
-                        out[idx] = emb
+                        out[batch_idx[bi]] = emb
                         self._save(batch_texts[bi], emb)
                     break
                 except Exception as e:
                     if attempt == self.max_retries - 1:
                         print(f"  Voyage failed: {e}")
-                        for idx in batch_idx: out[idx] = [0.0] * 1024
+                        for idx in batch_idx:
+                            out[idx] = [0.0] * 1024
                     else:
                         time.sleep(self.backoff_base * (2 ** attempt))
 
@@ -154,11 +173,11 @@ class VoyageEmbedder:
 # UTILS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
-
 def _sha1(s: str) -> str:
     return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
 
 def _parse_tickers(val: Any) -> List[str]:
     if isinstance(val, list):
@@ -167,24 +186,13 @@ def _parse_tickers(val: Any) -> List[str]:
         return [t.strip().upper() for t in val.split(",") if t.strip()]
     return []
 
-def _load_article_cache(cache_dir: str, sha1: str) -> Optional[List[Dict]]:
-    p = os.path.join(cache_dir, f"{sha1}.json")
-    if not os.path.exists(p): return None
-    try:
-        with open(p) as f: return json.load(f).get("triples", [])
-    except Exception: return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TICKER HELPERS
-# V5: TICKER_NAME_MAP imported from configs.ticker_aliases (top of file)
-# ─────────────────────────────────────────────────────────────────────────────
-
 TITLE_WEIGHT = 3
 
 def detect_primary_ticker(title: str, content: str, tickers: List[str]) -> str:
-    if not tickers: return ""
-    if len(tickers) == 1: return tickers[0]
+    if not tickers:
+        return ""
+    if len(tickers) == 1:
+        return tickers[0]
     t_up = (title   or "").upper()
     c_up = (content or "").upper()
     counts = {}
@@ -195,35 +203,31 @@ def detect_primary_ticker(title: str, content: str, tickers: List[str]) -> str:
             score += t_up.count(n_up) * TITLE_WEIGHT + c_up.count(n_up)
         counts[t] = score
     best = max(counts.values())
-    if best == 0: return tickers[0]
+    if best == 0:
+        return tickers[0]
     for t in tickers:
-        if counts[t] == best: return t
+        if counts[t] == best:
+            return t
 
 def _ticker_mentioned_in_triple(ticker: str, triple: Dict) -> bool:
-    """True if ticker or any known name appears in subject or object."""
     tl = ticker.lower()
     sn = triple.get("subject", {}).get("name", "").lower()
     on = triple.get("object",  {}).get("name", "").lower()
-    if tl in sn or tl in on: return True
+    if tl in sn or tl in on:
+        return True
     for name in TICKER_NAME_MAP.get(ticker.upper(), []):
-        if name.lower() in sn or name.lower() in on: return True
+        if name.lower() in sn or name.lower() in on:
+            return True
     return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TRIPLE → TEXT CONVERSION  (V3.4: no impact/conf/rel metadata)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def triples_to_text(triples: List[Dict], ticker: str) -> str:
     if not triples:
         return ""
-
     sorted_triples = sorted(
         triples,
         key=lambda t: abs(float(t.get("price_impact_score", 0))),
         reverse=True,
     )
-
     parts = [f"TARGET: {ticker}"]
     for t in sorted_triples:
         subj   = t.get("subject", {}).get("name", "")
@@ -236,67 +240,173 @@ def triples_to_text(triples: List[Dict], ticker: str) -> str:
         if reason:
             line += f". {reason}"
         parts.append(line)
-
     return " | ".join(parts)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# READ CACHE + FILTER PER (ticker, date)
+# CACHE SCANNING & LOADING
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_day_triples(
-    day_df: pd.DataFrame,
-    ticker: str,
-    cache_dir: str,
-    min_relevance: float,
-    min_confidence: float,
-) -> List[Dict]:
-    sha1_to_meta: Dict[str, Dict] = {}
-    sha1_to_raw:  Dict[str, Optional[List]] = {}
+class CacheStore:
+    """
+    Unified cache store: preload và lookup từ CẢ HAI format.
 
-    for _, row in day_df.iterrows():
-        title   = _norm(str(row.get("title",   "") or ""))
-        content = _norm(str(row.get("content", "") or ""))
-        parts = []
-        if title:   parts.append(f"HEADLINES:\n- {title}")
-        if content: parts.append(f"ARTICLES:\n{content}")
-        full_text = "\n\n".join(parts)
-        if not full_text:
-            continue
+    meta_entries: List[Dict]  — files có _meta (new format V5.2+)
+    sha1_no_meta: Set[str]    — SHA1 của files không có _meta (old format)
+    """
 
-        h = _sha1(full_text)
-        if h in sha1_to_raw:
-            continue
+    def __init__(self, cache_dir: str):
+        self.cache_dir    = cache_dir
+        self.meta_entries: List[Dict] = []
+        self.sha1_no_meta: Set[str]  = set()
+        self._loaded = False
 
-        primary = str(row.get("primary_ticker") or ticker)
-        sha1_to_meta[h] = {"primary_ticker": primary}
-        sha1_to_raw[h]  = _load_article_cache(cache_dir, h)
+    def load(self):
+        if self._loaded:
+            return
+        if not os.path.exists(self.cache_dir):
+            self._loaded = True
+            return
 
-    all_triples: List[Dict] = []
-    for h, raw in sha1_to_raw.items():
-        if not raw:
-            continue
-        primary = sha1_to_meta[h]["primary_ticker"]
+        files = [
+            f for f in os.listdir(self.cache_dir)
+            if f.endswith(".json") and not f.startswith("_")
+        ]
+        n_meta, n_no_meta = 0, 0
 
-        if primary.upper() == ticker.upper():
-            filtered = [
-                t for t in raw
-                if float(t.get("confidence", 0)) >= min_confidence
-                and float(t.get("relevance_to_ticker", 0)) >= min_relevance
-            ]
-        else:
-            filtered = [
-                t for t in raw
-                if _ticker_mentioned_in_triple(ticker, t)
-                and float(t.get("confidence", 0)) >= min_confidence
-                and float(t.get("relevance_to_ticker", 0)) >= min_relevance
-            ]
+        for fname in files:
+            path = os.path.join(self.cache_dir, fname)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                continue
 
-        all_triples.extend(filtered)
+            triples = data.get("triples", [])
+            meta    = data.get("_meta", {})
+            date_val  = meta.get("date")
+            primary   = str(meta.get("primary_ticker", "")).upper()
 
-    seen: set = set()
-    deduped: List[Dict] = []
-    for t in all_triples:
+            if date_val and triples:
+                # New format: has _meta with date
+                self.meta_entries.append({
+                    "date":            str(date_val),
+                    "primary_ticker":  primary,
+                    "triples":         triples,
+                })
+                n_meta += 1
+            elif triples:
+                # Old format: has triples but NO _meta
+                # SHA1 is the filename stem (without .json)
+                sha1 = fname[:-5]
+                self.sha1_no_meta.add(sha1)
+                n_no_meta += 1
+            # files with no triples (empty cache) are skipped
+
+        self._loaded = True
+        print(f"  Cache scan: {n_meta} new-format (with _meta), "
+              f"{n_no_meta} old-format (SHA1-only)")
+
+    def get_triples_meta(
+        self,
+        date_str: str,
+        ticker: str,
+        min_relevance: float,
+        min_confidence: float,
+    ) -> List[Dict]:
+        """Lookup via _meta entries (new format). Fast — in-memory."""
+        all_triples: List[Dict] = []
+
+        for entry in self.meta_entries:
+            if entry["date"] != date_str:
+                continue
+            primary = entry["primary_ticker"]
+            raw     = entry["triples"]
+
+            if primary == ticker.upper():
+                filtered = [
+                    t for t in raw
+                    if float(t.get("confidence", 0))          >= min_confidence
+                    and float(t.get("relevance_to_ticker", 0)) >= min_relevance
+                ]
+            else:
+                filtered = [
+                    t for t in raw
+                    if _ticker_mentioned_in_triple(ticker, t)
+                    and float(t.get("confidence", 0))          >= min_confidence
+                    and float(t.get("relevance_to_ticker", 0)) >= min_relevance
+                ]
+            all_triples.extend(filtered)
+
+        return all_triples
+
+    def get_triples_sha1(
+        self,
+        day_df: pd.DataFrame,
+        ticker: str,
+        min_relevance: float,
+        min_confidence: float,
+    ) -> List[Dict]:
+        """
+        Fallback: SHA1-based lookup (old format files, no _meta).
+
+        Tính SHA1 từ title+content trong DataFrame rows,
+        rồi đọc file {sha1}.json nếu nằm trong sha1_no_meta.
+        """
+        if not self.sha1_no_meta:
+            return []
+
+        all_triples: List[Dict] = []
+
+        for _, row in day_df.iterrows():
+            title   = _norm(str(row.get("title",   "") or ""))
+            content = _norm(str(row.get("content", "") or ""))
+            parts   = []
+            if title:
+                parts.append(f"HEADLINES:\n- {title}")
+            if content:
+                parts.append(f"ARTICLES:\n{content}")
+            full_text = "\n\n".join(parts)
+            if not full_text:
+                continue
+
+            h = _sha1(full_text)
+            if h not in self.sha1_no_meta:
+                continue  # file not in old-format set
+
+            path = os.path.join(self.cache_dir, f"{h}.json")
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                raw = data.get("triples", [])
+            except Exception:
+                continue
+
+            primary = str(row.get("primary_ticker") or ticker)
+
+            if primary.upper() == ticker.upper():
+                filtered = [
+                    t for t in raw
+                    if float(t.get("confidence", 0))          >= min_confidence
+                    and float(t.get("relevance_to_ticker", 0)) >= min_relevance
+                ]
+            else:
+                filtered = [
+                    t for t in raw
+                    if _ticker_mentioned_in_triple(ticker, t)
+                    and float(t.get("confidence", 0))          >= min_confidence
+                    and float(t.get("relevance_to_ticker", 0)) >= min_relevance
+                ]
+            all_triples.extend(filtered)
+
+        return all_triples
+
+
+def _dedup_triples(triples: List[Dict]) -> List[Dict]:
+    """Simple exact dedup by (subject, relation, object)."""
+    seen:   set       = set()
+    result: List[Dict] = []
+    for t in triples:
         key = (
             t.get("subject", {}).get("name", ""),
             t.get("relation", ""),
@@ -304,13 +414,98 @@ def get_day_triples(
         )
         if key not in seen:
             seen.add(key)
-            deduped.append(t)
+            result.append(t)
+    return result
 
-    return deduped
+
+def get_day_triples_unified(
+    day_df:        pd.DataFrame,
+    date_str:      str,
+    ticker:        str,
+    cache_store:   CacheStore,
+    min_relevance: float,
+    min_confidence: float,
+    force_sha1:    bool = False,
+    force_meta:    bool = False,
+) -> List[Dict]:
+    """
+    Unified triple lookup: meta-based + SHA1 fallback.
+
+    Priority:
+      1. Meta-based lookup (new format V5.2+, multi-article cache)
+      2. SHA1-based fallback (old format, no _meta)
+      3. Merge + dedup both results
+    """
+    triples_meta: List[Dict] = []
+    triples_sha1: List[Dict] = []
+
+    if not force_sha1:
+        triples_meta = cache_store.get_triples_meta(
+            date_str, ticker, min_relevance, min_confidence)
+
+    if not force_meta:
+        triples_sha1 = cache_store.get_triples_sha1(
+            day_df, ticker, min_relevance, min_confidence)
+
+    all_triples = triples_meta + triples_sha1
+    return _dedup_triples(all_triples)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN — Stage A.5
+# CACHE DIAGNOSTIC (--check-cache)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_cache_stats(cache_dir: str):
+    """In thống kê về cache directory. Không embed gì cả."""
+    print(f"\nCache directory: {cache_dir}")
+    if not os.path.exists(cache_dir):
+        print("  Không tồn tại.")
+        return
+
+    files = [f for f in os.listdir(cache_dir) if f.endswith(".json") and not f.startswith("_")]
+    print(f"  Tổng files: {len(files)}")
+
+    n_with_meta   = 0
+    n_no_meta     = 0
+    n_empty       = 0
+    date_set: set = set()
+    ticker_set: set = set()
+
+    for fname in files:
+        path = os.path.join(cache_dir, fname)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        triples = data.get("triples", [])
+        meta    = data.get("_meta", {})
+        date_val = meta.get("date")
+        primary  = meta.get("primary_ticker", "")
+
+        if not triples:
+            n_empty += 1
+        elif date_val:
+            n_with_meta += 1
+            date_set.add(str(date_val)[:10])
+            if primary:
+                ticker_set.add(primary.upper())
+        else:
+            n_no_meta += 1
+
+    print(f"  New-format (có _meta, có triples): {n_with_meta}")
+    print(f"  Old-format (không có _meta):       {n_no_meta}")
+    print(f"  Empty (không có triples):           {n_empty}")
+    if date_set:
+        dates_sorted = sorted(date_set)
+        print(f"  Ngày đầu (new-format): {dates_sorted[0]}")
+        print(f"  Ngày cuối (new-format): {dates_sorted[-1]}")
+        print(f"  Tickers trong _meta: {sorted(ticker_set)}")
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN EMBED LOGIC
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_embed_news(
@@ -322,12 +517,15 @@ def run_embed_news(
     min_confidence: float = None,
     ticker_filter:  Optional[str] = None,
     date_prefix:    Optional[str] = None,
+    force_sha1:     bool = False,
+    force_meta:     bool = False,
 ) -> str:
     if min_relevance  is None: min_relevance  = GlobalConfig.KG_MIN_RELEVANCE
     if min_confidence is None: min_confidence = GlobalConfig.KG_MIN_CONFIDENCE
 
     voyage = VoyageEmbedder(cache_dir=voyage_cache)
 
+    # ── Normalize DataFrame ───────────────────────────────────────────────
     df = news_df.copy()
     if "headline" in df.columns and "title" not in df.columns:
         df = df.rename(columns={"headline": "title"})
@@ -335,17 +533,25 @@ def run_embed_news(
         df = df.rename(columns={"ticker": "equity"})
     if "content" not in df.columns:
         for alt in ("body", "text"):
-            if alt in df.columns: df = df.rename(columns={alt: "content"}); break
+            if alt in df.columns:
+                df = df.rename(columns={alt: "content"})
+                break
     if "content" not in df.columns: df["content"] = ""
     if "title"   not in df.columns: df["title"]   = ""
 
     # Auto-detect date column
     if "date" not in df.columns:
-        DATE_CANDS = ["created_at", "createdAt", "published_at", "publishedAt",
-                      "publish_date", "pub_date", "Date", "DATE", "timestamp", "time", "news_date"]
+        DATE_CANDS = [
+            "created_at", "createdAt", "published_at", "publishedAt",
+            "publish_date", "pub_date", "Date", "DATE", "timestamp", "news_date",
+        ]
         date_col = next((c for c in DATE_CANDS if c in df.columns), None)
         if date_col is None:
-            date_col = next((c for c in df.columns if any(k in c.lower() for k in ("date", "time", "publish", "creat"))), None)
+            date_col = next(
+                (c for c in df.columns if any(
+                    k in c.lower() for k in ("date", "time", "publish", "creat"))),
+                None,
+            )
         if date_col is not None:
             df = df.rename(columns={date_col: "date"})
 
@@ -378,12 +584,18 @@ def run_embed_news(
         df = df[df["date"].astype(str).str.startswith(date_prefix)]
 
     tickers = sorted(df["equity"].unique())
-    print(f"\nEmbed news V5: {len(tickers)} tickers (no rolling window)")
+    mode_str = "sha1-only" if force_sha1 else ("meta-only" if force_meta else "unified (meta + sha1 fallback)")
+    print(f"\nEmbed news V7 (Unified): {len(tickers)} tickers — mode: {mode_str}")
     print(f"Cache dir : {cache_dir}")
     print(f"Output    : {output_path}\n")
 
+    # ── Load cache store once ─────────────────────────────────────────────
+    cache_store = CacheStore(cache_dir)
+    cache_store.load()
+
+    # ── Build (ticker, date) → triples text ───────────────────────────────
     ticker_date_text: Dict[Tuple[str, str], str] = {}
-    miss_count = 0
+    stats = {"meta_only": 0, "sha1_only": 0, "both": 0, "empty": 0}
 
     for ticker in tickers:
         df_t  = df[df["equity"] == ticker].copy()
@@ -393,69 +605,120 @@ def run_embed_news(
             date_str = str(d)
             day_df   = df_t[df_t["date"] == d]
 
-            triples = get_day_triples(
-                day_df=day_df,
-                ticker=ticker,
-                cache_dir=cache_dir,
-                min_relevance=min_relevance,
-                min_confidence=min_confidence,
-            )
+            # Meta-based lookup
+            meta_triples: List[Dict] = []
+            if not force_sha1:
+                meta_triples = cache_store.get_triples_meta(
+                    date_str, ticker, min_relevance, min_confidence)
 
-            if not triples:
-                miss_count += 1
+            # SHA1-based fallback
+            sha1_triples: List[Dict] = []
+            if not force_meta:
+                sha1_triples = cache_store.get_triples_sha1(
+                    day_df, ticker, min_relevance, min_confidence)
 
-            text = triples_to_text(triples, ticker)
+            # Merge + dedup
+            all_triples = _dedup_triples(meta_triples + sha1_triples)
+
+            # Stats
+            has_meta = bool(meta_triples)
+            has_sha1 = bool(sha1_triples)
+            if has_meta and has_sha1:
+                stats["both"] += 1
+            elif has_meta:
+                stats["meta_only"] += 1
+            elif has_sha1:
+                stats["sha1_only"] += 1
+            else:
+                stats["empty"] += 1
+
+            text = triples_to_text(all_triples, ticker)
             ticker_date_text[(ticker, date_str)] = text
 
-    print(f"Days with no cache entries : {miss_count}")
-    print(f"Total (ticker, date) pairs : {len(ticker_date_text)}")
+    print(f"\nCache coverage per (ticker, date) pair:")
+    print(f"  Meta-based only (new format):  {stats['meta_only']}")
+    print(f"  SHA1-based only (old format):  {stats['sha1_only']}")
+    print(f"  Both sources (merged):         {stats['both']}")
+    print(f"  No cache found (zeros):        {stats['empty']}")
+    print(f"  Total pairs: {len(ticker_date_text)}")
 
+    # ── Embed via Voyage ──────────────────────────────────────────────────
     unique_texts = list(set(ticker_date_text.values()))
     non_empty    = [t for t in unique_texts if t]
     empty_vec    = [0.0] * 1024
 
     if non_empty:
-        print(f"Embedding {len(non_empty)} unique texts via Voyage...")
+        print(f"\nEmbedding {len(non_empty)} unique texts via Voyage...")
         embeddings_list = voyage.embed_texts(non_empty)
         text_to_emb     = {t: e for t, e in zip(non_empty, embeddings_list)}
     else:
         text_to_emb = {}
+        print("\nNo text to embed (all pairs empty).")
 
+    # ── Build output ──────────────────────────────────────────────────────
     output: Dict[str, Dict[str, List[float]]] = defaultdict(dict)
     for (ticker, date_str), text in ticker_date_text.items():
-        emb = text_to_emb.get(text, empty_vec)
-        output[date_str][ticker] = emb
+        output[date_str][ticker] = text_to_emb.get(text, empty_vec)
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(dict(output), f, ensure_ascii=False)
 
-    print(f"\nSaved news_embeddings.json: {len(output)} dates")
-    print(f"Output path: {output_path}")
+    print(f"\nSaved: {output_path}")
+    print(f"  Dates: {len(output)}")
+    if output:
+        sample_date = next(iter(output))
+        sample_tickers = list(output[sample_date].keys())
+        print(f"  Sample ({sample_date}): tickers = {sample_tickers}")
     return output_path
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
 def main():
-    parser = argparse.ArgumentParser(description="Stage A.5 — Embed news triples via Voyage (V5)")
-    parser.add_argument("--news",       default=None,  help="Path to news parquet")
-    parser.add_argument("--cache-dir",  default=None,  help="SHA-1 cache dir (default: GlobalConfig)")
-    parser.add_argument("--output",     default=None,  help="Output JSON path (default: GlobalConfig)")
-    parser.add_argument("--ticker",     default=None)
-    parser.add_argument("--date",       default=None,  help="Date prefix filter, e.g. '2022-06'")
+    parser = argparse.ArgumentParser(
+        description="Stage A.5 — Embed news triples via Voyage (V7 Unified)"
+    )
+    parser.add_argument("--news",      default=None, help="Path to news parquet")
+    parser.add_argument("--cache-dir", default=None, help="Article triple cache dir")
+    parser.add_argument("--output",    default=None, help="Output JSON path")
+    parser.add_argument("--ticker",    default=None, help="Filter to 1 ticker, e.g. TSLA")
+    parser.add_argument("--date",      default=None, help="Date prefix, e.g. '2022-06'")
     parser.add_argument("--min-relevance",  type=float, default=None)
     parser.add_argument("--min-confidence", type=float, default=None)
+    parser.add_argument("--force-sha1",  action="store_true",
+                        help="Only use SHA1 lookup (old format only, for debugging)")
+    parser.add_argument("--force-meta",  action="store_true",
+                        help="Only use _meta scan (new format only, for debugging)")
+    parser.add_argument("--check-cache", action="store_true",
+                        help="Print cache stats and exit (no embedding)")
     args = parser.parse_args()
 
+    cache_dir = args.cache_dir or GlobalConfig.kg_cache_dir()
+
+    # ── Check-cache mode ──────────────────────────────────────────────────
+    if args.check_cache:
+        check_cache_stats(cache_dir)
+        return
+
+    # ── Validate ──────────────────────────────────────────────────────────
     news_path = args.news or os.path.join(
         GlobalConfig.INTERIM_PATH, "concatenated_news_filtered.parquet"
     )
     if not os.path.exists(news_path):
-        print(f"News file not found: {news_path}"); sys.exit(1)
+        print(f"News file not found: {news_path}")
+        sys.exit(1)
 
-    cache_dir = args.cache_dir or GlobalConfig.kg_cache_dir()
     if not os.path.exists(cache_dir):
         print(f"Cache dir not found: {cache_dir}")
-        print("Run Stage A first: python extract_corpus.py"); sys.exit(1)
+        print("Run Stage A first: python extract_corpus.py")
+        sys.exit(1)
+
+    if args.force_sha1 and args.force_meta:
+        print("Cannot use --force-sha1 and --force-meta together.")
+        sys.exit(1)
 
     output_path = args.output or os.path.join(
         GlobalConfig.INTERIM_PATH, "kg_embeddings", "news_embeddings.json"
@@ -473,6 +736,8 @@ def main():
         min_relevance=args.min_relevance,
         min_confidence=args.min_confidence,
         ticker_filter=args.ticker,
+        force_sha1=args.force_sha1,
+        force_meta=args.force_meta,
         date_prefix=args.date,
     )
 

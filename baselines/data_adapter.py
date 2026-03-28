@@ -1,234 +1,127 @@
 # baselines/data_adapter.py
 """
-BaselineDataPrepare — Kế thừa data_prepare gốc, bổ sung:
-  - indicators   : (T, W, 3)   — s_o, s_h, s_c ghép lại
-  - s_news_per_day: (T, W, 128) — graph/news embedding từng ngày trong cửa sổ
-  - s_graph_emb  : (T, 128)    — graph embedding của ngày target (từ file .pt)
-  - s_m          : (T, W, macro_dim) — giữ nguyên như cũ
-  - label        : (T,)        — rolling-quantile label (giống data_loader.py)
+BaselineDataAdapter — V5.3
 
-KHÔNG thay đổi bất kỳ file gốc nào.
+Wrapper mỏng quanh src.data_loader.data_prepare.
+Thêm key 'indicators' = cat(s_o, s_h, s_c) để baselines dùng dạng (B, W, 3).
+
+V5.3 mapping (khớp với pipeline hiện tại, không dùng PyG/GNN):
+  indicators   (B, W, 3)    — giá OHLC ghép    ← "indicator sequence"
+  s_n          (B, W, 1024) — Voyage embeddings ← "dynamic document"
+  s_m          (B, W, M)    — macro indicators  ← "market context" (thay graph)
+  label        (B,)         — 0=DOWN,1=FLAT,2=UP
+
+Lý do không dùng lại data_adapter.py cũ:
+  - Cũ dùng kg_tensor (PyG graphs) → không tồn tại trong V5.3
+  - Cũ dùng 128D GNN embedding → V5.3 dùng 1024D Voyage
+  - Cũ import KGGraphEncoder → bị xóa từ V4
 """
 
-import os
 import torch
-import numpy as np
-import pandas as pd
-
-from configs.config import TrainConfig
 from src.data_loader import data_prepare
-
-# Chiều embedding của GNN output (graph_out_dim=128 trong configs)
-BASELINE_NEWS_DIM = 128
+from configs.config import GlobalConfig
 
 
-class BaselineDataPrepare(data_prepare):
+def prepare_for_baselines(pkl_path: str, ticker: str) -> tuple[dict, dict, dict]:
     """
-    Mở rộng data_prepare để trích xuất flat embeddings cho baseline models.
+    Load và chuẩn bị dữ liệu cho tất cả baseline models.
 
-    Sử dụng:
-        adapter = BaselineDataPrepare(pkl_path)
-        train, valid, test = adapter.prepare_baseline_data("TSLA")
+    Tái sử dụng hoàn toàn data_prepare.prepare_data() — không duplicate logic.
+    Chỉ thêm key 'indicators' cho convenience.
+
+    Parameters
+    ----------
+    pkl_path : str
+        Path đến unified_dataset.pkl
+    ticker : str
+        Ticker symbol, e.g. "TSLA"
+
+    Returns
+    -------
+    train_data, valid_data, test_data : dict
+        Mỗi dict chứa:
+            s_o, s_h, s_c  : (N, W, 1)     — giá riêng
+            s_m            : (N, W, M)     — macro
+            s_n            : (N, W, 1024)  — Voyage news embeddings
+            label          : (N,)          — 0/1/2
+            indicators     : (N, W, 3)     — cat(s_o, s_h, s_c) cho flat baselines
     """
+    dp = data_prepare(pkl_path)
+    train, valid, test = dp.prepare_data(ticker)
 
-    NEWS_DIM = BASELINE_NEWS_DIM
+    for split in (train, valid, test):
+        if split and len(split.get("label", [])) > 0:
+            split["indicators"] = torch.cat(
+                [split["s_o"], split["s_h"], split["s_c"]], dim=-1
+            )  # (N, W, 3)
 
-    # ------------------------------------------------------------------
-    # Helper: lấy news_embedding vector từ một ngày trong raw_data
-    # ------------------------------------------------------------------
-    def _get_news_emb_for_day(self, day_data: dict, target_ticker: str) -> np.ndarray:
-        """
-        Trả về vector 128-dim từ day_data["news_embedding"][ticker].
-        Nếu thiếu → zero vector.
-        """
-        emb = day_data.get("news_embedding", {}).get(target_ticker)
-        if emb is None or not isinstance(emb, list) or len(emb) == 0:
-            return np.zeros(self.NEWS_DIM, dtype=np.float32)
+    return train, valid, test
 
-        arr = np.array(emb, dtype=np.float32)
-        # Padding / truncation nếu không khớp chiều
-        if len(arr) < self.NEWS_DIM:
-            arr = np.pad(arr, (0, self.NEWS_DIM - len(arr)))
-        elif len(arr) > self.NEWS_DIM:
-            arr = arr[: self.NEWS_DIM]
-        return arr
 
-    # ------------------------------------------------------------------
-    # Helper: load graph_emb từ file .pt được lưu bởi tensorize_and_embed
-    # ------------------------------------------------------------------
-    def _get_graph_emb_from_pt(self, kg_path) -> np.ndarray:
-        """
-        Load pre-computed graph embedding (128-dim) từ file .pt.
-        File được tạo bởi KGGenNewsEmbedder.tensorize_and_embed().
-        """
-        if not kg_path or not isinstance(kg_path, str) or not os.path.exists(kg_path):
-            return np.zeros(self.NEWS_DIM, dtype=np.float32)
+def merge_tickers(
+    splits_per_ticker: dict[str, tuple[dict, dict, dict]],
+    shuffle_train: bool = True,
+) -> tuple[dict, dict, dict]:
+    """
+    Gộp data nhiều tickers thành một dataset.
+
+    Parameters
+    ----------
+    splits_per_ticker : {ticker: (train, valid, test)}
+    shuffle_train     : bool — shuffle train sau khi gộp
+
+    Returns
+    -------
+    (merged_train, merged_valid, merged_test)
+    """
+    def _merge(dicts):
+        if not dicts:
+            return {}
+        merged = {}
+        for key in dicts[0].keys():
+            parts = [d[key] for d in dicts if d and key in d]
+            if parts and isinstance(parts[0], torch.Tensor):
+                merged[key] = torch.cat(parts, dim=0)
+        return merged
+
+    trains = [v[0] for v in splits_per_ticker.values() if v[0] and len(v[0].get("label", [])) > 0]
+    valids = [v[1] for v in splits_per_ticker.values() if v[1] and len(v[1].get("label", [])) > 0]
+    tests  = [v[2] for v in splits_per_ticker.values() if v[2] and len(v[2].get("label", [])) > 0]
+
+    merged_train = _merge(trains)
+    merged_valid = _merge(valids)
+    merged_test  = _merge(tests)
+
+    if shuffle_train and "label" in merged_train:
+        idx = torch.randperm(len(merged_train["label"]))
+        for k in merged_train:
+            merged_train[k] = merged_train[k][idx]
+
+    return merged_train, merged_valid, merged_test
+
+
+def load_all_available_tickers(pkl_path: str) -> tuple[dict, dict, dict]:
+    """
+    Load tất cả tickers có trong GlobalConfig.TICKERS.
+    Skip ticker nào không có đủ data (ít nhất 100 training samples).
+
+    Returns merged train/valid/test.
+    """
+    splits = {}
+    for ticker in GlobalConfig.TICKERS:
         try:
-            data = torch.load(kg_path, map_location="cpu", weights_only=False)
-            if isinstance(data, dict) and "graph_emb" in data:
-                emb = data["graph_emb"]
-                arr = emb.numpy().astype(np.float32) if isinstance(emb, torch.Tensor) else np.array(emb, dtype=np.float32)
-                if len(arr) < self.NEWS_DIM:
-                    arr = np.pad(arr, (0, self.NEWS_DIM - len(arr)))
-                return arr[: self.NEWS_DIM]
-        except Exception:
-            pass
-        return np.zeros(self.NEWS_DIM, dtype=np.float32)
-
-    # ------------------------------------------------------------------
-    # Main method
-    # ------------------------------------------------------------------
-    def prepare_baseline_data(self, target_ticker: str):
-        """
-        Chuẩn bị dữ liệu cho baseline models.
-
-        Returns
-        -------
-        train_dict, valid_dict, test_dict : dict
-            Mỗi dict chứa:
-              - 'indicators'     : Tensor (N, W, 3)   — giá ghép
-              - 's_o','s_h','s_c': Tensor (N, W, 1)   — giá riêng lẻ
-              - 's_m'            : Tensor (N, W, M)   — macro
-              - 's_news_per_day' : Tensor (N, W, 128) — news emb mỗi ngày trong window
-              - 's_graph_emb'    : Tensor (N, 128)    — graph emb ngày target
-              - 'label'          : Tensor (N,)        — 0=DOWN,1=FLAT,2=UP
-        """
-        dates = sorted(self.raw_data.keys())
-
-        # ── 1. Thu thập rows ──────────────────────────────────────────
-        rows = []
-        for date_key in dates:
-            day_data = self.raw_data[date_key]
-            price_data = day_data.get("price", {}).get(target_ticker)
-            if price_data is None:
-                continue
-
-            if isinstance(price_data, dict):
-                s_o = price_data.get("Open") or price_data.get("open")
-                s_h = price_data.get("High") or price_data.get("high")
-                s_c = price_data.get("Close") or price_data.get("close")
+            tr, va, te = prepare_for_baselines(pkl_path, ticker)
+            if tr and len(tr.get("label", [])) >= 100:
+                splits[ticker] = (tr, va, te)
+                n_train = len(tr["label"])
+                n_news  = int((tr["s_n"].abs().sum(dim=-1).sum(dim=-1) > 0).sum())
+                print(f"  {ticker}: {n_train} train  news_coverage={n_news}/{n_train}")
             else:
-                continue
+                print(f"  {ticker}: skip (insufficient data)")
+        except Exception as e:
+            print(f"  {ticker}: skip ({e})")
 
-            if s_o is None or s_h is None or s_c is None:
-                continue
-            try:
-                s_o, s_h, s_c = float(s_o), float(s_h), float(s_c)
-            except (ValueError, TypeError):
-                continue
+    if not splits:
+        raise RuntimeError("No ticker data available. Run main_test.py first.")
 
-            macro_data = day_data.get("macro", {})
-            kg_path    = day_data.get("kg_tensor", {}).get(target_ticker)
-            # news_embedding là GNN graph embedding (128-dim) lưu trong builder.py
-            news_emb   = self._get_news_emb_for_day(day_data, target_ticker)
-
-            rows.append({
-                "date": date_key,
-                "s_o": s_o, "s_h": s_h, "s_c": s_c,
-                "macro": macro_data,
-                "kg_path": kg_path,
-                "news_emb": news_emb,
-            })
-
-        if len(rows) < self.window_size + 1:
-            print(f"⚠️  {target_ticker}: Không đủ dữ liệu ({len(rows)} ngày)")
-            return {}, {}, {}
-
-        print(f"📊 {target_ticker}: {len(rows)} ngày hợp lệ")
-
-        # ── 2. Rolling Quantile Labels (giống data_loader.py) ────────
-        close_prices   = pd.Series([r["s_c"] for r in rows])
-        returns_series = close_prices.pct_change().fillna(0)
-        roll_low  = returns_series.rolling(20).quantile(0.33).shift(1)
-        roll_high = returns_series.rolling(20).quantile(0.66).shift(1)
-
-        # ── 3. Khởi tạo arrays ───────────────────────────────────────
-        T          = len(rows) - self.window_size
-        macro_keys = sorted(rows[0]["macro"].keys())
-        macro_dim  = len(macro_keys)
-
-        s_o_all        = np.zeros((T, self.window_size, 1),             dtype=np.float32)
-        s_h_all        = np.zeros((T, self.window_size, 1),             dtype=np.float32)
-        s_c_all        = np.zeros((T, self.window_size, 1),             dtype=np.float32)
-        s_m_all        = np.zeros((T, self.window_size, macro_dim),     dtype=np.float32)
-        s_news_per_day = np.zeros((T, self.window_size, self.NEWS_DIM), dtype=np.float32)
-        s_graph_emb    = np.zeros((T, self.NEWS_DIM),                   dtype=np.float32)
-        labels         = np.zeros(T, dtype=np.int64)
-
-        # ── 4. Xây dựng windows ──────────────────────────────────────
-        for t in range(T):
-            window_rows = rows[t : t + self.window_size]
-            target_row  = rows[t + self.window_size]
-
-            for w, row in enumerate(window_rows):
-                s_o_all[t, w, 0] = row["s_o"]
-                s_h_all[t, w, 0] = row["s_h"]
-                s_c_all[t, w, 0] = row["s_c"]
-                s_m_all[t, w]    = [row["macro"].get(k, 0.0) for k in macro_keys]
-                s_news_per_day[t, w] = row["news_emb"]
-
-            # Graph embedding của ngày target (từ file .pt)
-            s_graph_emb[t] = self._get_graph_emb_from_pt(target_row["kg_path"])
-
-            # Label
-            idx      = t + self.window_size
-            cur_ret  = returns_series.iloc[idx]
-            cur_low  = roll_low.iloc[idx]
-            cur_high = roll_high.iloc[idx]
-
-            if pd.isna(cur_low) or pd.isna(cur_high):
-                labels[t] = 1
-            elif abs(cur_ret) < 0.001:
-                labels[t] = 1
-            elif cur_ret < cur_low:
-                labels[t] = 0   # DOWN
-            elif cur_ret > cur_high:
-                labels[t] = 2   # UP
-            else:
-                labels[t] = 1   # FLAT
-
-        label_dist = dict(zip(*np.unique(labels, return_counts=True)))
-        print(f"   ⚖️  Label: {label_dist}")
-
-        # ── 5. Normalization (chỉ trên Train để tránh leakage) ───────
-        train_ratio = getattr(TrainConfig, "train_ratio", 0.7)
-        valid_ratio = getattr(TrainConfig, "valid_ratio", 0.15)
-        train_end   = int(T * train_ratio)
-        valid_end   = int(T * (train_ratio + valid_ratio))
-
-        def _znorm_inplace(arr, train_end):
-            mu  = arr[:train_end].mean()
-            std = arr[:train_end].std() + 1e-8
-            arr -= mu
-            arr /= std
-
-        _znorm_inplace(s_o_all, train_end)
-        _znorm_inplace(s_h_all, train_end)
-        _znorm_inplace(s_c_all, train_end)
-
-        mu_m  = s_m_all[:train_end].mean(axis=(0, 1), keepdims=True)
-        std_m = s_m_all[:train_end].std(axis=(0, 1),  keepdims=True) + 1e-8
-        s_m_all = (s_m_all - mu_m) / std_m
-
-        # indicators = cat(s_o, s_h, s_c) → (T, W, 3)
-        indicators = np.concatenate([s_o_all, s_h_all, s_c_all], axis=-1)
-
-        # ── 6. Chuyển sang tensor và split ───────────────────────────
-        def _to_dict(sl: slice) -> dict:
-            return {
-                "indicators":      torch.tensor(indicators[sl],      dtype=torch.float32),
-                "s_o":             torch.tensor(s_o_all[sl],         dtype=torch.float32),
-                "s_h":             torch.tensor(s_h_all[sl],         dtype=torch.float32),
-                "s_c":             torch.tensor(s_c_all[sl],         dtype=torch.float32),
-                "s_m":             torch.tensor(s_m_all[sl],         dtype=torch.float32),
-                "s_news_per_day":  torch.tensor(s_news_per_day[sl],  dtype=torch.float32),
-                "s_graph_emb":     torch.tensor(s_graph_emb[sl],     dtype=torch.float32),
-                "label":           torch.tensor(labels[sl],          dtype=torch.long),
-            }
-
-        train_data = _to_dict(slice(None, train_end))
-        valid_data = _to_dict(slice(train_end, valid_end))
-        test_data  = _to_dict(slice(valid_end, None))
-
-        print(f"✅ {target_ticker}: Train={train_end} | Valid={valid_end-train_end} | Test={T-valid_end}")
-        return train_data, valid_data, test_data
+    return merge_tickers(splits, shuffle_train=True)

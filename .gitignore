@@ -19,3 +19,13 @@ data/
 *.log
 *.json
 *.jsonl
+*.md
+*.csv
+*.xlsx
+*.txt
+
+baselines/
+*__pycache__/
+*.pt
+*.json
+*.txt

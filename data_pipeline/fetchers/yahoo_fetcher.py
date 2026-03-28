@@ -1,89 +1,137 @@
 import yfinance as yf
 import pandas as pd
-from typing import List, Dict
+from typing import List, Dict, Union
 from pandas_datareader import data as pdr
 
+
 class YahooFetcher:
+
     def download_data(self, start_day: str, end_day: str, tickers: List[str]) -> List[pd.DataFrame]:
         """
-        RESOLVED CONFLICT: Follows logic from [finmem]_macro_indicators_retrieval.py
-        Fetches 'Open', 'High', 'Close' (not just Close).
-        Renames columns to {ticker}_open, {ticker}_high, {ticker}_close.
+        Tải OHLC cho từng ticker. Trả về List[DataFrame] với cột
+        date, {TICKER}_open, {TICKER}_high, {TICKER}_close.
         """
         df_list = []
         for ticker in tickers:
             print(f'Downloading data for {ticker}')
-            # Logic: Auto_adjust=False implies we want raw/adjusted appropriately, 
-            # but usually 'Adj Close' is separate. 
-            # Macro file uses: data = yf.download(...) -> reset_index -> rename
-            data = yf.download(ticker, start=start_day, end=end_day)
-            
-            # Reset index to make Date a column
+            data = yf.download(ticker, start=start_day, end=end_day, progress=False)
             data = data.reset_index()
-            data['Date'] = data['Date'].dt.date
-            
-            # Select OHLC
-            # Note: yfinance might return MultiIndex if multiple tickers, but here we loop one by one.
-            if 'Open' in data.columns and 'High' in data.columns and 'Close' in data.columns:
-                data = data[['Date', 'Open', 'High', 'Close']]
-                data = data.rename(columns={
-                    'Date': 'date',
-                    'Open': f'{ticker}_open',
-                    'High': f'{ticker}_high',
-                    'Close': f'{ticker}_close'
-                })
-                df_list.append(data)
-            else:
-                 print(f"Warning: Missing OHLC data for {ticker}")
-                 
+            data['Date'] = pd.to_datetime(data['Date']).dt.date
+
+            # Flatten MultiIndex nếu có (yfinance >= 0.2.x)
+            if isinstance(data.columns, pd.MultiIndex):
+                data.columns = ['_'.join(filter(None, col)).strip() for col in data.columns]
+
+            # Tìm các cột Open/High/Close (có thể là "Open" hoặc "Open_TSLA")
+            open_col  = next((c for c in data.columns if c.lower().startswith("open")),  None)
+            high_col  = next((c for c in data.columns if c.lower().startswith("high")),  None)
+            close_col = next((c for c in data.columns if c.lower().startswith("close")), None)
+            date_col  = next((c for c in data.columns if c.lower() == "date"), None)
+
+            if not all([open_col, high_col, close_col, date_col]):
+                print(f"Warning: Missing OHLC columns for {ticker}. Cols: {list(data.columns)}")
+                continue
+
+            out = data[[date_col, open_col, high_col, close_col]].copy()
+            out = out.rename(columns={
+                date_col:  "date",
+                open_col:  f"{ticker}_open",
+                high_col:  f"{ticker}_high",
+                close_col: f"{ticker}_close",
+            })
+            df_list.append(out)
+
         return df_list
 
-    def fetch_macro_indicators(self, start_date: str, end_date: str, symbols: Dict[str, str]):
+    def fetch_macro_indicators(
+        self,
+        start_date: str,
+        end_date:   str,
+        symbols:    Union[List[str], Dict[str, str]],
+    ) -> pd.DataFrame:
         """
-        Fetches Macro data (Yahoo + FRED).
-        Updated to accept 'symbols' argument.
+        Tải macro indicators từ Yahoo Finance + FRED.
+
+        symbols có thể là:
+          - List[str]:         ["^GSPC", "^VIX", ...]  → dùng ticker làm key
+          - Dict[str, str]:    {"sp500": "^GSPC", ...} → dùng key làm tên cột
+
+        FIX: GlobalConfig.MACRO_SYMBOLS là List[str], không phải Dict.
+        Code cũ gọi .values() trên list → TypeError.
         """
-        # 1. Fetch from Yahoo
+        # Chuẩn hóa symbols → dict {canonical_name: yahoo_symbol}
+        if isinstance(symbols, dict):
+            symbol_map = symbols  # {"vix": "^VIX", ...}
+        else:
+            # List → tạo canonical name từ ticker symbol
+            symbol_map = {}
+            for sym in symbols:
+                name = (
+                    sym.replace("^", "")
+                       .replace(".", "_")
+                       .lower()
+                )
+                # Override với tên chuẩn cho các symbol quen thuộc
+                friendly = {
+                    "gspc":  "sp500",
+                    "dji":   "dji",
+                    "ixic":  "nasdaq",
+                    "vix":   "vix",
+                    "tnx":   "us10y_yahoo",  # sẽ bị override bởi FRED
+                    "tyx":   "us30y",
+                    "irx":   "us3m",
+                    "dxy":   "dxy",
+                    "cl=f":  "wti",
+                }
+                symbol_map[friendly.get(name, name)] = sym
+
+        ticker_list = list(symbol_map.values())
+
+        # 1. Tải từ Yahoo
         print("Fetching Macro from Yahoo...")
+        macro_data = pd.DataFrame()
         try:
-            # yfinance download accepts list of tickers
-            ticker_list = list(symbols.values())
-            macro_data = yf.download(ticker_list, start=start_date, end=end_date, auto_adjust=True, progress=False)
-            
-            # Handle yfinance Output Structure (it varies by version/number of tickers)
-            if 'Close' in macro_data.columns and isinstance(macro_data.columns, pd.MultiIndex):
-                macro_data = macro_data['Close']
-            elif 'Close' in macro_data.columns: # Single ticker case or flat index
-                pass # Use as is if it's just the close prices
-                
-            # Rename columns to standardized keys (vix, sp500, etc.)
-            # Map values back to keys: {'^VIX': 'vix', ...}
-            inv_map = {v: k for k, v in symbols.items()}
-            macro_data = macro_data.rename(columns=inv_map)
-            
-        except Exception as e:
-            print(f"Yahoo Macro Error: {e}")
-            macro_data = pd.DataFrame()
+            raw = yf.download(
+                ticker_list,
+                start=start_date, end=end_date,
+                auto_adjust=True, progress=False,
+            )
 
-        # 2. Fetch from FRED
+            # Lấy Close prices
+            if isinstance(raw.columns, pd.MultiIndex):
+                if "Close" in raw.columns.get_level_values(0):
+                    raw = raw["Close"]
+                else:
+                    # Flatten
+                    raw.columns = ["_".join(filter(None, c)) for c in raw.columns]
+
+            # Rename: yahoo symbol → canonical name
+            inv_map = {v: k for k, v in symbol_map.items()}
+            raw = raw.rename(columns=inv_map)
+            macro_data = raw.copy()
+
+        except Exception as e:
+            print(f"  Yahoo Macro Error: {e}")
+
+        # 2. Tải yields từ FRED (override Yahoo TNX nếu có)
         try:
-            print("Fetching Yields from FRED...")
-            fred_2y = pdr.DataReader("DGS2", "fred", start_date, end_date)
+            print("  Fetching Yields from FRED...")
+            fred_2y  = pdr.DataReader("DGS2",  "fred", start_date, end_date)
             fred_10y = pdr.DataReader("DGS10", "fred", start_date, end_date)
-            
-            # Merge into macro_data
-            # We use assignment which aligns on Index (Date) automatically
-            macro_data['us2y'] = fred_2y['DGS2']
-            macro_data['us10y'] = fred_10y['DGS10']
-            
+            macro_data["us2y"]  = fred_2y["DGS2"]
+            macro_data["us10y"] = fred_10y["DGS10"]
         except Exception as e:
-            print(f"FRED Error: {e}")
+            print(f"  FRED Error: {e}")
 
-        # Reset index to make 'date' a column
+        # 3. Chuẩn hóa index thành cột date
         macro_data = macro_data.reset_index()
-        # Rename 'Date' index to 'date' column
-        if 'Date' in macro_data.columns:
-            macro_data = macro_data.rename(columns={'Date': 'date'})
-            macro_data['date'] = pd.to_datetime(macro_data['date']).dt.date
-            
+        date_col = next(
+            (c for c in macro_data.columns if c.lower() in ("date", "index")), None
+        )
+        if date_col and date_col != "date":
+            macro_data = macro_data.rename(columns={date_col: "date"})
+        if "date" in macro_data.columns:
+            macro_data["date"] = pd.to_datetime(macro_data["date"]).dt.date
+
+        print(f"  Macro columns: {[c for c in macro_data.columns if c != 'date']}")
         return macro_data

@@ -1,26 +1,63 @@
 # baselines/trainer.py
 """
-BaselineTrainer — Trainer chung cho tất cả baseline models.
+Unified trainer cho tất cả baseline models và MSGCA variants.
 
-Features:
-  - Chạy N_RUNS lần với random seeds khác nhau → báo mean ± std
-  - Cùng hyperparameters với paper MSGCA (lr=1e-4, warmup, Adam)
-  - Evaluate bằng ACC + MCC (sklearn)
-  - Hỗ trợ cả flat-input baselines lẫn MSGCA-NAF (cần graph list)
+Hỗ trợ 2 loại model:
+  1. Flat baselines (LSTM, ALSTM, ESTIMATE, DTML, ALSTM-W, SLOT, LLM-Stock):
+     - Forward: model(indicators, s_n, s_m, ...) → logits
+     - DataLoader: TensorDataset của indicators, s_n, s_m, label
+
+  2. MSGCA-style models (MSGCANoGate, MSGCAWithGLU, StockMovementModel):
+     - Forward: model(s_o, s_h, s_c, s_m, s_n, label, mode=...) → loss/metrics
+     - DataLoader: giống StockDataset trong main.py
+
+Hyperparameters khớp với paper MSGCA (Section 5.1):
+  lr=1e-4, epochs=200, warmup=10, Adam, clip_grad=1.0
 """
 
-import os
 import random
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, Dataset
 from sklearn.metrics import accuracy_score, matthews_corrcoef
+from typing import Callable, Optional
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Utility
+# Dataset classes
 # ──────────────────────────────────────────────────────────────────────
+
+class FlatDataset(TensorDataset):
+    """Dataset cho flat baselines — trả về (indicators, s_n, s_m, label)."""
+
+    def __init__(self, data: dict):
+        super().__init__(
+            data["indicators"],  # (N, W, 3)
+            data["s_n"],         # (N, W, 1024)
+            data["s_m"],         # (N, W, M)
+            data["label"],       # (N,)
+        )
+
+
+class MSGCADataset(Dataset):
+    """Dataset cho MSGCA-style models — trả về dict."""
+
+    def __init__(self, data: dict):
+        self.data = data
+
+    def __len__(self):
+        return len(self.data["label"])
+
+    def __getitem__(self, idx):
+        return {k: v[idx] for k, v in self.data.items()}
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Seeds
+# ──────────────────────────────────────────────────────────────────────
+
+SEEDS = [42, 123, 256, 512, 1024]
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -29,249 +66,210 @@ def set_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark     = False
-
-
-def build_loader(data_dict: dict, batch_size: int, shuffle: bool) -> DataLoader:
-    """
-    Tạo DataLoader từ data_dict chứa các Tensor.
-    Chỉ sử dụng cho flat-input baselines (không phải MSGCA-NAF).
-    """
-    keys   = ["indicators", "s_news_per_day", "s_graph_emb", "s_m", "label"]
-    arrays = [data_dict[k] for k in keys]
-    ds     = TensorDataset(*arrays)
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=False)
+    torch.backends.cudnn.benchmark = False
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Flat baseline: models nhận tensor trực tiếp
+# Evaluation
 # ──────────────────────────────────────────────────────────────────────
 
-def train_flat_baseline(
-    model: nn.Module,
-    train_data: dict,
-    valid_data: dict,
-    test_data: dict,
-    epochs: int       = 200,
-    lr: float         = 1e-4,
-    batch_size: int   = 1024,
-    warmup_epochs: int = 10,
-    device: torch.device = None,
-) -> tuple:
-    """
-    Train một flat baseline (LSTM, ALSTM, ESTIMATE, DTML, ALSTM-W, SLOT, LLM-Stock).
-
-    Returns
-    -------
-    (test_acc, test_mcc) : float, float
-    """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model = model.to(device)
-    optimizer  = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler  = torch.optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs
-    )
-    criterion  = nn.CrossEntropyLoss()
-    train_loader = build_loader(train_data, batch_size, shuffle=True)
-
-    best_val_mcc = -2.0
-    best_state   = None
-
-    for epoch in range(epochs):
-        model.train()
-        for batch in train_loader:
-            indicators, s_news, s_graph, s_m, labels = [b.to(device) for b in batch]
-            optimizer.zero_grad()
-            logits = model(
-                indicators    = indicators,
-                s_news_per_day = s_news,
-                s_graph_emb   = s_graph,
-                s_m           = s_m,
-            )
-            loss = criterion(logits, labels)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-
-        if epoch < warmup_epochs:
-            scheduler.step()
-
-        # Validate
-        val_acc, val_mcc = eval_flat_baseline(model, valid_data, batch_size, device)
-        if val_mcc > best_val_mcc and epoch >= 50:
-            best_val_mcc = val_mcc
-            best_state   = {k: v.clone() for k, v in model.state_dict().items()}
-
-    # Test với best model
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    return eval_flat_baseline(model, test_data, batch_size, device)
-
-
-def eval_flat_baseline(
-    model: nn.Module,
-    data_dict: dict,
-    batch_size: int = 512,
-    device: torch.device = None,
-) -> tuple:
+@torch.no_grad()
+def evaluate_flat(model: nn.Module, data: dict, batch_size: int = 512,
+                  device=None) -> tuple[float, float]:
     """Evaluate flat baseline → (acc, mcc)."""
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if not data_dict or len(data_dict.get("label", [])) == 0:
+    if not data or len(data.get("label", [])) == 0:
         return 0.0, 0.0
-
+    device = device or next(model.parameters()).device
     model.eval()
-    loader = build_loader(data_dict, batch_size, shuffle=False)
-    all_preds, all_labels = [], []
+    loader = DataLoader(FlatDataset(data), batch_size=batch_size)
+    preds_all, labels_all = [], []
+    for indicators, s_n, s_m, labels in loader:
+        logits = model(
+            indicators=indicators.to(device),
+            s_n=s_n.to(device),
+            s_m=s_m.to(device),
+        )
+        preds_all.extend(logits.argmax(1).cpu().numpy())
+        labels_all.extend(labels.numpy())
+    acc = accuracy_score(labels_all, preds_all)
+    mcc = matthews_corrcoef(labels_all, preds_all) if len(set(labels_all)) > 1 else 0.0
+    return acc, mcc
 
-    with torch.no_grad():
-        for batch in loader:
-            indicators, s_news, s_graph, s_m, labels = [b.to(device) for b in batch]
-            logits = model(
-                indicators     = indicators,
-                s_news_per_day = s_news,
-                s_graph_emb    = s_graph,
-                s_m            = s_m,
-            )
-            preds = logits.argmax(dim=-1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.numpy())
 
-    acc = accuracy_score(all_labels, all_preds)
-    try:
-        mcc = matthews_corrcoef(all_labels, all_preds)
-    except Exception:
-        mcc = 0.0
+@torch.no_grad()
+def evaluate_msgca(model: nn.Module, data: dict, batch_size: int = 64,
+                   device=None) -> tuple[float, float]:
+    """Evaluate MSGCA-style model → (acc, mcc)."""
+    if not data or len(data.get("label", [])) == 0:
+        return 0.0, 0.0
+    device = device or next(model.parameters()).device
+    model.eval()
+    loader = DataLoader(MSGCADataset(data), batch_size=batch_size)
+    preds_all, labels_all = [], []
+    for batch in loader:
+        preds = model(
+            batch["s_o"].to(device), batch["s_h"].to(device),
+            batch["s_c"].to(device), batch["s_m"].to(device),
+            batch["s_n"].to(device), batch["label"].to(device),
+            mode="test", return_preds=True,
+        )
+        if isinstance(preds, tuple):  # (acc, mcc, preds)
+            preds = preds[2]
+        preds_all.extend(preds.cpu().numpy())
+        labels_all.extend(batch["label"].numpy())
+    acc = accuracy_score(labels_all, preds_all)
+    mcc = matthews_corrcoef(labels_all, preds_all) if len(set(labels_all)) > 1 else 0.0
     return acc, mcc
 
 
 # ──────────────────────────────────────────────────────────────────────
-# MSGCA-NAF: cần graph list (PyG Data objects)
+# Training
 # ──────────────────────────────────────────────────────────────────────
 
-def train_msgca_naf(
-    model,
-    train_data_full: dict,   # output của data_prepare.prepare_data (gốc)
-    valid_data_full: dict,
-    test_data_full: dict,
-    epochs: int       = 200,
-    lr: float         = 1e-4,
-    batch_size: int   = 128,
-    device: torch.device = None,
-) -> tuple:
-    """
-    Train MSGCA-NAF model (dùng s_n_graphs — giống main.py).
-    Tái sử dụng collate_fn và StockGraphDataset từ main.py.
-    """
-    from main import StockGraphDataset, collate_graph_batch, evaluate as eval_main
-
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+def train_flat(
+    model: nn.Module,
+    train_data: dict,
+    valid_data: dict,
+    test_data: dict,
+    epochs: int = 200,
+    lr: float = 1e-4,
+    batch_size: int = 512,
+    warmup_epochs: int = 10,
+    device=None,
+    verbose: bool = False,
+) -> tuple[float, float]:
+    """Train flat baseline và return (test_acc, test_mcc)."""
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-    optimizer  = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler  = torch.optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=0.1, end_factor=1.0, total_iters=10
-    )
-    criterion  = nn.CrossEntropyLoss()
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    sched = torch.optim.lr_scheduler.LinearLR(
+        opt, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
+    criterion = nn.CrossEntropyLoss()
+    loader = DataLoader(FlatDataset(train_data), batch_size=batch_size, shuffle=True)
 
-    train_ds     = StockGraphDataset(train_data_full)
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        collate_fn=collate_graph_batch, drop_last=False,
-    )
-
-    best_val_mcc = -2.0
-    best_state   = None
-
+    best_mcc, best_state = -2.0, None
     for epoch in range(epochs):
         model.train()
-        for batch in train_loader:
-            optimizer.zero_grad()
+        for indicators, s_n, s_m, labels in loader:
+            opt.zero_grad()
+            logits = model(
+                indicators=indicators.to(device),
+                s_n=s_n.to(device),
+                s_m=s_m.to(device),
+            )
+            criterion(logits, labels.to(device)).backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+        if epoch < warmup_epochs:
+            sched.step()
+        if epoch >= 40:
+            _, val_mcc = evaluate_flat(model, valid_data, batch_size, device)
+            if val_mcc > best_mcc:
+                best_mcc = val_mcc
+                best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            if verbose and (epoch + 1) % 50 == 0:
+                print(f"    epoch {epoch+1}: val_mcc={val_mcc:.4f}")
+
+    if best_state:
+        model.load_state_dict(best_state)
+    return evaluate_flat(model, test_data, batch_size, device)
+
+
+def train_msgca_variant(
+    model: nn.Module,
+    train_data: dict,
+    valid_data: dict,
+    test_data: dict,
+    epochs: int = 200,
+    lr: float = 1e-4,
+    batch_size: int = 32,
+    warmup_epochs: int = 10,
+    device=None,
+    verbose: bool = False,
+) -> tuple[float, float]:
+    """Train MSGCA-style model (MSGCANoGate, MSGCAWithGLU) và return (test_acc, test_mcc)."""
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.LinearLR(
+        opt, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
+    loader = DataLoader(MSGCADataset(train_data), batch_size=batch_size, shuffle=True)
+
+    best_mcc, best_state = -2.0, None
+    for epoch in range(epochs):
+        model.train()
+        for batch in loader:
+            opt.zero_grad()
             loss = model(
-                batch["s_o"].to(device),
-                batch["s_h"].to(device),
-                batch["s_c"].to(device),
-                batch["s_m"].to(device),
-                batch["s_n_graphs"],
-                batch["label"].to(device),
+                batch["s_o"].to(device), batch["s_h"].to(device),
+                batch["s_c"].to(device), batch["s_m"].to(device),
+                batch["s_n"].to(device), batch["label"].to(device),
                 mode="train",
             )
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            opt.step()
+        if epoch < warmup_epochs:
+            sched.step()
+        if epoch >= 40:
+            _, val_mcc = evaluate_msgca(model, valid_data, batch_size, device)
+            if val_mcc > best_mcc:
+                best_mcc = val_mcc
+                best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            if verbose and (epoch + 1) % 50 == 0:
+                print(f"    epoch {epoch+1}: val_mcc={val_mcc:.4f}")
 
-        if epoch < 10:
-            scheduler.step()
-
-        val_acc, val_mcc = eval_main(model, valid_data_full)
-        if val_mcc > best_val_mcc and epoch >= 50:
-            best_val_mcc = val_mcc
-            best_state   = {k: v.clone() for k, v in model.state_dict().items()}
-
-    if best_state is not None:
+    if best_state:
         model.load_state_dict(best_state)
-
-    test_acc, test_mcc = eval_main(model, test_data_full)
-    return test_acc, test_mcc
+    return evaluate_msgca(model, test_data, batch_size, device)
 
 
 # ──────────────────────────────────────────────────────────────────────
 # Multi-seed runner
 # ──────────────────────────────────────────────────────────────────────
 
-SEEDS = [42, 123, 256, 512, 1024]
-
-
-def run_baseline_multi_seed(
-    model_factory,           # callable() → nn.Module (mới mỗi run)
+def run_multi_seed(
+    model_factory: Callable[[], nn.Module],
     train_data: dict,
     valid_data: dict,
     test_data: dict,
-    model_name: str   = "Model",
-    n_runs: int       = 5,
-    epochs: int       = 200,
-    lr: float         = 1e-4,
-    batch_size: int   = 1024,
-    device: torch.device = None,
-    is_naf: bool      = False,   # True nếu là MSGCA-NAF
+    model_name: str = "Model",
+    is_msgca_style: bool = False,
+    n_runs: int = 5,
+    epochs: int = 200,
+    lr: float = 1e-4,
+    batch_size: int = 512,
+    device=None,
+    verbose: bool = False,
 ) -> dict:
     """
-    Chạy baseline N lần với random seeds khác nhau.
+    Chạy N lần với random seeds khác nhau → mean ± std.
+
+    Parameters
+    ----------
+    is_msgca_style : bool
+        True  → dùng train_msgca_variant (model nhận s_o,s_h,s_c,s_m,s_n,label)
+        False → dùng train_flat (model nhận indicators,s_n,s_m)
 
     Returns
     -------
-    dict với keys:
-      acc_mean, acc_std, mcc_mean, mcc_std,
-      acc_list, mcc_list
+    dict với acc_mean, acc_std, mcc_mean, mcc_std, acc_list, mcc_list
     """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     acc_list, mcc_list = [], []
-    seeds = SEEDS[:n_runs]
+    train_fn = train_msgca_variant if is_msgca_style else train_flat
 
-    for run_idx, seed in enumerate(seeds):
+    for i, seed in enumerate(SEEDS[:n_runs]):
         set_seed(seed)
         model = model_factory()
-
-        if is_naf:
-            acc, mcc = train_msgca_naf(
-                model, train_data, valid_data, test_data,
-                epochs=epochs, lr=lr, batch_size=batch_size, device=device,
-            )
-        else:
-            acc, mcc = train_flat_baseline(
-                model, train_data, valid_data, test_data,
-                epochs=epochs, lr=lr, batch_size=batch_size, device=device,
-            )
-
+        acc, mcc = train_fn(
+            model, train_data, valid_data, test_data,
+            epochs=epochs, lr=lr, batch_size=batch_size, device=device,
+            verbose=verbose,
+        )
         acc_list.append(acc)
         mcc_list.append(mcc)
-        print(f"  [{model_name}] Run {run_idx+1}/{n_runs} | ACC={acc:.4f} | MCC={mcc:.4f}")
+        print(f"  [{model_name}] Run {i+1}/{n_runs} | ACC={acc:.4f} | MCC={mcc:.4f}")
 
     result = {
         "acc_mean": float(np.mean(acc_list)),
@@ -282,7 +280,7 @@ def run_baseline_multi_seed(
         "mcc_list": mcc_list,
     }
     print(
-        f"  ✅ [{model_name}] ACC: {result['acc_mean']:.4f}±{result['acc_std']:.4f} | "
-        f"MCC: {result['mcc_mean']:.4f}±{result['mcc_std']:.4f}"
+        f"  ✓ [{model_name}] ACC={result['acc_mean']:.4f}±{result['acc_std']:.4f} "
+        f"MCC={result['mcc_mean']:.4f}±{result['mcc_std']:.4f}"
     )
     return result
