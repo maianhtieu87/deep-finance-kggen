@@ -154,6 +154,13 @@ class data_prepare:
         unique, counts = np.unique(labels, return_counts=True)
         print(f"  Label distribution: {dict(zip(unique, counts))}")
 
+        # Fix lỗi Nan
+        s_o_all = np.nan_to_num(s_o_all, nan=0.0)
+        s_h_all = np.nan_to_num(s_h_all, nan=0.0)
+        s_c_all = np.nan_to_num(s_c_all, nan=0.0)
+        s_m_all = np.nan_to_num(s_m_all, nan=0.0)
+        s_n_all = np.nan_to_num(s_n_all, nan=0.0)
+
         # Leakage-free normalization (train stats only)
         train_ratio = getattr(TrainConfig, "train_ratio", 0.7)
         valid_ratio = getattr(TrainConfig, "valid_ratio", 0.15)

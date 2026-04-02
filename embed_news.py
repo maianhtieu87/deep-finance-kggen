@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# embed_news_full.py — V7 (Unified: SHA1 + Meta-based cache reading)
+# embed_news.py — V7.1 (Unified: SHA1 + Meta-based cache reading + merge-on-write fix)
 """
 Stage A.5 — News Embedding (UNIFIED VERSION)
 
@@ -21,16 +21,24 @@ V7 changes vs V6 (embed_news_batch.py):
     - Nếu trống → fallback SHA1-based
     - Kết quả merge và dedup
 
+  V7.1 — Merge-on-write fix:
+    Bug V7: khi chạy --ticker TSLA rồi --ticker AAPL rồi --ticker MSFT,
+    mỗi lần ghi đè hoàn toàn news_embeddings.json → chỉ còn MSFT.
+    Fix: khi ticker_filter được set, load existing output rồi merge
+    trước khi ghi. Chỉ (date, ticker) mới được ghi đè — các ticker
+    khác trong file cũ được giữ nguyên.
+
   Output: {"YYYY-MM-DD": {"TICKER": [1024D vector]}}
   Format giống hệt V5 và V6 — backward compatible.
 
 Usage:
-    python embed_news.py                         # toàn bộ
-    python embed_news.py --ticker TSLA           # 1 ticker
-    python embed_news.py --ticker TSLA --date 2022
-    python embed_news.py --ticker TSLA --force-sha1  # chỉ dùng SHA1 (debug)
-    python embed_news.py --ticker TSLA --force-meta  # chỉ dùng _meta (debug)
-    python embed_news.py --check-cache           # kiểm tra cache stats (không embed)
+    python embed_news_full.py                            # toàn bộ (rebuild sạch)
+    python embed_news_full.py --ticker TSLA              # 1 ticker (merge vào file hiện tại)
+    python embed_news_full.py --ticker TSLA --date 2022
+    python embed_news_full.py --ticker TSLA --force-sha1  # chỉ dùng SHA1 (debug)
+    python embed_news_full.py --ticker TSLA --force-meta  # chỉ dùng _meta (debug)
+    python embed_news_full.py --check-cache              # kiểm tra cache stats (không embed)
+    python embed_news_full.py --check-output             # kiểm tra news_embeddings.json hiện tại
 """
 
 from __future__ import annotations
@@ -297,11 +305,9 @@ class CacheStore:
                 n_meta += 1
             elif triples:
                 # Old format: has triples but NO _meta
-                # SHA1 is the filename stem (without .json)
                 sha1 = fname[:-5]
                 self.sha1_no_meta.add(sha1)
                 n_no_meta += 1
-            # files with no triples (empty cache) are skipped
 
         self._loaded = True
         print(f"  Cache scan: {n_meta} new-format (with _meta), "
@@ -349,9 +355,6 @@ class CacheStore:
     ) -> List[Dict]:
         """
         Fallback: SHA1-based lookup (old format files, no _meta).
-
-        Tính SHA1 từ title+content trong DataFrame rows,
-        rồi đọc file {sha1}.json nếu nằm trong sha1_no_meta.
         """
         if not self.sha1_no_meta:
             return []
@@ -372,7 +375,7 @@ class CacheStore:
 
             h = _sha1(full_text)
             if h not in self.sha1_no_meta:
-                continue  # file not in old-format set
+                continue
 
             path = os.path.join(self.cache_dir, f"{h}.json")
             try:
@@ -418,37 +421,48 @@ def _dedup_triples(triples: List[Dict]) -> List[Dict]:
     return result
 
 
-def get_day_triples_unified(
-    day_df:        pd.DataFrame,
-    date_str:      str,
-    ticker:        str,
-    cache_store:   CacheStore,
-    min_relevance: float,
-    min_confidence: float,
-    force_sha1:    bool = False,
-    force_meta:    bool = False,
-) -> List[Dict]:
-    """
-    Unified triple lookup: meta-based + SHA1 fallback.
+# ─────────────────────────────────────────────────────────────────────────────
+# OUTPUT DIAGNOSTICS (--check-output)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Priority:
-      1. Meta-based lookup (new format V5.2+, multi-article cache)
-      2. SHA1-based fallback (old format, no _meta)
-      3. Merge + dedup both results
-    """
-    triples_meta: List[Dict] = []
-    triples_sha1: List[Dict] = []
+def check_output_stats(output_path: str):
+    """In thống kê về news_embeddings.json hiện tại."""
+    print(f"\nOutput file: {output_path}")
+    if not os.path.exists(output_path):
+        print("  Không tồn tại.")
+        return
+    try:
+        with open(output_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"  Lỗi đọc file: {e}")
+        return
 
-    if not force_sha1:
-        triples_meta = cache_store.get_triples_meta(
-            date_str, ticker, min_relevance, min_confidence)
+    print(f"  Tổng số dates: {len(data)}")
+    if not data:
+        return
 
-    if not force_meta:
-        triples_sha1 = cache_store.get_triples_sha1(
-            day_df, ticker, min_relevance, min_confidence)
+    # Collect all tickers
+    all_tickers: Dict[str, int] = {}
+    for date_str, ticker_dict in data.items():
+        for t in ticker_dict:
+            all_tickers[t] = all_tickers.get(t, 0) + 1
 
-    all_triples = triples_meta + triples_sha1
-    return _dedup_triples(all_triples)
+    dates_sorted = sorted(data.keys())
+    print(f"  Date range: {dates_sorted[0]} → {dates_sorted[-1]}")
+    print(f"  Tickers có trong file:")
+    for t, cnt in sorted(all_tickers.items()):
+        print(f"    {t}: {cnt} ngày")
+
+    # Check for zero vectors
+    n_zero = 0
+    n_total = 0
+    for date_str, ticker_dict in data.items():
+        for t, vec in ticker_dict.items():
+            n_total += 1
+            if isinstance(vec, list) and all(v == 0.0 for v in vec[:10]):
+                n_zero += 1
+    print(f"  Zero vectors (no embedding): {n_zero}/{n_total} ({100*n_zero/max(n_total,1):.1f}%)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -507,6 +521,21 @@ def check_cache_stats(cache_dir: str):
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN EMBED LOGIC
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _load_existing_output(output_path: str) -> Dict[str, Dict[str, List[float]]]:
+    """Load existing news_embeddings.json nếu tồn tại. Trả về {} nếu lỗi."""
+    if not os.path.exists(output_path):
+        return {}
+    try:
+        with open(output_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # Validate structure
+        if isinstance(data, dict):
+            return data
+    except Exception as e:
+        print(f"  Warning: could not load existing output ({e}) — starting fresh")
+    return {}
+
 
 def run_embed_news(
     news_df:        pd.DataFrame,
@@ -585,9 +614,14 @@ def run_embed_news(
 
     tickers = sorted(df["equity"].unique())
     mode_str = "sha1-only" if force_sha1 else ("meta-only" if force_meta else "unified (meta + sha1 fallback)")
-    print(f"\nEmbed news V7 (Unified): {len(tickers)} tickers — mode: {mode_str}")
+    print(f"\nEmbed news V7.1 (Unified + merge-on-write): {len(tickers)} tickers — mode: {mode_str}")
     print(f"Cache dir : {cache_dir}")
-    print(f"Output    : {output_path}\n")
+    print(f"Output    : {output_path}")
+    if ticker_filter:
+        print(f"Ticker filter: {ticker_filter.upper()} — will MERGE into existing output")
+    else:
+        print(f"No ticker filter — will REBUILD entire output")
+    print()
 
     # ── Load cache store once ─────────────────────────────────────────────
     cache_store = CacheStore(cache_dir)
@@ -635,7 +669,7 @@ def run_embed_news(
             text = triples_to_text(all_triples, ticker)
             ticker_date_text[(ticker, date_str)] = text
 
-    print(f"\nCache coverage per (ticker, date) pair:")
+    print(f"Cache coverage per (ticker, date) pair:")
     print(f"  Meta-based only (new format):  {stats['meta_only']}")
     print(f"  SHA1-based only (old format):  {stats['sha1_only']}")
     print(f"  Both sources (merged):         {stats['both']}")
@@ -655,21 +689,65 @@ def run_embed_news(
         text_to_emb = {}
         print("\nNo text to embed (all pairs empty).")
 
-    # ── Build output ──────────────────────────────────────────────────────
-    output: Dict[str, Dict[str, List[float]]] = defaultdict(dict)
+    # ── Build new output dict ─────────────────────────────────────────────
+    new_output: Dict[str, Dict[str, List[float]]] = defaultdict(dict)
     for (ticker, date_str), text in ticker_date_text.items():
-        output[date_str][ticker] = text_to_emb.get(text, empty_vec)
+        new_output[date_str][ticker] = text_to_emb.get(text, empty_vec)
 
+    # ── Merge-on-write: load existing output and merge ────────────────────
+    # IMPORTANT: khi chạy per-ticker (--ticker TSLA, --ticker AAPL...),
+    # mỗi lần chỉ compute new_output cho 1 ticker.  Nếu ghi thẳng sẽ xoá
+    # các tickers khác đã embed.  Fix: load existing → merge → ghi.
+    #
+    # Quy tắc merge:
+    #   - existing[date][ticker] được GIỮ NGUYÊN nếu ticker không trong
+    #     current run (ticker_filter khác)
+    #   - existing[date][ticker] bị GHI ĐÈ nếu ticker trong current run
+    #     (fresh computation có thể tốt hơn cached)
+    #   - Khi không có ticker_filter (rebuild toàn bộ): KHÔNG load existing
+    #     (intentional full rebuild)
+
+    if ticker_filter:
+        existing_output = _load_existing_output(output_path)
+        if existing_output:
+            n_existing_tickers = len(set(
+                t for d in existing_output.values() for t in d
+            ))
+            print(f"\nMerging with existing output:")
+            print(f"  Existing: {len(existing_output)} dates, ~{n_existing_tickers} tickers")
+            print(f"  New data: {len(new_output)} dates for {ticker_filter.upper()}")
+
+            # Start from existing, then overwrite with new data
+            merged: Dict[str, Dict[str, List[float]]] = defaultdict(dict)
+            for date_str, ticker_dict in existing_output.items():
+                merged[date_str].update(ticker_dict)
+            for date_str, ticker_dict in new_output.items():
+                merged[date_str].update(ticker_dict)
+
+            final_output = merged
+            n_final_tickers = len(set(
+                t for d in final_output.values() for t in d
+            ))
+            print(f"  Final: {len(final_output)} dates, ~{n_final_tickers} tickers")
+        else:
+            print(f"\nNo existing output found — creating new file for {ticker_filter.upper()}")
+            final_output = new_output
+    else:
+        # Full rebuild: use new_output directly (intentional, no merge)
+        final_output = new_output
+
+    # ── Save ──────────────────────────────────────────────────────────────
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(dict(output), f, ensure_ascii=False)
+        json.dump(dict(final_output), f, ensure_ascii=False)
 
     print(f"\nSaved: {output_path}")
-    print(f"  Dates: {len(output)}")
-    if output:
-        sample_date = next(iter(output))
-        sample_tickers = list(output[sample_date].keys())
+    print(f"  Dates: {len(final_output)}")
+    if final_output:
+        sample_date = next(iter(final_output))
+        sample_tickers = sorted(final_output[sample_date].keys())
         print(f"  Sample ({sample_date}): tickers = {sample_tickers}")
+
     return output_path
 
 
@@ -679,7 +757,7 @@ def run_embed_news(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Stage A.5 — Embed news triples via Voyage (V7 Unified)"
+        description="Stage A.5 — Embed news triples via Voyage (V7.1 Unified + merge-on-write)"
     )
     parser.add_argument("--news",      default=None, help="Path to news parquet")
     parser.add_argument("--cache-dir", default=None, help="Article triple cache dir")
@@ -694,13 +772,22 @@ def main():
                         help="Only use _meta scan (new format only, for debugging)")
     parser.add_argument("--check-cache", action="store_true",
                         help="Print cache stats and exit (no embedding)")
+    parser.add_argument("--check-output", action="store_true",
+                        help="Print current news_embeddings.json stats and exit")
     args = parser.parse_args()
 
     cache_dir = args.cache_dir or GlobalConfig.kg_cache_dir()
+    output_path = args.output or os.path.join(
+        GlobalConfig.INTERIM_PATH, "kg_embeddings", "news_embeddings.json"
+    )
 
-    # ── Check-cache mode ──────────────────────────────────────────────────
+    # ── Check modes ───────────────────────────────────────────────────────
     if args.check_cache:
         check_cache_stats(cache_dir)
+        return
+
+    if args.check_output:
+        check_output_stats(output_path)
         return
 
     # ── Validate ──────────────────────────────────────────────────────────
@@ -720,9 +807,6 @@ def main():
         print("Cannot use --force-sha1 and --force-meta together.")
         sys.exit(1)
 
-    output_path = args.output or os.path.join(
-        GlobalConfig.INTERIM_PATH, "kg_embeddings", "news_embeddings.json"
-    )
     voyage_cache = GlobalConfig.kg_voyage_cache_dir()
 
     df = pd.read_parquet(news_path)

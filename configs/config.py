@@ -108,7 +108,7 @@ class TrainConfig:
     seed          = 42
     use_cuda      = True
     batch_size    = 32
-    epoch_num     = 200
+    epoch_num     = 150
     learning_rate = 1e-4
     weight_decay  = 1e-4
 
@@ -116,34 +116,15 @@ class TrainConfig:
     valid_ratio = 0.15
 
     window_size = 20
-    dim         = 256
+    dim         = 128
     output_dim  = 3
-    num_head    = 4
-
+    num_head    = 2
     news_embed_dim  = 1024
-
-    use_gnn        = False
-    gnn_type       = "gat"
-    gnn_hidden_dim = 128
-    gnn_num_layers = 2
-    gnn_heads      = 4
-    gnn_pool       = "mean"
-
-    kg_node_dim      = 1033
-    kg_edge_attr_dim = 17
 
     use_focal_loss      = True
     focal_gamma         = 2.0
     use_label_smoothing = False
     label_smoothing     = 0.1
-
-    kg_top_triples = 5
-    kg_use_voyage  = True
-    kg_allow_llm   = False
-
-    use_improved_resolver = False
-    resolver_kmeans_k     = 64
-    resolver_min_cluster  = 3
 
     drop_out = 0.1
 
@@ -156,15 +137,10 @@ class ModelConfig:
     macro_lstm_hidden = 64
     macro_lstm_layers = 2
 
-    kg_node_dim      = 1033
-    kg_edge_attr_dim = 17
-    kg_use_gat       = False
-    kg_use_sage      = False
-
-    fusion_num_heads = 4
+    fusion_num_heads = TrainConfig.num_head
     fusion_dropout   = 0.1
 
-    predictor_hidden_dim = 256
+    predictor_hidden_dim = TrainConfig.dim
     predictor_dropout    = 0.1
 
 
@@ -217,7 +193,6 @@ if __name__ == "__main__":
     print(f"Tickers  : {GlobalConfig.TICKERS}")
     print(f"Date     : {GlobalConfig.START_DATE} -> {GlobalConfig.END_DATE}")
     print(f"News dim : {TrainConfig.news_embed_dim} (Voyage-finance-2)")
-    print(f"use_gnn  : {TrainConfig.use_gnn}")
     print(f"KG thresholds: rel>={GlobalConfig.KG_MIN_RELEVANCE}  conf>={GlobalConfig.KG_MIN_CONFIDENCE}")
     print(f"Article  : max_chars={GlobalConfig.KG_MAX_ARTICLE_CHARS}  chunking={GlobalConfig.KG_ENABLE_CHUNKING}")
     print(f"Batch    : chunk_size={GlobalConfig.KG_BATCH_CHUNK_SIZE}")

@@ -29,3 +29,8 @@ baselines/
 *.pt
 *.json
 *.txt
+
+bebug/
+*__pycache__/
+*.json
+*.py

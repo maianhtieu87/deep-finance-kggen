@@ -8,6 +8,10 @@ Thay đổi so với V3:
   - StockMovementModel nhận s_n trực tiếp
 """
 
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
+sys.stderr.reconfigure(encoding='utf-8')
+
 import os
 import random
 import numpy as np
@@ -170,6 +174,12 @@ def train_model(train_data: dict, valid_data: dict, test_data: dict):
         weight_decay=getattr(TrainConfig, "weight_decay", 1e-4),
     )
 
+    # Cosine LR schedule with warm restarts
+    # Important for sequential fusion with conservative gate init (converges slowly)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=30, T_mult=2, eta_min=1e-6
+    )
+
     best_val_mcc = -1.0
     best_val_acc = -1.0
     save_dir  = "output"
@@ -177,12 +187,15 @@ def train_model(train_data: dict, valid_data: dict, test_data: dict):
     save_path = os.path.join(save_dir, "best_model.pt")
 
     print(f"\n  Training on {device} ...")
+    print(f"  LR schedule: CosineAnnealingWarmRestarts(T_0=30, T_mult=2)")
+
+    # --- THÊM BIẾN EARLY STOPPING ---
+    epochs_since_improvement = 0
 
     for epoch in range(int(TrainConfig.epoch_num)):
         model.train()
         total_loss  = 0
         num_batches = 0
-
         for batch in train_loader:
             optimizer.zero_grad()
             loss = model(
@@ -201,20 +214,33 @@ def train_model(train_data: dict, valid_data: dict, test_data: dict):
             num_batches += 1
 
         avg_loss = total_loss / max(num_batches, 1)
-        val_acc, val_mcc = evaluate(model, valid_data)
+        scheduler.step()  # Step LR scheduler each epoch
 
         if (epoch + 1) % 10 == 0:
+            val_acc, val_mcc = evaluate(model, valid_data)
+            current_lr = optimizer.param_groups[0]['lr']
             print(f"  Epoch {epoch+1:03d} | Loss {avg_loss:.4f} | "
-                  f"Val ACC {val_acc:.4f} | Val MCC {val_mcc:.4f}")
+                  f"Val ACC {val_acc:.4f} | Val MCC {val_mcc:.4f} | "
+                  f"LR {current_lr:.2e}")
 
-        is_best = val_mcc > best_val_mcc or (
-            val_mcc == best_val_mcc and val_acc > best_val_acc
-        )
-        if is_best and epoch >= 40:
-            best_val_mcc = val_mcc
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), save_path)
-            print(f"    >>> Best model saved (MCC={val_mcc:.4f} ACC={val_acc:.4f})")
+            is_best = val_mcc > best_val_mcc or (
+                val_mcc == best_val_mcc and val_acc > best_val_acc
+            )
+            
+            if is_best:
+                best_val_mcc = val_mcc
+                best_val_acc = val_acc
+                epochs_since_improvement = 0  # Reset early stopping
+                
+                if epoch >= 9:  # Save from first eval checkpoint
+                    torch.save(model.state_dict(), save_path)
+                    print(f"    >>> Best model saved (MCC={val_mcc:.4f} ACC={val_acc:.4f})")
+            else:
+                epochs_since_improvement += 10 # Cộng 10 vì check mỗi 10 epoch
+            # --- KIỂM TRA EARLY STOPPING ---
+            if epochs_since_improvement > 30:
+                    print(f"    >>> Early stopping at epoch {epoch+1} (No improvement for > 30 epochs)")
+                    break
 
     print("\n  Final evaluation...")
     if os.path.exists(save_path):
@@ -228,7 +254,50 @@ def train_model(train_data: dict, valid_data: dict, test_data: dict):
         print("  No best model saved.")
 
 
+# if __name__ == "__main__":
+#     pkl_path = os.path.join(GlobalConfig.PROCESSED_PATH, "unified_dataset_test.pkl")
+#     print(f"Loading: {pkl_path}")
+
+#     if not os.path.exists(pkl_path):
+#         print("unified_dataset_test.pkl not found. Run main_test.py first.")
+#         raise SystemExit(1)
+
+#     dp = data_prepare(pkl_path)
+
+#     list_train, list_valid, list_test = [], [], []
+#     for ticker in GlobalConfig.TICKERS:
+#         try:
+#             tr, val, te = dp.prepare_data(ticker)
+#             if tr and len(tr.get("label", [])) > 0:
+#                 list_train.append(tr)
+#                 list_valid.append(val)
+#                 list_test.append(te)
+#                 print(f"  {ticker}: Train={len(tr['label'])} "
+#                       f"Valid={len(val.get('label',[]))} "
+#                       f"Test={len(te.get('label',[]))}")
+#         except Exception as e:
+#             print(f"  Skip {ticker}: {e}")
+
+#     final_train = merge_datasets(list_train, shuffle=True)
+#     final_valid = merge_datasets(list_valid, shuffle=False)
+#     final_test  = merge_datasets(list_test,  shuffle=False)
+
+#     if final_train:
+#         # Kiểm tra an toàn trước khi train
+#         for k in ["s_o", "s_h", "s_c", "s_m", "s_n"]:
+#             if torch.isnan(final_train[k]).any():
+#                 print(f"[CẢNH BÁO] Phát hiện NaN trong tensor {k}. Hãy kiểm tra lại data_loader!")
+                
+#         train_model(final_train, final_valid, final_test)
+
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Train Stock Movement Model")
+    parser.add_argument("--epochs", type=int, default=150, help="Number of training epochs")
+    # THÊM CƠ CHẾ --ticker VÀO ĐÂY:
+    parser.add_argument("--ticker", nargs="+", default=None, help="List of tickers to train on, e.g. TSLA AAPL")
+    args = parser.parse_args()
+
     pkl_path = os.path.join(GlobalConfig.PROCESSED_PATH, "unified_dataset_test.pkl")
     print(f"Loading: {pkl_path}")
 
@@ -238,8 +307,16 @@ if __name__ == "__main__":
 
     dp = data_prepare(pkl_path)
 
+    # XỬ LÝ LOGIC TICKER: Nếu người dùng truyền --ticker thì dùng list đó, nếu không thì dùng GlobalConfig
+    if args.ticker:
+        tickers_to_run = [t.upper() for t in args.ticker]
+    else:
+        tickers_to_run = GlobalConfig.TICKERS
+
+    print(f"Running for tickers: {tickers_to_run}")
+
     list_train, list_valid, list_test = [], [], []
-    for ticker in GlobalConfig.TICKERS:
+    for ticker in tickers_to_run:
         try:
             tr, val, te = dp.prepare_data(ticker)
             if tr and len(tr.get("label", [])) > 0:
@@ -252,9 +329,19 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"  Skip {ticker}: {e}")
 
+    if not list_train:
+        print("Không có dữ liệu để train cho các Ticker đã chọn.")
+        raise SystemExit(1)
+
     final_train = merge_datasets(list_train, shuffle=True)
     final_valid = merge_datasets(list_valid, shuffle=False)
     final_test  = merge_datasets(list_test,  shuffle=False)
 
     if final_train:
+        # Kiểm tra an toàn trước khi train
+        for k in ["s_o", "s_h", "s_c", "s_m", "s_n"]:
+            if torch.isnan(final_train[k]).any():
+                print(f"[CẢNH BÁO] Phát hiện NaN trong tensor {k}. Hãy kiểm tra lại data_loader!")
+                
         train_model(final_train, final_valid, final_test)
+
