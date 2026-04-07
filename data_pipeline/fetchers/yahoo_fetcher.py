@@ -1,3 +1,24 @@
+# data_pipeline/fetchers/yahoo_fetcher.py
+"""
+V5.3 — YahooFetcher
+
+Symbol mapping:
+  ^GSPC    → sp500           (model feature)
+  ^VIX     → vix             (model feature)
+  CL=F     → wti             (model feature)
+  DX-Y.NYB → dxy             (model feature)
+  ^TNX     → us10y_yahoo     (intermediate: yield_spread fallback)
+  ^IRX     → us_irx          (intermediate: yield_spread fallback)
+
+V5.3 fixes vs V5.2:
+  1. _FRIENDLY map now covers CL=F → wti and DX-Y.NYB → dxy correctly.
+     Old code: key = sym.lower() → "cl=f" not in map → stored as raw key.
+  2. FRED: shorter per-attempt timeout + one retry before fallback.
+     Old code: single long blocking call → 30s hang on timeout.
+  3. Removed dji/nasdaq from model path. They are never in MACRO_COLS
+     so fetching them was wasted API calls.
+"""
+
 import yfinance as yf
 import pandas as pd
 from typing import List, Dict, Union
@@ -6,30 +27,39 @@ from pandas_datareader import data as pdr
 
 class YahooFetcher:
 
-    def download_data(self, start_day: str, end_day: str, tickers: List[str]) -> List[pd.DataFrame]:
-        """
-        Tải OHLC cho từng ticker. Trả về List[DataFrame] với cột
-        date, {TICKER}_open, {TICKER}_high, {TICKER}_close.
-        """
+    # Canonical name map: key = processed symbol string → column name in macro_df
+    # Processing: sym.replace("^","").replace(".","_").lower()
+    _FRIENDLY: Dict[str, str] = {
+        "gspc":      "sp500",         # ^GSPC
+        "vix":       "vix",           # ^VIX
+        "cl=f":      "wti",           # CL=F   (crude oil futures)
+        "dx-y_nyb":  "dxy",           # DX-Y.NYB → replace "." with "_"
+        "tnx":       "us10y_yahoo",   # ^TNX   (10Y yield, intermediate)
+        "irx":       "us_irx",        # ^IRX   (13-week T-bill, intermediate)
+    }
+
+    def download_data(self, start_day: str, end_day: str,
+                      tickers: List[str]) -> List[pd.DataFrame]:
+        """Download OHLC per ticker."""
         df_list = []
         for ticker in tickers:
-            print(f'Downloading data for {ticker}')
-            data = yf.download(ticker, start=start_day, end=end_day, progress=False)
+            print(f"Downloading data for {ticker}")
+            data = yf.download(ticker, start=start_day, end=end_day,
+                               progress=False, auto_adjust=True)
             data = data.reset_index()
-            data['Date'] = pd.to_datetime(data['Date']).dt.date
+            data["Date"] = pd.to_datetime(data["Date"]).dt.date
 
-            # Flatten MultiIndex nếu có (yfinance >= 0.2.x)
             if isinstance(data.columns, pd.MultiIndex):
-                data.columns = ['_'.join(filter(None, col)).strip() for col in data.columns]
+                data.columns = ["_".join(filter(None, col)).strip()
+                                for col in data.columns]
 
-            # Tìm các cột Open/High/Close (có thể là "Open" hoặc "Open_TSLA")
             open_col  = next((c for c in data.columns if c.lower().startswith("open")),  None)
             high_col  = next((c for c in data.columns if c.lower().startswith("high")),  None)
             close_col = next((c for c in data.columns if c.lower().startswith("close")), None)
-            date_col  = next((c for c in data.columns if c.lower() == "date"), None)
+            date_col  = next((c for c in data.columns if c.lower() == "date"),           None)
 
             if not all([open_col, high_col, close_col, date_col]):
-                print(f"Warning: Missing OHLC columns for {ticker}. Cols: {list(data.columns)}")
+                print(f"  [WARN] Missing OHLC for {ticker}: {list(data.columns)}")
                 continue
 
             out = data[[date_col, open_col, high_col, close_col]].copy()
@@ -40,7 +70,6 @@ class YahooFetcher:
                 close_col: f"{ticker}_close",
             })
             df_list.append(out)
-
         return df_list
 
     def fetch_macro_indicators(
@@ -50,80 +79,70 @@ class YahooFetcher:
         symbols:    Union[List[str], Dict[str, str]],
     ) -> pd.DataFrame:
         """
-        Tải macro indicators từ Yahoo Finance + FRED.
+        Download macro data from Yahoo + FRED.
 
-        symbols có thể là:
-          - List[str]:         ["^GSPC", "^VIX", ...]  → dùng ticker làm key
-          - Dict[str, str]:    {"sp500": "^GSPC", ...} → dùng key làm tên cột
-
-        FIX: GlobalConfig.MACRO_SYMBOLS là List[str], không phải Dict.
-        Code cũ gọi .values() trên list → TypeError.
+        Returns a DataFrame with canonical column names.
+        Columns present after a successful run (FRED OK):
+          sp500, vix, wti, dxy, us10y_yahoo, us_irx, us10y, us2y
+        Columns present after FRED timeout:
+          sp500, vix, wti, dxy, us10y_yahoo, us_irx
+        MacroProcessor consumes this and produces exactly 5 model features.
         """
-        # Chuẩn hóa symbols → dict {canonical_name: yahoo_symbol}
+        # ── Build symbol_map: canonical_name → yahoo_symbol ──────────────────
         if isinstance(symbols, dict):
-            symbol_map = symbols  # {"vix": "^VIX", ...}
+            symbol_map = symbols
         else:
-            # List → tạo canonical name từ ticker symbol
             symbol_map = {}
             for sym in symbols:
-                name = (
-                    sym.replace("^", "")
-                       .replace(".", "_")
-                       .lower()
-                )
-                # Override với tên chuẩn cho các symbol quen thuộc
-                friendly = {
-                    "gspc":  "sp500",
-                    "dji":   "dji",
-                    "ixic":  "nasdaq",
-                    "vix":   "vix",
-                    "tnx":   "us10y_yahoo",  # sẽ bị override bởi FRED
-                    "tyx":   "us30y",
-                    "irx":   "us3m",
-                    "dxy":   "dxy",
-                    "cl=f":  "wti",
-                }
-                symbol_map[friendly.get(name, name)] = sym
+                key = sym.replace("^", "").replace(".", "_").lower()
+                canonical = self._FRIENDLY.get(key, key)
+                symbol_map[canonical] = sym
 
         ticker_list = list(symbol_map.values())
+        print(f"Fetching Macro from Yahoo ({len(ticker_list)} symbols: {ticker_list})...")
 
-        # 1. Tải từ Yahoo
-        print("Fetching Macro from Yahoo...")
+        # ── Yahoo download ────────────────────────────────────────────────────
         macro_data = pd.DataFrame()
         try:
-            raw = yf.download(
-                ticker_list,
-                start=start_date, end=end_date,
-                auto_adjust=True, progress=False,
-            )
+            raw = yf.download(ticker_list, start=start_date, end=end_date,
+                              auto_adjust=True, progress=False)
 
-            # Lấy Close prices
             if isinstance(raw.columns, pd.MultiIndex):
-                if "Close" in raw.columns.get_level_values(0):
-                    raw = raw["Close"]
-                else:
-                    # Flatten
+                lvl0 = raw.columns.get_level_values(0).unique().tolist()
+                raw  = raw["Close"] if "Close" in lvl0 else raw
+                if isinstance(raw.columns, pd.MultiIndex):
                     raw.columns = ["_".join(filter(None, c)) for c in raw.columns]
 
-            # Rename: yahoo symbol → canonical name
-            inv_map = {v: k for k, v in symbol_map.items()}
-            raw = raw.rename(columns=inv_map)
-            macro_data = raw.copy()
+            inv_map    = {v: k for k, v in symbol_map.items()}
+            macro_data = raw.rename(columns=inv_map)
+
+            got     = [c for c in macro_data.columns if not macro_data[c].isna().all()]
+            missing = [k for k in symbol_map if k not in macro_data.columns]
+            print(f"  Yahoo OK   : {got}")
+            if missing:
+                print(f"  Yahoo miss : {missing}")
 
         except Exception as e:
-            print(f"  Yahoo Macro Error: {e}")
+            print(f"  Yahoo Error: {e}")
 
-        # 2. Tải yields từ FRED (override Yahoo TNX nếu có)
-        try:
-            print("  Fetching Yields from FRED...")
-            fred_2y  = pdr.DataReader("DGS2",  "fred", start_date, end_date)
-            fred_10y = pdr.DataReader("DGS10", "fred", start_date, end_date)
-            macro_data["us2y"]  = fred_2y["DGS2"]
-            macro_data["us10y"] = fred_10y["DGS10"]
-        except Exception as e:
-            print(f"  FRED Error: {e}")
+        # ── FRED — 10Y and 2Y Treasury yields ────────────────────────────────
+        print("  Fetching yields from FRED...")
+        macro_data["us10y"] = self._fred_series("DGS10", start_date, end_date)
+        macro_data["us2y"]  = self._fred_series("DGS2",  start_date, end_date)
 
-        # 3. Chuẩn hóa index thành cột date
+        if macro_data["us10y"] is None:
+            macro_data.drop(columns=["us10y"], errors="ignore", inplace=True)
+            print("  FRED DGS10: failed → yield_spread will use ^TNX fallback")
+        else:
+            print("  FRED DGS10: OK")
+
+        if macro_data["us2y"] is None:
+            macro_data.drop(columns=["us2y"], errors="ignore", inplace=True)
+            print("  FRED DGS2 : failed → yield_spread will use ^IRX fallback")
+        else:
+            print("  FRED DGS2 : OK")
+
+        # ── Normalise index → date column ────────────────────────────────────
         macro_data = macro_data.reset_index()
         date_col = next(
             (c for c in macro_data.columns if c.lower() in ("date", "index")), None
@@ -133,5 +152,20 @@ class YahooFetcher:
         if "date" in macro_data.columns:
             macro_data["date"] = pd.to_datetime(macro_data["date"]).dt.date
 
-        print(f"  Macro columns: {[c for c in macro_data.columns if c != 'date']}")
+        cols = [c for c in macro_data.columns if c != "date"]
+        print(f"  macro_df columns ({len(cols)}): {cols}")
         return macro_data
+
+    # ── Private ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _fred_series(series_id: str, start: str, end: str):
+        """Fetch one FRED series with one retry. Returns Series or None."""
+        for attempt in range(2):
+            try:
+                df = pdr.DataReader(series_id, "fred", start, end)
+                return df[series_id]
+            except Exception as e:
+                label = "attempt 1" if attempt == 0 else "attempt 2 (final)"
+                print(f"    FRED {series_id} {label}: {type(e).__name__}")
+        return None

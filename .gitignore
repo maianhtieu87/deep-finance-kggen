@@ -34,3 +34,5 @@ bebug/
 *__pycache__/
 *.json
 *.py
+
+.ipynb
