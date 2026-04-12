@@ -1,23 +1,6 @@
-# src/model_v2.py
+# src/model.py
 """
-StockMovementModel V2 — ticker-aware
-
-Key addition: TickerEmbedding
-  When training across multiple tickers (TSLA, AAPL, AMZN, MSFT, GOOGL),
-  the model faces label noise because the same price pattern (+1%) means
-  UP for AAPL but FLAT for TSLA (different volatility regimes).
-
-  A learned ticker embedding allows the model to:
-  1. Learn different decision boundaries per ticker
-  2. Condition the modality gate on ticker identity (not just price)
-  3. Enable cross-ticker knowledge transfer through shared layers
-
-  Architecture change:
-    ticker_emb (N_TICKERS, dim) → v_t
-    modality_gate: sigmoid(W * [v_i_mean | v_t])   ← was just v_i_mean
-    prediction: [h_fused | h_orig | v_t_broadcast] ← added to predictor input
-
-  Backward compatible: if ticker_id not provided, uses zero embedding (same as original)
+StockMovementModel — ticker-aware
 """
 
 import torch
@@ -26,7 +9,7 @@ import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, matthews_corrcoef
 
 from configs.config import TrainConfig
-from src.data_loader_v6 import N_TICKERS
+from src.data_loader import N_TICKERS # Đã sửa import đúng version
 from encoders.mutil_encoder import MultimodalSourceEncoding
 from src.fusion import StableGatedCrossAttention
 from src.predictor import FinegrainedMovementPrediction
@@ -60,8 +43,6 @@ class StockMovementModel(nn.Module):
         self.dim      = dim
 
         # ── Ticker embedding ──────────────────────────────────────────────────
-        # Small (16D), separate from main dim so it doesn't dominate.
-        # Projected to dim for use in gate and predictor.
         self.ticker_emb = nn.Embedding(n_tickers, ticker_emb_dim, padding_idx=None)
         self.ticker_proj = nn.Sequential(
             nn.Linear(ticker_emb_dim, dim),
@@ -80,13 +61,9 @@ class StockMovementModel(nn.Module):
         self.fusion_stage2 = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
 
         # Modality gate: price context + ticker identity
-        # Original: sigmoid(W_p * price_mean)       → dim → dim
-        # V2:       sigmoid(W * [price_mean | v_t]) → 2*dim → dim
         self.modality_gate = nn.Linear(2 * dim, dim)
 
         # ── Predictor ─────────────────────────────────────────────────────────
-        # V2: predictor input is [h_fused | h_orig | v_t] → 3*dim
-        # Original predictor uses 2*dim internally; we add a projection layer
         self.pre_predict_proj = nn.Sequential(
             nn.Linear(3 * dim, 2 * dim),
             nn.LayerNorm(2 * dim),
@@ -112,7 +89,8 @@ class StockMovementModel(nn.Module):
         label=None,
         mode="train",
         return_preds=False,
-        ticker_id=None,    # (B,) long tensor of ticker indices
+        ticker_id=None,    
+        news_mask=None, **kwargs
     ):
         B = s_o.shape[0]
         T = s_o.shape[1]
@@ -123,13 +101,21 @@ class StockMovementModel(nn.Module):
         s_n = (s_n.to(self.device) if s_n is not None
                else torch.zeros(B, T, self.news_dim, device=self.device))
 
-        # ── Ticker embedding ──────────────────────────────────────────────────
+        # ======================================================================
+        # [TICKER EMBEDDING] - VỊ TRÍ ĐỂ BẬT/TẮT KIỂM CHỨNG (ABLATION STUDY)
+        # ======================================================================
         if ticker_id is not None:
             tid = ticker_id.to(self.device)
         else:
             tid = torch.zeros(B, dtype=torch.long, device=self.device)
 
-        v_t = self.ticker_proj(self.ticker_emb(tid))   # (B, dim)
+        # 1. BẢN FULL (Chạy bình thường để lấy kết quả cao nhất):
+        # v_t = self.ticker_proj(self.ticker_emb(tid))   # (B, dim)
+        v_t = torch.zeros(B, self.dim, device=self.device)
+        # 2. BẢN ABLATION (Tắt Ticker Emb để thầy thấy sự khác biệt)
+        # Bôi đen dòng v_t ở trên, và mở comment dòng dưới đây:
+        # v_t = torch.zeros(B, self.dim, device=self.device)
+        # ======================================================================
 
         # ── Encode modalities ─────────────────────────────────────────────────
         v_m, v_i, v_n = self.multimodal_encoder(s_o, s_h, s_c, s_m, s_n)
@@ -147,14 +133,10 @@ class StockMovementModel(nn.Module):
         H_fused = w * H_news + (1.0 - w) * H_macro           # (B, T, dim)
 
         # ── Ticker-conditioned prediction ─────────────────────────────────────
-        # Broadcast v_t over time dimension and concat
         v_t_seq = v_t.unsqueeze(1).expand(-1, T, -1)         # (B, T, dim)
-
-        # Project [H_fused | v_i_orig | v_t] back to 2*dim for predictor
         combined = torch.cat([H_fused, v_i, v_t_seq], dim=-1)  # (B, T, 3*dim)
         H_final  = self.pre_predict_proj(combined)               # (B, T, 2*dim)
 
-        # Split for predictor (it expects fused_seq and orig_seq of shape (B,T,dim))
         H_pred_fused = H_final[:, :, :self.dim]   # (B, T, dim)
         H_pred_orig  = H_final[:, :, self.dim:]   # (B, T, dim)
 
@@ -181,4 +163,4 @@ class StockMovementModel(nn.Module):
                 return acc, mcc, preds
             return acc, mcc
 
-        return logits  # mode == "logits"
+        return logits

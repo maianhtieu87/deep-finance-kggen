@@ -1,225 +1,309 @@
 # src/data_loader.py
 """
-V4 — Data Loader (Voyage embedding, no GATv2)
-
-Thay đổi so với V3:
-  - Đọc "news_embedding" key thay vì "kg_tensor" key
-  - s_n là tensor (T, 1024) thay vì list of PyG Data objects
-  - _create_zero_news() trả về zeros(1024) thay vì empty graph
-  - Không cần PyG Data, không cần _load_graph_from_path
-
-Luồng:
-  unified_dataset.pkl
-    → date → "news_embedding" → {ticker: [1024D vector]}
-    → s_n_all: (T, window_size, 1024)
-    → model.py: NewsEncoder(1024 → 128) → MSGCA
-
-Fusion order (model.py):
-  price (v_i) → Stage1 MSGCA với news (v_n) → Stage2 MSGCA với macro (v_m) → predict
+ Data Loader (Walk-Forward Validation Support)
 """
 
-import os
 import pickle
-from typing import Optional
-
 import numpy as np
 import pandas as pd
 import torch
 
-from configs.config import TrainConfig, GlobalConfig
+from configs.config import TrainConfig
 
-
-# News embedding dimension: Voyage-3-large output = 1024
 NEWS_EMB_DIM = 1024
+VOL_WINDOW   = 20      
+VOL_FALLBACK = 0.02    
+
+# [TICKER EMBEDDING LOGIC] - Mapping mã chứng khoán ra ID
+ALL_TICKERS  = ["TSLA", "AAPL", "AMZN", "MSFT", "GOOGL",
+                "META", "BA",   "JPM",  "WMT"]
+TICKER_TO_ID = {t: i for i, t in enumerate(ALL_TICKERS)}
+N_TICKERS    = len(ALL_TICKERS)
+
+
+def _extract_float(d, *keys):
+    for k in keys:
+        v = d.get(k) if isinstance(d, dict) else None
+        if v is None: continue
+        if hasattr(v, "iloc"):
+            v = v.iloc[0] if len(v) > 0 else None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            pass
+    return None
 
 
 class data_prepare:
-
-    def __init__(self, dataset_path: str):
+    def __init__(
+        self,
+        dataset_path:      str,
+        price_mode:        str  = "vol_adjusted",
+        label_mode:        str  = "rolling",
+        include_ticker_id: bool = True,
+    ):
         with open(dataset_path, "rb") as f:
             self.raw_data = pickle.load(f)
-        self.window_size = TrainConfig.window_size
-        # news_embed_dim phải khớp với Voyage dim = 1024
-        # model.py: NewsEncoder(1024, dim) — project xuống dim=128 khi train
-        self.news_dim = NEWS_EMB_DIM
-        print(f"Loaded dataset: {len(self.raw_data)} trading days")
-        print(f"News embedding dim: {self.news_dim} (Voyage-3-large)")
+        self.window_size       = TrainConfig.window_size
+        self.news_dim          = NEWS_EMB_DIM
+        self.price_mode        = price_mode
+        self.label_mode        = label_mode
+        self.include_ticker_id = include_ticker_id
+        self._cache_rows       = {} 
 
-    def prepare_data(self, target_ticker: str):
+        print(f"Loaded dataset : {len(self.raw_data)} trading days")
+        print(f"Price mode     : {self.price_mode}")
+        print(f"Label mode     : {self.label_mode}")
+        print(f"Ticker ID      : {'enabled' if include_ticker_id else 'disabled'}")
+
+    def _load_rows(self, target_ticker: str):
+        if target_ticker in self._cache_rows:
+            return self._cache_rows[target_ticker]
+
         dates = sorted(self.raw_data.keys())
         rows  = []
-
         for date_key in dates:
-            day_data   = self.raw_data[date_key]
-            price_data = day_data.get("price", {}).get(target_ticker)
-            if price_data is None:
-                continue
-
-            def _extract(d, *keys):
-                for k in keys:
-                    v = d.get(k) if isinstance(d, dict) else None
-                    if v is not None:
-                        if hasattr(v, "iloc"):
-                            v = v.iloc[0] if len(v) > 0 else None
-                        try:
-                            return float(v)
-                        except (TypeError, ValueError):
-                            pass
-                return None
-
-            s_o = _extract(price_data, "Open",  "open")
-            s_h = _extract(price_data, "High",  "high")
-            s_c = _extract(price_data, "Close", "close")
-            if s_o is None or s_h is None or s_c is None:
-                continue
-
-            macro_data = day_data.get("macro", {})
-
-            # Read news_embedding — 1024D Voyage vector
-            news_emb_dict = day_data.get("news_embedding", {})
-            news_emb = news_emb_dict.get(target_ticker, None)
-
+            day = self.raw_data[date_key]
+            p   = day.get("price", {}).get(target_ticker)
+            if p is None: continue
+            
+            s_o = _extract_float(p, "Open",  "open")
+            s_h = _extract_float(p, "High",  "high")
+            s_c = _extract_float(p, "Close", "close")
+            if None in (s_o, s_h, s_c): continue
+            
             rows.append({
                 "date":     date_key,
                 "s_o":      s_o,
                 "s_h":      s_h,
                 "s_c":      s_c,
-                "macro":    macro_data,
-                "news_emb": news_emb,  # list of 1024 floats or None
+                "macro":    day.get("macro", {}),
+                "news_emb": day.get("news_embedding", {}).get(target_ticker, None),
             })
+            
+        self._cache_rows[target_ticker] = rows
+        return rows
 
+    def get_max_T(self, target_ticker: str) -> int:
+        rows = self._load_rows(target_ticker)
+        if len(rows) < self.window_size + 1: return 0
+        return len(rows) - self.window_size
+
+    def prepare_data(self, target_ticker: str, train_end=None, val_end=None, test_end=None):
+        rows = self._load_rows(target_ticker)
         if len(rows) < self.window_size + 1:
-            print(f"  {target_ticker}: Not enough data ({len(rows)} days)")
             return {}, {}, {}
 
-        print(f"  {target_ticker}: {len(rows)} days with valid price data")
+        T_max = len(rows) - self.window_size
 
-        # Count coverage
-        n_with_news = sum(1 for r in rows if r["news_emb"] and len(r["news_emb"]) > 0)
-        print(f"  News embedding coverage: {n_with_news}/{len(rows)} days")
+        if train_end is None or val_end is None or test_end is None:
+            train_ratio = getattr(TrainConfig, "train_ratio", 0.70)
+            valid_ratio = getattr(TrainConfig, "valid_ratio", 0.15)
+            train_end   = int(T_max * train_ratio)
+            val_end     = int(T_max * (train_ratio + valid_ratio))
+            test_end    = T_max
 
-        # Rolling Quantile Labeling (no look-ahead)
-        close_prices   = pd.Series([r["s_c"] for r in rows])
-        returns_series = close_prices.pct_change().fillna(0)
-        roll_w    = 20
-        roll_low  = returns_series.rolling(roll_w).quantile(0.33).shift(1)
-        roll_high = returns_series.rolling(roll_w).quantile(0.66).shift(1)
+        T = test_end  
 
-        T = len(rows) - self.window_size
+        close_s = pd.Series([r["s_c"] for r in rows])
+        ret_s   = close_s.pct_change().fillna(0)
+        labels  = self._build_labels(ret_s, T, train_end)
 
-        s_o_all = np.zeros((T, self.window_size, 1))
-        s_h_all = np.zeros((T, self.window_size, 1))
-        s_c_all = np.zeros((T, self.window_size, 1))
+        close_arr = np.array([r["s_c"] for r in rows], dtype=np.float64)
+        open_arr  = np.array([r["s_o"] for r in rows], dtype=np.float64)
+        high_arr  = np.array([r["s_h"] for r in rows], dtype=np.float64)
+        s_o_all, s_h_all, s_c_all = self._build_price_features(
+            close_arr, open_arr, high_arr, T, train_end
+        )
 
-        first_macro = rows[0]["macro"]
-        macro_keys  = sorted(first_macro.keys())
-        macro_dim   = len(macro_keys)
-        s_m_all     = np.zeros((T, self.window_size, macro_dim))
+        macro_keys = sorted(rows[0]["macro"].keys())
+        macro_dim  = len(macro_keys)
+        s_m_all    = np.zeros((T, self.window_size, macro_dim), dtype=np.float32)
+        for t in range(T):
+            for w, row in enumerate(rows[t: t + self.window_size]):
+                s_m_all[t, w, :] = [row["macro"].get(k, 0.0) for k in macro_keys]
+        s_m_all = self._znorm(s_m_all, s_m_all[:train_end])
 
-        # s_n_all: (T, window_size, news_dim)
-        s_n_all     = np.zeros((T, self.window_size, self.news_dim))
+        s_n_all, news_mask_all = self._build_news(rows, T, train_end)
 
-        labels = np.zeros(T, dtype=int)
+        for name, arr in [("s_o", s_o_all), ("s_h", s_h_all), ("s_c", s_c_all),
+                          ("s_m", s_m_all), ("s_n", s_n_all)]:
+            n_nan = int(np.isnan(arr).sum())
+            if n_nan > 0: arr[:] = np.nan_to_num(arr, nan=0.0)
+
+        s_o_t  = torch.tensor(s_o_all,      dtype=torch.float32)
+        s_h_t  = torch.tensor(s_h_all,      dtype=torch.float32)
+        s_c_t  = torch.tensor(s_c_all,      dtype=torch.float32)
+        s_m_t  = torch.tensor(s_m_all,      dtype=torch.float32)
+        s_n_t  = torch.tensor(s_n_all,      dtype=torch.float32)
+        mask_t = torch.tensor(news_mask_all, dtype=torch.bool)
+        lbl_t  = torch.tensor(labels,        dtype=torch.long)
+        
+        # [TICKER EMBEDDING LOGIC] - Ép tensor lưu ID
+        tid_t  = torch.full(
+            (T,), TICKER_TO_ID.get(target_ticker, 0), dtype=torch.long
+        )
+
+        def _s(x, a, b): return x[a:b]
+
+        def _make(a, b):
+            if a >= b: return {} 
+            d = {
+                "s_o":       _s(s_o_t,  a, b),
+                "s_h":       _s(s_h_t,  a, b),
+                "s_c":       _s(s_c_t,  a, b),
+                "s_m":       _s(s_m_t,  a, b),
+                "s_n":       _s(s_n_t,  a, b),
+                "news_mask": _s(mask_t, a, b),
+                "label":     _s(lbl_t,  a, b),
+            }
+            # [TICKER EMBEDDING LOGIC] - Đưa id vào dict 
+            if self.include_ticker_id:
+                d["ticker_id"] = _s(tid_t, a, b)
+            return d
+
+        tr = _make(0,         train_end)
+        va = _make(train_end, val_end)
+        te = _make(val_end,   test_end)
+        return tr, va, te
+
+    def _build_price_features(self, close_arr, open_arr, high_arr, T, train_end):
+        if self.price_mode == "vol_adjusted":
+            return self._vol_adjusted(close_arr, open_arr, high_arr, T, train_end)
+        elif self.price_mode == "pct_first":
+            return self._pct_first(close_arr, open_arr, high_arr, T, train_end)
+        else:
+            return self._absolute(close_arr, open_arr, high_arr, T, train_end)
+
+    def _vol_adjusted(self, close_arr, open_arr, high_arr, T, train_end):
+        n = len(close_arr)
+        close_lr = np.zeros(n, dtype=np.float64)
+        open_lr  = np.zeros(n, dtype=np.float64)
+        high_lr  = np.zeros(n, dtype=np.float64)
+        for i in range(1, n):
+            if close_arr[i-1] > 0: close_lr[i] = np.log(close_arr[i] / close_arr[i-1])
+            if open_arr[i-1] > 0:  open_lr[i]  = np.log(open_arr[i]  / open_arr[i-1])
+            if high_arr[i-1] > 0:  high_lr[i]  = np.log(high_arr[i]  / high_arr[i-1])
+
+        realized_vol = np.full(n, VOL_FALLBACK, dtype=np.float64)
+        for i in range(VOL_WINDOW, n):
+            v = close_lr[i - VOL_WINDOW: i].std()
+            realized_vol[i] = max(v, 1e-6)
+        realized_vol[:VOL_WINDOW] = realized_vol[VOL_WINDOW]
+
+        close_va = close_lr / realized_vol
+        open_va  = open_lr  / realized_vol
+        high_va  = high_lr  / realized_vol
+
+        s_o = np.zeros((T, self.window_size, 1), dtype=np.float32)
+        s_h = np.zeros((T, self.window_size, 1), dtype=np.float32)
+        s_c = np.zeros((T, self.window_size, 1), dtype=np.float32)
+        for t in range(T):
+            s_o[t, :, 0] = open_va[t:  t + self.window_size]
+            s_h[t, :, 0] = high_va[t:  t + self.window_size]
+            s_c[t, :, 0] = close_va[t: t + self.window_size]
+
+        s_o = self._znorm(s_o, s_o[:train_end])
+        s_h = self._znorm(s_h, s_h[:train_end])
+        s_c = self._znorm(s_c, s_c[:train_end])
+        return s_o, s_h, s_c
+
+    def _pct_first(self, close_arr, open_arr, high_arr, T, train_end):
+        s_o = np.zeros((T, self.window_size, 1), dtype=np.float32)
+        s_h = np.zeros((T, self.window_size, 1), dtype=np.float32)
+        s_c = np.zeros((T, self.window_size, 1), dtype=np.float32)
+        for t in range(T):
+            base = close_arr[t]
+            if base > 0:
+                s_o[t, :, 0] = open_arr[t:  t + self.window_size]  / base - 1.0
+                s_h[t, :, 0] = high_arr[t:  t + self.window_size]  / base - 1.0
+                s_c[t, :, 0] = close_arr[t: t + self.window_size]  / base - 1.0
+        s_o = self._znorm(s_o, s_o[:train_end])
+        s_h = self._znorm(s_h, s_h[:train_end])
+        s_c = self._znorm(s_c, s_c[:train_end])
+        return s_o, s_h, s_c
+
+    def _absolute(self, close_arr, open_arr, high_arr, T, train_end):
+        s_o = np.zeros((T, self.window_size, 1), dtype=np.float32)
+        s_h = np.zeros((T, self.window_size, 1), dtype=np.float32)
+        s_c = np.zeros((T, self.window_size, 1), dtype=np.float32)
+        for t in range(T):
+            s_o[t, :, 0] = open_arr[t:  t + self.window_size]
+            s_h[t, :, 0] = high_arr[t:  t + self.window_size]
+            s_c[t, :, 0] = close_arr[t: t + self.window_size]
+        s_o = self._znorm(s_o, s_o[:train_end])
+        s_h = self._znorm(s_h, s_h[:train_end])
+        s_c = self._znorm(s_c, s_c[:train_end])
+        return s_o, s_h, s_c
+
+    def _build_news(self, rows, T, train_end):
+        s_n    = np.zeros((T, self.window_size, self.news_dim), dtype=np.float32)
+        mask   = np.ones ((T, self.window_size),                dtype=bool)
 
         for t in range(T):
             for w, row in enumerate(rows[t: t + self.window_size]):
-                s_o_all[t, w, 0] = row["s_o"]
-                s_h_all[t, w, 0] = row["s_h"]
-                s_c_all[t, w, 0] = row["s_c"]
-                s_m_all[t, w, :]  = [row["macro"].get(k, 0) for k in macro_keys]
-
-                # Fill news embedding for this window position
                 emb = row["news_emb"]
-                if emb and len(emb) == self.news_dim:
-                    s_n_all[t, w, :] = emb
-                # else: stays zeros (no news for this day)
+                if emb is None or len(emb) != self.news_dim: continue
+                arr = np.array(emb, dtype=np.float32)
+                if np.allclose(arr, 0): continue
+                s_n[t, w, :]  = arr
+                mask[t, w]    = False
 
-            # Label for day t+window_size
-            idx     = t + self.window_size
-            ret     = returns_series.iloc[idx]
-            r_low   = roll_low.iloc[idx]
-            r_high  = roll_high.iloc[idx]
+        s_n = self._znorm(s_n, s_n[:train_end])
+        s_n[mask] = 0.0
+        return s_n, mask
 
-            if pd.isna(r_low) or pd.isna(r_high):
-                labels[t] = 1
-            elif abs(ret) < 0.001:
-                labels[t] = 1
-            elif ret < r_low:
-                labels[t] = 0
-            elif ret > r_high:
-                labels[t] = 2
-            else:
-                labels[t] = 1
+    def _build_labels(self, ret_s: pd.Series, T: int, train_end: int) -> np.ndarray:
+        if self.label_mode == "rolling":
+            return self._labels_rolling(ret_s, T, train_end)
+        elif self.label_mode == "fixed":
+            return self._labels_fixed(ret_s, T, train_end)
+        elif self.label_mode == "volatility":
+            return self._labels_volatility(ret_s, T, train_end)
+        raise ValueError(f"Unknown label_mode: {self.label_mode!r}")
 
-        unique, counts = np.unique(labels, return_counts=True)
-        print(f"  Label distribution: {dict(zip(unique, counts))}")
+    def _labels_rolling(self, ret_s: pd.Series, T: int, train_end: int) -> np.ndarray:
+        ws    = self.window_size
+        rl    = ret_s.rolling(20).quantile(0.33).shift(1)
+        rh    = ret_s.rolling(20).quantile(0.66).shift(1)
+        tr    = [ret_s.iloc[t + ws] for t in range(train_end)]
+        fb_lo = np.percentile(tr, 33)
+        fb_hi = np.percentile(tr, 66)
+        labels = np.ones(T, dtype=int)
+        for t in range(T):
+            ret = ret_s.iloc[t + ws]
+            lo  = rl.iloc[t + ws]
+            hi  = rh.iloc[t + ws]
+            lo, hi = (fb_lo, fb_hi) if pd.isna(lo) else (lo, hi)
+            if ret < lo:   labels[t] = 0
+            elif ret > hi: labels[t] = 2
+        return labels
 
-        # Fix lỗi Nan
-        s_o_all = np.nan_to_num(s_o_all, nan=0.0)
-        s_h_all = np.nan_to_num(s_h_all, nan=0.0)
-        s_c_all = np.nan_to_num(s_c_all, nan=0.0)
-        s_m_all = np.nan_to_num(s_m_all, nan=0.0)
-        s_n_all = np.nan_to_num(s_n_all, nan=0.0)
+    def _labels_fixed(self, ret_s: pd.Series, T: int, train_end: int) -> np.ndarray:
+        ws    = self.window_size
+        tr    = [ret_s.iloc[t + ws] for t in range(train_end)]
+        q33   = np.percentile(tr, 33)
+        q66   = np.percentile(tr, 66)
+        labels = np.ones(T, dtype=int)
+        for t in range(T):
+            r = ret_s.iloc[t + ws]
+            if r < q33:   labels[t] = 0
+            elif r > q66: labels[t] = 2
+        return labels
 
-        # Leakage-free normalization (train stats only)
-        train_ratio = getattr(TrainConfig, "train_ratio", 0.7)
-        valid_ratio = getattr(TrainConfig, "valid_ratio", 0.15)
-        train_end   = int(T * train_ratio)
-        valid_end   = int(T * (train_ratio + valid_ratio))
+    def _labels_volatility(self, ret_s: pd.Series, T: int, train_end: int) -> np.ndarray:
+        ws  = self.window_size
+        tr  = np.array([ret_s.iloc[t + ws] for t in range(train_end)])
+        thr = 0.5 * tr.std()
+        labels = np.ones(T, dtype=int)
+        for t in range(T):
+            r = ret_s.iloc[t + ws]
+            if r < -thr:  labels[t] = 0
+            elif r > thr: labels[t] = 2
+        return labels
 
-        def _norm_arr(arr, ref):
-            mu  = ref.mean()
-            std = ref.std() + 1e-8
-            return (arr - mu) / std
-
-        s_o_all = _norm_arr(s_o_all, s_o_all[:train_end])
-        s_h_all = _norm_arr(s_h_all, s_h_all[:train_end])
-        s_c_all = _norm_arr(s_c_all, s_c_all[:train_end])
-
-        mu_m  = s_m_all[:train_end].mean(axis=(0, 1), keepdims=True)
-        std_m = s_m_all[:train_end].std( axis=(0, 1), keepdims=True) + 1e-8
-        s_m_all = (s_m_all - mu_m) / std_m
-
-        # Normalize news embedding per-dimension using train stats
-        mu_n  = s_n_all[:train_end].mean(axis=(0, 1), keepdims=True)
-        std_n = s_n_all[:train_end].std( axis=(0, 1), keepdims=True) + 1e-8
-        s_n_all = (s_n_all - mu_n) / std_n
-
-        s_o_t = torch.tensor(s_o_all, dtype=torch.float32)
-        s_h_t = torch.tensor(s_h_all, dtype=torch.float32)
-        s_c_t = torch.tensor(s_c_all, dtype=torch.float32)
-        s_m_t = torch.tensor(s_m_all, dtype=torch.float32)
-        s_n_t = torch.tensor(s_n_all, dtype=torch.float32)
-        lbl_t = torch.tensor(labels,  dtype=torch.long)
-
-        def _split(tensor, a, b):
-            return tensor[a:b]
-
-        train_data = {
-            "s_o": _split(s_o_t, 0, train_end),
-            "s_h": _split(s_h_t, 0, train_end),
-            "s_c": _split(s_c_t, 0, train_end),
-            "s_m": _split(s_m_t, 0, train_end),
-            "s_n": _split(s_n_t, 0, train_end),       # (T_train, window, 1024)
-            "label": _split(lbl_t, 0, train_end),
-        }
-        valid_data = {
-            "s_o": _split(s_o_t, train_end, valid_end),
-            "s_h": _split(s_h_t, train_end, valid_end),
-            "s_c": _split(s_c_t, train_end, valid_end),
-            "s_m": _split(s_m_t, train_end, valid_end),
-            "s_n": _split(s_n_t, train_end, valid_end),
-            "label": _split(lbl_t, train_end, valid_end),
-        }
-        test_data = {
-            "s_o": _split(s_o_t, valid_end, T),
-            "s_h": _split(s_h_t, valid_end, T),
-            "s_c": _split(s_c_t, valid_end, T),
-            "s_m": _split(s_m_t, valid_end, T),
-            "s_n": _split(s_n_t, valid_end, T),
-            "label": _split(lbl_t, valid_end, T),
-        }
-
-        print(f"  {target_ticker}: Train={len(train_data['label'])} "
-              f"Valid={len(valid_data['label'])} Test={len(test_data['label'])}")
-        return train_data, valid_data, test_data
+    @staticmethod
+    def _znorm(arr: np.ndarray, ref: np.ndarray) -> np.ndarray:
+        mu  = ref.mean()
+        std = ref.std() + 1e-8
+        return (arr - mu) / std
