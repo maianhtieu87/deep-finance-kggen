@@ -2,37 +2,46 @@
 __pycache__/
 *.pyc
 *.pyo
+*.ipynb
 
 # Virtual environment
 venv/
 .venv/
 .env/
 
-
 # IDE
 .vscode/
 .idea/
 
-data/
+# Local debug
+debug/
+
+# Generated results
+baselines/results/
+
+# Large artifacts
 *.pt
 *.parquet
 *.log
 *.json
-*.jsonl
-*.md
-*.csv
-*.xlsx
-*.txt
 
-baselines/
-*__pycache__/
-*.pt
-*.json
-*.txt
+# Ignore data contents
+data/**
 
-bebug/
-*__pycache__/
-*.json
-*.py
+# Keep data structure
+!data/
+!data/raw/
+!data/raw/macro/
+!data/raw/market_price/
+!data/raw/price/
+!data/interim/
+!data/processed/
 
-.ipynb
+# Keep placeholders
+!data/.gitkeep
+!data/raw/.gitkeep
+!data/raw/macro/.gitkeep
+!data/raw/market_price/.gitkeep
+!data/raw/price/.gitkeep
+!data/interim/.gitkeep
+!data/processed/.gitkeep

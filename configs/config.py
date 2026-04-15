@@ -30,7 +30,7 @@ class GlobalConfig:
 
 
     START_DATE = "2022-01-01"
-    END_DATE   = "2024-12-31"
+    END_DATE   = "2025-06-23"
 
 
     # TICKERS = ["TSLA", "AAPL", "AMZN", "MSFT", "GOOGL"]
@@ -115,13 +115,13 @@ class TrainConfig:
     train_ratio = 0.7;  
     valid_ratio = 0.15
    
-    window_size = 14;  
+    window_size = 20;  
     dim = 64;  
     output_dim = 3;  
     num_head = 2
     news_embed_dim = 1024
    
-    use_focal_loss = False;  
+    use_focal_loss = True;  
     focal_gamma = 2.0
     use_label_smoothing = False;  
     label_smoothing = 0.1

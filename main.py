@@ -1,6 +1,7 @@
-# main_v3.py
+# main.py
 """
-Training script V3 — Walk-Forward Validation Edition
+Training script — Standard Time Series Split (Train/Val/Test)
+Chạy mặc định 200 epochs.
 """
 
 import sys
@@ -16,6 +17,7 @@ import random
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
+from sklearn.metrics import accuracy_score, matthews_corrcoef
 
 # ĐỒNG BỘ IMPORT VỚI FILE CỦA BẠN
 from src.model import StockMovementModel
@@ -31,11 +33,9 @@ def set_seed(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark     = False
 
-
 device = torch.device(
     "cuda" if TrainConfig.use_cuda and torch.cuda.is_available() else "cpu"
 )
-
 
 class StockDataset(Dataset):
     _BASE_KEYS = ["s_o", "s_h", "s_c", "s_m", "s_n", "news_mask", "label"]
@@ -107,89 +107,28 @@ def evaluate(model: StockMovementModel, data_dict: dict) -> tuple:
                 batch["label"].to(device),
                 mode="test",
                 return_preds=True,
-                # [TICKER EMBEDDING LOGIC] Truyền ID vào khi Test
                 ticker_id=batch.get("ticker_id"),
                 news_mask=batch["news_mask"].to(device),
             )
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(batch["label"].cpu().numpy())
 
-    from sklearn.metrics import accuracy_score, matthews_corrcoef
     return (accuracy_score(all_labels, all_preds),
             matthews_corrcoef(all_labels, all_preds))
 
 
-def train_inner_fold(
-    fold_idx: int,
-    train_data: dict,
-    val_data: dict,
-    include_ticker_id: bool,
-    max_epochs: int = 60
-) -> list:
-    print(f"\n[{fold_idx}] INNER FOLD TRAINING (N_Train={len(train_data['label'])}, N_Val={len(val_data['label'])})")
-    
-    s_m_dim = train_data["s_m"].shape[-1]
-    s_n_dim = train_data["s_n"].shape[-1]
-    cw = compute_class_weights(train_data["label"], suppress_print=True).to(device)
-    
-    ds  = StockDataset(train_data)
-    ldr = DataLoader(ds, batch_size=getattr(TrainConfig, "batch_size", 32), shuffle=True, drop_last=False)
-
-    model = StockMovementModel(
-        price_dim=1, macro_dim=s_m_dim, news_dim=s_n_dim,
-        dim=TrainConfig.dim, input_dim=TrainConfig.window_size,
-        output_dim=3, num_head=TrainConfig.num_head, dropout=0.1,
-        class_weights=cw, use_focal_loss=getattr(TrainConfig, "use_focal_loss", True),
-        focal_gamma=getattr(TrainConfig, "focal_gamma", 2.0),
-        device=device, n_tickers=N_TICKERS,
-    ).to(device)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=getattr(TrainConfig, "learning_rate", 1e-4), weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=30, T_mult=2, eta_min=1e-6)
-
-    mcc_history = []
-    
-    for epoch in range(max_epochs):
-        model.train()
-        for batch in ldr:
-            optimizer.zero_grad()
-            loss = model(
-                batch["s_o"].to(device), batch["s_h"].to(device), batch["s_c"].to(device),
-                batch["s_m"].to(device), batch["s_n"].to(device), batch["label"].to(device),
-                mode="train",
-                # [TICKER EMBEDDING LOGIC] Truyền ID vào khi Train
-                ticker_id=(batch["ticker_id"] if include_ticker_id and "ticker_id" in batch else None),
-                news_mask=batch["news_mask"].to(device),
-            )
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-        
-        scheduler.step()
-        _, val_mcc = evaluate(model, val_data)
-        mcc_history.append(val_mcc)
-        
-        if (epoch + 1) % 20 == 0 or epoch == max_epochs - 1:
-            print(f"  Fold {fold_idx} | Ep {epoch+1:03d}/{max_epochs} | Val MCC {val_mcc:.4f}")
-
-    return mcc_history
-
-
-def retrain_final_model(
-    train_data: dict,
-    test_data: dict,
-    best_epochs: int,
-    include_ticker_id: bool,
-    save_path: str
+def train_and_evaluate(
+    train_data: dict, val_data: dict, test_data: dict,
+    include_ticker_id: bool, max_epochs: int, save_path: str
 ):
-    print(f"\n{'-'*60}\nRETRAINING FINAL MODEL (Epochs: {best_epochs}, N_Train={len(train_data['label'])})")
+    print(f"\n{'-'*60}\nSTANDARD TRAINING (Epochs: {max_epochs}, N_Train={len(train_data['label'])}, N_Val={len(val_data['label'])}, N_Test={len(test_data['label'])})")
     
     s_m_dim = train_data["s_m"].shape[-1]
     s_n_dim = train_data["s_n"].shape[-1]
     cw = compute_class_weights(train_data["label"]).to(device)
     
-    ds  = StockDataset(train_data)
-    ldr = DataLoader(ds, batch_size=getattr(TrainConfig, "batch_size", 32), shuffle=True, drop_last=False)
+    ds_train = StockDataset(train_data)
+    ldr_train = DataLoader(ds_train, batch_size=getattr(TrainConfig, "batch_size", 32), shuffle=True, drop_last=False)
 
     model = StockMovementModel(
         price_dim=1, macro_dim=s_m_dim, news_dim=s_n_dim,
@@ -200,21 +139,24 @@ def retrain_final_model(
         device=device, n_tickers=N_TICKERS,
     ).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=getattr(TrainConfig, "learning_rate", 1e-4), weight_decay=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=getattr(TrainConfig, "learning_rate", 1e-4), weight_decay=getattr(TrainConfig, "weight_decay", 1e-4))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=30, T_mult=2, eta_min=1e-6)
 
     os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
 
-    for epoch in range(best_epochs):
+    best_val_mcc = -1.0
+    best_epoch = 0
+
+    for epoch in range(max_epochs):
         model.train()
         total_loss = 0.0
-        for batch in ldr:
+        
+        for batch in ldr_train:
             optimizer.zero_grad()
             loss = model(
                 batch["s_o"].to(device), batch["s_h"].to(device), batch["s_c"].to(device),
                 batch["s_m"].to(device), batch["s_n"].to(device), batch["label"].to(device),
                 mode="train",
-                # [TICKER EMBEDDING LOGIC] Truyền ID vào khi Retrain
                 ticker_id=(batch["ticker_id"] if include_ticker_id and "ticker_id" in batch else None),
                 news_mask=batch["news_mask"].to(device),
             )
@@ -224,22 +166,34 @@ def retrain_final_model(
             total_loss += loss.item()
         
         scheduler.step()
-        if (epoch + 1) % 10 == 0:
-            print(f"  Retrain | Ep {epoch+1:03d} | Train Loss {total_loss/len(ldr):.4f}")
 
-    torch.save(model.state_dict(), save_path)
-    print(f"\n  Final model saved to {save_path}")
+        # Evaluate on Validation Set
+        val_acc, val_mcc = evaluate(model, val_data)
+        
+        # Chỉ in ra mỗi 5 epochs hoặc khi có checkpoint mới để đỡ rối log
+        if (epoch + 1) % 5 == 0 or epoch == max_epochs - 1:
+            print(f"  Ep {epoch+1:03d}/{max_epochs} | Train Loss {total_loss/len(ldr_train):.4f} | Val ACC: {val_acc:.4f} | Val MCC: {val_mcc:.4f}")
 
-    ta, tm = evaluate(model, test_data)
+        # Save Best Model
+        if val_mcc > best_val_mcc:
+            best_val_mcc = val_mcc
+            best_epoch = epoch + 1
+            torch.save(model.state_dict(), save_path)
+
     print(f"\n{'-'*60}")
-    print(f"FINAL OUTER TEST PERFORMANCE (MÙ HOÀN TOÀN TỪ ĐẦU ĐẾN CUỐI)")
-    print(f"  Test ACC : {ta:.4f}")
-    print(f"  Test MCC : {tm:.4f}")
+    print(f"LOADING BEST MODEL (Epoch {best_epoch} - Val MCC: {best_val_mcc:.4f}) FOR FINAL TEST EVALUATION")
+    
+    # Evaluate on Test Set using Best Model
+    model.load_state_dict(torch.load(save_path))
+    test_acc, test_mcc = evaluate(model, test_data)
+    
+    print(f"  Test ACC : {test_acc:.4f}")
+    print(f"  Test MCC : {test_mcc:.4f}")
     print(f"{'-'*60}\n")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="WF-Train StockMovementModel V3 (P1+P3+P4)")
+    ap = argparse.ArgumentParser(description="Standard Train StockMovementModel (Train/Val/Test)")
     ap.add_argument("--pkl",         default=None)
     ap.add_argument("--price-mode",  default="vol_adjusted",
                     choices=["vol_adjusted", "pct_first", "absolute"])
@@ -248,8 +202,8 @@ def main():
     ap.add_argument("--tickers",     nargs="+", default=None)
     ap.add_argument("--no-ticker-id", action="store_true")
     ap.add_argument("--seed",        type=int, default=42)
-    ap.add_argument("--wf-folds",    type=int, default=3, help="Số lượng Walk-forward Inner Folds")
-    ap.add_argument("--wf-epochs",   type=int, default=60, help="Số max epochs để dò tìm ở Inner Folds")
+    # Cấu hình cứng chạy 200 epoch theo yêu cầu
+    ap.add_argument("--epochs",      type=int, default=200, help="Số lượng Epochs để huấn luyện")
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -274,70 +228,43 @@ def main():
         return
     global_T_max = min(valid_T)
     
-    outer_test_start = int(global_T_max * 0.85)  
-    inner_T = outer_test_start
-    chunk_size = inner_T // (args.wf_folds + 1)
+    # Chia theo mốc thời gian Time-Series dựa trên TrainConfig
+    train_ratio = getattr(TrainConfig, "train_ratio", 0.7)
+    valid_ratio = getattr(TrainConfig, "valid_ratio", 0.15)
+    
+    train_end = int(global_T_max * train_ratio)
+    val_end   = int(global_T_max * (train_ratio + valid_ratio))
 
     print(f"\n{'-'*60}")
-    print(f"WALK-FORWARD LAYOUT (T_max = {global_T_max})")
-    print(f"Outer Test range: [{outer_test_start} : {global_T_max}] (15%)")
-    print(f"Inner Data range: [0 : {outer_test_start}] (85%) divided into {args.wf_folds} anchored folds")
+    print(f"TIME SERIES SPLIT LAYOUT (T_max = {global_T_max})")
+    print(f"Train range: [0 : {train_end}] ({train_ratio*100:.0f}%)")
+    print(f"Val range  : [{train_end} : {val_end}] ({valid_ratio*100:.0f}%)")
+    print(f"Test range : [{val_end} : {global_T_max}] (15%)")
     print(f"{'-'*60}")
 
-    all_folds_mcc = np.zeros((args.wf_folds, args.wf_epochs))
-
-    for k in range(args.wf_folds):
-        train_end = (k + 2) * chunk_size
-        val_end   = (k + 3) * chunk_size
-        if k == args.wf_folds - 1:
-            val_end = inner_T
-
-        print(f"\nBuilding Fold {k+1}/{args.wf_folds} | Train:[0:{train_end}], Val:[{train_end}:{val_end}]")
-        
-        list_train, list_val = [], []
-        for t in tickers:
-            tr, va, _ = dp.prepare_data(t, train_end=train_end, val_end=val_end, test_end=val_end)
-            if tr and len(tr.get("label", [])) > 0:
-                list_train.append(tr)
-                list_val.append(va)
-
-        fold_train = merge_datasets(list_train, shuffle=True)
-        fold_val   = merge_datasets(list_val, shuffle=False)
-
-        fold_mcc = train_inner_fold(
-            fold_idx=k+1, train_data=fold_train, val_data=fold_val,
-            include_ticker_id=include_tid, max_epochs=args.wf_epochs
-        )
-        all_folds_mcc[k, :] = fold_mcc
-
-    avg_mcc_history = np.mean(all_folds_mcc, axis=0)
-    smoothed_mcc = [np.mean(avg_mcc_history[max(0, i-1):min(args.wf_epochs, i+2)]) for i in range(args.wf_epochs)]
-    best_epoch = np.argmax(smoothed_mcc) + 1  
-
-    print(f"\n{'-'*60}")
-    print(f"INNER LOOP COMPLETE.")
-    print(f"Selected Optimal Epoch: {best_epoch} (Avg Smoothed MCC: {smoothed_mcc[best_epoch-1]:.4f})")
-    print(f"{'-'*60}")
-
-    print("\nBuilding Final Retrain & Outer Test Datasets...")
-    list_retrain, list_test = [], []
+    list_train, list_val, list_test = [], [], []
     for t in tickers:
-        tr, _, te = dp.prepare_data(t, train_end=inner_T, val_end=inner_T, test_end=global_T_max)
+        tr, va, te = dp.prepare_data(t, train_end=train_end, val_end=val_end, test_end=global_T_max)
         if tr and len(tr.get("label", [])) > 0:
-            list_retrain.append(tr)
+            list_train.append(tr)
+        if va and len(va.get("label", [])) > 0:
+            list_val.append(va)
+        if te and len(te.get("label", [])) > 0:
             list_test.append(te)
 
-    retrain_data = merge_datasets(list_retrain, shuffle=True)
-    outer_test_data = merge_datasets(list_test, shuffle=False)
+    train_data = merge_datasets(list_train, shuffle=True)
+    val_data   = merge_datasets(list_val, shuffle=False)
+    test_data  = merge_datasets(list_test, shuffle=False)
 
-    tag = f"label={args.label_mode}_price={args.price_mode}{'_notid' if args.no_ticker_id else '_tid'}_seed{args.seed}_wf"
+    tag = f"label={args.label_mode}_price={args.price_mode}{'_notid' if args.no_ticker_id else '_tid'}_seed{args.seed}_standard"
     save_path = f"output/best_model_{tag}.pt"
 
-    retrain_final_model(
-        train_data=retrain_data,
-        test_data=outer_test_data,
-        best_epochs=best_epoch,
+    train_and_evaluate(
+        train_data=train_data,
+        val_data=val_data,
+        test_data=test_data,
         include_ticker_id=include_tid,
+        max_epochs=args.epochs,
         save_path=save_path
     )
 

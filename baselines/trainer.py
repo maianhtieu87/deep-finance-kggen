@@ -2,22 +2,10 @@
 """
 Unified trainer cho flat baselines và MSGCA variants.
 
-━━━ OPTIMIZER POLICY ━━━
-  Baselines (RQ1 fair comparison):
-    Adam, lr=1e-4, weight_decay=1e-5  (paper spec, Section 5.1)
-
-  MSGCA trong RQ1 (fair comparison):
-    Adam, lr=1e-4, weight_decay=1e-4, eps=1e-6
-    CE loss (không dùng Focal Loss để đảm bảo công bằng)
-
-  MSGCA production (main_single_ticker.py):
-    AdamW, FocalLoss, class_weights — xử lý riêng, không qua trainer này
-
-━━━ DATASET INTERFACES ━━━
-  FlatDataset   : (indicators, s_n, s_m, label)
-                  cho Category 1/2/3 baselines
-  MSGCADataset  : dict {s_o, s_h, s_c, s_m, s_n, label}
-                  cho MSGCANoGate, MSGCAWithGLU, StockMovementModel
+CHANGES vs previous:
+  - evaluate_msgca: pass news_mask + ticker_id vào model.forward()
+  - train_msgca_variant: pass news_mask + ticker_id vào model.forward()
+  (Model đã được fix sequential fusion + news_mask bug, trainer phải khớp)
 """
 
 import random
@@ -29,14 +17,9 @@ from sklearn.metrics import accuracy_score, matthews_corrcoef
 from typing import Callable, Dict, List, Optional, Tuple
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Seeds (5 independent runs như paper MSGCA)
-# ─────────────────────────────────────────────────────────────────────────────
-
 SEEDS = [42, 123, 256, 512, 1024]
 
-# Optimizer classes used — referenced by run_experiments.py for print
-FLAT_OPTIMIZER_CLS = torch.optim.Adam
+FLAT_OPTIMIZER_CLS  = torch.optim.Adam
 MSGCA_OPTIMIZER_CLS = torch.optim.Adam
 
 
@@ -55,32 +38,25 @@ def set_seed(seed: int):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FlatDataset(TensorDataset):
-    """
-    Dataset cho flat baselines (Category 1/2/3).
-    Trả về (indicators, s_n, s_m, label).
-    indicators = cat(s_o, s_h, s_c) dim=-1 → (N,W,3)
-    """
-
     def __init__(self, data: dict):
         super().__init__(
-            data["indicators"],  # (N, W, 3)
-            data["s_n"],         # (N, W, 1024)
-            data["s_m"],         # (N, W, M)
-            data["label"],       # (N,)
+            data["indicators"],
+            data["s_n"],
+            data["s_m"],
+            data["label"],
         )
 
 
 class MSGCADataset(Dataset):
-    """Dataset cho MSGCA-style models. Trả về dict."""
-
     def __init__(self, data: dict):
         self.data = data
+        self.keys = [k for k in data if isinstance(data[k], torch.Tensor)]
 
     def __len__(self) -> int:
         return len(self.data["label"])
 
     def __getitem__(self, idx: int) -> dict:
-        return {k: v[idx] for k, v in self.data.items()}
+        return {k: self.data[k][idx] for k in self.keys}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -94,7 +70,6 @@ def evaluate_flat(
     batch_size: int = 512,
     device=None,
 ) -> Tuple[float, float]:
-    """Evaluate flat baseline → (acc, mcc)."""
     if not data or len(data.get("label", [])) == 0:
         return 0.0, 0.0
 
@@ -126,8 +101,9 @@ def evaluate_msgca(
 ) -> Tuple[float, float]:
     """
     Evaluate MSGCA-style model → (acc, mcc).
-    Handles both StockMovementModel (returns acc,mcc,preds)
-    and MSGCANoGate/GLU (returns preds directly).
+
+    FIX: truyền news_mask và ticker_id vào model.forward().
+    Model đã được fix sequential fusion + news_mask, trainer phải khớp.
     """
     if not data or len(data.get("label", [])) == 0:
         return 0.0, 0.0
@@ -147,6 +123,8 @@ def evaluate_msgca(
             batch["label"].to(device),
             mode="test",
             return_preds=True,
+            ticker_id=batch.get("ticker_id"),          # FIX: pass ticker_id
+            news_mask=batch.get("news_mask"),           # FIX: pass news_mask
         )
         # StockMovementModel returns (acc, mcc, preds); ablations return preds only
         if isinstance(result, tuple):
@@ -179,12 +157,6 @@ def train_flat(
     device=None,
     verbose: bool = False,
 ) -> Tuple[float, float]:
-    """
-    Train flat baseline và return (test_acc, test_mcc).
-
-    Optimizer: Adam (paper spec Section 5.1, không dùng AdamW để đúng paper).
-    Loss: CrossEntropyLoss (fair comparison trong RQ1).
-    """
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
@@ -217,11 +189,10 @@ def train_flat(
         if epoch < warmup_epochs:
             sched.step()
 
-        # Checkpoint after warmup phase (epoch >= 40)
         if epoch >= 40:
             _, val_mcc = evaluate_flat(model, valid_data, batch_size, device)
             if val_mcc > best_mcc:
-                best_mcc  = val_mcc
+                best_mcc   = val_mcc
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 epochs_no_improve = 0
             else:
@@ -256,11 +227,9 @@ def train_msgca_variant(
     optimizer_cls=None,
 ) -> Tuple[float, float]:
     """
-    Train MSGCA-style model (MSGCANoGate, MSGCAWithGLU, StockMovementModel).
+    Train MSGCA-style model.
 
-    RQ1/2/3: optimizer_cls=None → dùng MSGCA_OPTIMIZER_CLS (Adam) cho fair comparison.
-    RQ4 production: optimizer_cls=AdamW cho full production setting.
-    CE/Focal loss được set trong model constructor.
+    FIX: truyền news_mask và ticker_id vào model.forward() ở cả train lẫn eval.
     """
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -291,9 +260,10 @@ def train_msgca_variant(
                 batch["s_n"].to(device),
                 batch["label"].to(device),
                 mode="train",
+                ticker_id=batch.get("ticker_id"),      # FIX: pass ticker_id
+                news_mask=batch.get("news_mask"),       # FIX: pass news_mask
             )
             if not torch.isfinite(loss):
-                # Skip bad batch thay vì crash (hiếm nhưng có thể xảy ra)
                 continue
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -305,7 +275,7 @@ def train_msgca_variant(
         if epoch >= 40:
             _, val_mcc = evaluate_msgca(model, valid_data, batch_size, device)
             if val_mcc > best_mcc:
-                best_mcc  = val_mcc
+                best_mcc   = val_mcc
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 epochs_no_improve = 0
             else:
@@ -343,24 +313,8 @@ def run_multi_seed(
     verbose: bool = False,
     optimizer_cls=None,
 ) -> dict:
-    """
-    Chạy N independent seeds → mean ± std theo paper methodology.
-
-    Parameters
-    ----------
-    model_factory   : callable → nn.Module (khởi tạo fresh mỗi run)
-    is_msgca_style  : True  → train_msgca_variant (batch_size default 32)
-                      False → train_flat (batch_size default 512)
-    n_runs          : số runs (paper dùng 5)
-    optimizer_cls   : optional optimizer class override (e.g. AdamW for RQ4)
-
-    Returns
-    -------
-    dict: acc_mean, acc_std, mcc_mean, mcc_std, acc_list, mcc_list
-    """
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Default batch sizes theo paper spec
     if batch_size is None:
         batch_size = 32 if is_msgca_style else 512
 
@@ -371,7 +325,6 @@ def run_multi_seed(
         set_seed(seed)
         model = model_factory()
 
-        # Build kwargs — optimizer_cls chỉ áp dụng cho MSGCA-style
         train_kwargs = dict(
             epochs=epochs, lr=lr, batch_size=batch_size,
             device=device, verbose=verbose,
@@ -396,8 +349,8 @@ def run_multi_seed(
         "mcc_list": mcc_list,
     }
     print(
-        f"  ✓ [{model_name}] "
-        f"ACC={result['acc_mean']:.4f}±{result['acc_std']:.4f}  "
-        f"MCC={result['mcc_mean']:.4f}±{result['mcc_std']:.4f}"
+        f"  [OK] [{model_name}] "
+        f"ACC={result['acc_mean']:.4f}+/-{result['acc_std']:.4f}  "
+        f"MCC={result['mcc_mean']:.4f}+/-{result['mcc_std']:.4f}"
     )
     return result
