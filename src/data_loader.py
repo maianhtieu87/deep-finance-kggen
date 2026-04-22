@@ -1,6 +1,10 @@
 # src/data_loader.py
 """
- Data Loader (Walk-Forward Validation Support)
+Data Loader — V5.6
+
+V5.6 change: NEWS_EMB_DIM now derived from GlobalConfig.news_emb_dim()
+  which reads TrainConfig.news_embedder ("finbert" → 768D, "voyage" → 1024D).
+  No more hardcoded dimension — switch embedder in config.py only.
 """
 
 import pickle
@@ -8,13 +12,14 @@ import numpy as np
 import pandas as pd
 import torch
 
-from configs.config import TrainConfig
+from configs.config import TrainConfig, GlobalConfig
 
-NEWS_EMB_DIM = 1024
-VOL_WINDOW   = 20      
-VOL_FALLBACK = 0.02    
+# Derived from TrainConfig.news_embedder — change config.py only
+NEWS_EMB_DIM = GlobalConfig.news_emb_dim()
 
-# [TICKER EMBEDDING LOGIC] - Mapping mã chứng khoán ra ID
+VOL_WINDOW   = 20
+VOL_FALLBACK = 0.02
+
 ALL_TICKERS  = ["TSLA", "AAPL", "AMZN", "MSFT", "GOOGL",
                 "META", "BA",   "JPM",  "WMT"]
 TICKER_TO_ID = {t: i for i, t in enumerate(ALL_TICKERS)}
@@ -35,6 +40,12 @@ def _extract_float(d, *keys):
 
 
 class data_prepare:
+
+    _EMBEDDER_LABEL = {
+        "finbert": "FinBERT per-triple CLS",
+        "voyage":  "Voyage-finance-2",
+    }
+
     def __init__(
         self,
         dataset_path:      str,
@@ -49,11 +60,15 @@ class data_prepare:
         self.price_mode        = price_mode
         self.label_mode        = label_mode
         self.include_ticker_id = include_ticker_id
-        self._cache_rows       = {} 
+        self._cache_rows       = {}
+
+        embedder       = TrainConfig.news_embedder
+        embedder_label = self._EMBEDDER_LABEL.get(embedder, embedder)
 
         print(f"Loaded dataset : {len(self.raw_data)} trading days")
         print(f"Price mode     : {self.price_mode}")
         print(f"Label mode     : {self.label_mode}")
+        print(f"News embed dim : {self.news_dim}D ({embedder_label})")
         print(f"Ticker ID      : {'enabled' if include_ticker_id else 'disabled'}")
 
     def _load_rows(self, target_ticker: str):
@@ -66,12 +81,12 @@ class data_prepare:
             day = self.raw_data[date_key]
             p   = day.get("price", {}).get(target_ticker)
             if p is None: continue
-            
+
             s_o = _extract_float(p, "Open",  "open")
             s_h = _extract_float(p, "High",  "high")
             s_c = _extract_float(p, "Close", "close")
             if None in (s_o, s_h, s_c): continue
-            
+
             rows.append({
                 "date":     date_key,
                 "s_o":      s_o,
@@ -80,7 +95,7 @@ class data_prepare:
                 "macro":    day.get("macro", {}),
                 "news_emb": day.get("news_embedding", {}).get(target_ticker, None),
             })
-            
+
         self._cache_rows[target_ticker] = rows
         return rows
 
@@ -103,7 +118,7 @@ class data_prepare:
             val_end     = int(T_max * (train_ratio + valid_ratio))
             test_end    = T_max
 
-        T = test_end  
+        T = test_end
 
         close_s = pd.Series([r["s_c"] for r in rows])
         ret_s   = close_s.pct_change().fillna(0)
@@ -138,8 +153,7 @@ class data_prepare:
         s_n_t  = torch.tensor(s_n_all,      dtype=torch.float32)
         mask_t = torch.tensor(news_mask_all, dtype=torch.bool)
         lbl_t  = torch.tensor(labels,        dtype=torch.long)
-        
-        # [TICKER EMBEDDING LOGIC] - Ép tensor lưu ID
+
         tid_t  = torch.full(
             (T,), TICKER_TO_ID.get(target_ticker, 0), dtype=torch.long
         )
@@ -147,7 +161,7 @@ class data_prepare:
         def _s(x, a, b): return x[a:b]
 
         def _make(a, b):
-            if a >= b: return {} 
+            if a >= b: return {}
             d = {
                 "s_o":       _s(s_o_t,  a, b),
                 "s_h":       _s(s_h_t,  a, b),
@@ -157,7 +171,6 @@ class data_prepare:
                 "news_mask": _s(mask_t, a, b),
                 "label":     _s(lbl_t,  a, b),
             }
-            # [TICKER EMBEDDING LOGIC] - Đưa id vào dict 
             if self.include_ticker_id:
                 d["ticker_id"] = _s(tid_t, a, b)
             return d
@@ -237,8 +250,8 @@ class data_prepare:
         return s_o, s_h, s_c
 
     def _build_news(self, rows, T, train_end):
-        s_n    = np.zeros((T, self.window_size, self.news_dim), dtype=np.float32)
-        mask   = np.ones ((T, self.window_size),                dtype=bool)
+        s_n  = np.zeros((T, self.window_size, self.news_dim), dtype=np.float32)
+        mask = np.ones ((T, self.window_size),                dtype=bool)
 
         for t in range(T):
             for w, row in enumerate(rows[t: t + self.window_size]):
@@ -262,7 +275,7 @@ class data_prepare:
             return self._labels_volatility(ret_s, T, train_end)
         raise ValueError(f"Unknown label_mode: {self.label_mode!r}")
 
-    def _labels_rolling(self, ret_s: pd.Series, T: int, train_end: int) -> np.ndarray:
+    def _labels_rolling(self, ret_s, T, train_end):
         ws    = self.window_size
         rl    = ret_s.rolling(20).quantile(0.33).shift(1)
         rh    = ret_s.rolling(20).quantile(0.66).shift(1)
@@ -279,7 +292,7 @@ class data_prepare:
             elif ret > hi: labels[t] = 2
         return labels
 
-    def _labels_fixed(self, ret_s: pd.Series, T: int, train_end: int) -> np.ndarray:
+    def _labels_fixed(self, ret_s, T, train_end):
         ws    = self.window_size
         tr    = [ret_s.iloc[t + ws] for t in range(train_end)]
         q33   = np.percentile(tr, 33)
@@ -291,7 +304,7 @@ class data_prepare:
             elif r > q66: labels[t] = 2
         return labels
 
-    def _labels_volatility(self, ret_s: pd.Series, T: int, train_end: int) -> np.ndarray:
+    def _labels_volatility(self, ret_s, T, train_end):
         ws  = self.window_size
         tr  = np.array([ret_s.iloc[t + ws] for t in range(train_end)])
         thr = 0.5 * tr.std()

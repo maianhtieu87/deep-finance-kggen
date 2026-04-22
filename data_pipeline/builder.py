@@ -1,20 +1,18 @@
 # data_pipeline/builder.py
 """
-V5.2 — DatasetBuilder
+V5.6 — DatasetBuilder
 
-V5.2 change vs V4:
-  - REMOVED kg_tensor key entirely (GATv2 pipeline deleted since V4)
-  - Cleaner output: only price, macro, news, news_embedding, filing_q, filing_k
-
-Format news_embeddings.json:
-  {"YYYY-MM-DD": {"TSLA": [0.12, -0.34, ...], "AAPL": [...]}}
+V5.6: Embedding path and expected dim are now derived from GlobalConfig.news_emb_path()
+and GlobalConfig.news_emb_dim() based on TrainConfig.news_embedder.
+Switch embedder by changing TrainConfig.news_embedder in configs/config.py.
 """
 
 import os
 import json
 import pickle
 import pandas as pd
-from configs.config import GlobalConfig as Config
+from configs.config import GlobalConfig as Config, TrainConfig
+from src.data_loader import NEWS_EMB_DIM
 
 
 class DatasetBuilder:
@@ -26,12 +24,17 @@ class DatasetBuilder:
         embedding_path,
     ):
         """
-        Sync price + macro + news_embedding (1024D) + filings.
+        Sync price + macro + news_embedding + filings.
 
-        embedding_path: path to news_embeddings.json
-          Format: {"YYYY-MM-DD": {"TSLA": [1024D vector]}}
+        embedding_path: path to news_embeddings JSON.
+          Auto-resolved from TrainConfig.news_embedder if not given.
+          - finbert → news_embeddings_finbert.json (768D)
+          - voyage  → news_embeddings_voyage.json  (1024D)
+
+        V5.6: Validates embedding dimension against NEWS_EMB_DIM derived
+        from the active embedder. Non-matching vectors are rejected so
+        news_mask correctly marks them as missing.
         """
-
         # 0) Filings (optional)
         if filing_path and os.path.exists(filing_path):
             filing_df = pd.read_parquet(filing_path)
@@ -59,8 +62,14 @@ class DatasetBuilder:
             if c not in news_df.columns:
                 news_df[c] = None
 
-        # 1) Load news_embeddings.json
+        # 1) Load news embeddings JSON
         embedding_data: dict = {}
+        n_dim_mismatch = 0
+        # Auto-resolve path if not supplied
+        if not embedding_path:
+            embedding_path = Config.news_emb_path()
+        _embedder_label = {"finbert": "FinBERT per-triple CLS", "voyage": "Voyage-finance-2"}
+        _label = _embedder_label.get(TrainConfig.news_embedder, TrainConfig.news_embedder)
         if embedding_path and os.path.exists(embedding_path):
             print(f"Loading news embeddings from {embedding_path}...")
             with open(embedding_path, "r", encoding="utf-8") as f:
@@ -68,9 +77,10 @@ class DatasetBuilder:
             for k, v in raw.items():
                 embedding_data[str(k)[:10]] = v
             print(f"  Loaded {len(embedding_data)} dates")
+            print(f"  Embedder: {_label} | Expected dim: {NEWS_EMB_DIM}D")
         else:
-            print(f"  news_embeddings.json not found at {embedding_path}")
-            print("  Run embed_news.py first: python embed_news.py")
+            print(f"  news embeddings not found at {embedding_path}")
+            print(f"  Run: python embed_news.py {'--finbert' if TrainConfig.news_embedder == 'finbert' else ''}")
 
         synchronized_data = {}
         mapping = Config.TICKER_MAPPING
@@ -91,7 +101,7 @@ class DatasetBuilder:
             # 2.2 Macro
             synchronized_data[date_obj]["macro"] = data.get("macro", {})
 
-            # 2.3 News objects (for reference only — not fed to model directly)
+            # 2.3 News objects (for reference only)
             synchronized_data[date_obj]["news"] = {}
             if len(news_df) > 0:
                 date_news = news_df[news_df["date"] == date_dt]
@@ -102,11 +112,9 @@ class DatasetBuilder:
                             ["title", "content", "summary", "source", "url"]
                         ].to_dict(orient="records")
                         synchronized_data[date_obj]["news"].setdefault(clean_ticker, [])
-                        synchronized_data[date_obj]["news"][clean_ticker].extend(
-                            news_records
-                        )
+                        synchronized_data[date_obj]["news"][clean_ticker].extend(news_records)
 
-            # 2.4 News embeddings (1024D Voyage vectors — fed to model via NewsEncoder)
+            # 2.4 News embeddings (dim depends on active embedder)
             synchronized_data[date_obj]["news_embedding"] = {}
 
             if date_str in embedding_data:
@@ -114,8 +122,12 @@ class DatasetBuilder:
                 for raw_ticker, emb in day_embs.items():
                     if raw_ticker in mapping:
                         clean_ticker = mapping[raw_ticker]
-                        if isinstance(emb, list) and len(emb) > 0:
+                        if isinstance(emb, list) and len(emb) == NEWS_EMB_DIM:
                             synchronized_data[date_obj]["news_embedding"][clean_ticker] = emb
+                        elif isinstance(emb, list) and len(emb) > 0:
+                            # Dimension mismatch — reject to avoid silent errors
+                            n_dim_mismatch += 1
+                            synchronized_data[date_obj]["news_embedding"][clean_ticker] = []
                         else:
                             synchronized_data[date_obj]["news_embedding"][clean_ticker] = []
 
@@ -137,6 +149,12 @@ class DatasetBuilder:
                         if k_txt:
                             synchronized_data[date_obj]["filing_k"][clean_ticker] = \
                                 " ".join(k_txt)
+
+        if n_dim_mismatch > 0:
+            print(f"  [WARN] {n_dim_mismatch} embeddings rejected: wrong dimension "
+                  f"(expected {NEWS_EMB_DIM}D). "
+                  f"Rebuild with: python embed_news.py "
+                  f"{'--finbert' if TrainConfig.news_embedder == 'finbert' else '(no --finbert for Voyage)'}")
 
         return synchronized_data
 

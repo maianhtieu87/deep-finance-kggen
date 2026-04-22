@@ -117,6 +117,55 @@ def evaluate(model: StockMovementModel, data_dict: dict) -> tuple:
             matthews_corrcoef(all_labels, all_preds))
 
 
+# def pretrain_news_branch(model: StockMovementModel, ldr: DataLoader, device: torch.device, include_ticker_id: bool, epochs: int = 50):
+#     print(f"\n{'-'*60}\n--- STAGE 1: Pre-training News Branch ({epochs} Epochs) ---")
+    
+#     # 1. Freeze all parameters
+#     for param in model.parameters():
+#         param.requires_grad = False
+        
+#     # 2. Unfreeze specific layers for Stage 1
+#     for param in model.multimodal_encoder.news_encoder.parameters():
+#         param.requires_grad = True
+#     for param in model.fusion_stage1.parameters():
+#         param.requires_grad = True
+#     for param in model.pre_predict_proj.parameters():
+#         param.requires_grad = True
+#     for param in model.movement_predictor.parameters():
+#         param.requires_grad = True
+
+#     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4, weight_decay=1e-4)
+
+#     model.train()
+#     for epoch in range(epochs):
+#         total_loss = 0.0
+#         for batch in ldr:
+#             optimizer.zero_grad()
+#             loss = model(
+#                 batch["s_o"].to(device), batch["s_h"].to(device), batch["s_c"].to(device),
+#                 batch["s_m"].to(device), batch["s_n"].to(device), batch["label"].to(device),
+#                 mode="train",
+#                 ticker_id=(batch["ticker_id"] if include_ticker_id and "ticker_id" in batch else None),
+#                 news_mask=batch["news_mask"].to(device),
+#             )
+#             if not torch.isfinite(loss):
+#                 continue
+#             loss.backward()
+#             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+#             optimizer.step()
+#             total_loss += loss.item()
+            
+#         if (epoch + 1) % 5 == 0 or epoch == epochs - 1:
+#             print(f"  Pre-train epoch {epoch+1:03d}/{epochs} | Loss {total_loss/len(ldr):.4f}")
+
+#     # 3. Unfreeze all for Stage 2
+#     for param in model.parameters():
+#         param.requires_grad = True
+        
+#     print(f"--- Stage 1 Complete. Unfreezing all parameters for Stage 2 ---\n{'-'*60}")
+
+
+
 def train_and_evaluate(
     train_data: dict, val_data: dict, test_data: dict,
     include_ticker_id: bool, max_epochs: int, save_path: str
@@ -146,6 +195,9 @@ def train_and_evaluate(
 
     best_val_mcc = -1.0
     best_epoch = 0
+
+    # Execute Stage 1: Pre-training the news branch
+    # pretrain_news_branch(model, ldr_train, device, include_ticker_id, epochs=50)
 
     for epoch in range(max_epochs):
         model.train()

@@ -1,24 +1,13 @@
 # baselines/data_adapter.py
 """
-BaselineDataAdapter — V5.3
+BaselineDataAdapter — V5.4
 
-Wrapper mỏng quanh src.data_loader.data_prepare.
-Thêm key 'indicators' = cat(s_o, s_h, s_c) để baselines dùng dạng (B, W, 3).
-
-V5.3 mapping (khớp với pipeline hiện tại, không dùng PyG/GNN):
-  indicators   (B, W, 3)    — giá OHLC ghép    ← "indicator sequence"
-  s_n          (B, W, 1024) — Voyage embeddings ← "dynamic document"
-  s_m          (B, W, M)    — macro indicators  ← "market context" (thay graph)
-  label        (B,)         — 0=DOWN,1=FLAT,2=UP
-
-Lý do không dùng lại data_adapter.py cũ:
-  - Cũ dùng kg_tensor (PyG graphs) → không tồn tại trong V5.3
-  - Cũ dùng 128D GNN embedding → V5.3 dùng 1024D Voyage
-  - Cũ import KGGraphEncoder → bị xóa từ V4
+V5.4 change: news_dim updated to 768 (FinBERT) in docstring.
+No structural change — news_dim is read from data dynamically.
 """
 
 import torch
-from src.data_loader import data_prepare
+from src.data_loader import data_prepare, NEWS_EMB_DIM
 from configs.config import GlobalConfig
 
 
@@ -26,25 +15,12 @@ def prepare_for_baselines(pkl_path: str, ticker: str) -> tuple[dict, dict, dict]
     """
     Load và chuẩn bị dữ liệu cho tất cả baseline models.
 
-    Tái sử dụng hoàn toàn data_prepare.prepare_data() — không duplicate logic.
-    Chỉ thêm key 'indicators' cho convenience.
-
-    Parameters
-    ----------
-    pkl_path : str
-        Path đến unified_dataset.pkl
-    ticker : str
-        Ticker symbol, e.g. "TSLA"
-
-    Returns
-    -------
-    train_data, valid_data, test_data : dict
-        Mỗi dict chứa:
-            s_o, s_h, s_c  : (N, W, 1)     — giá riêng
-            s_m            : (N, W, M)     — macro
-            s_n            : (N, W, 1024)  — Voyage news embeddings
-            label          : (N,)          — 0/1/2
-            indicators     : (N, W, 3)     — cat(s_o, s_h, s_c) cho flat baselines
+    Returns dicts with:
+        s_o, s_h, s_c  : (N, W, 1)
+        s_m            : (N, W, M)
+        s_n            : (N, W, 768)  — FinBERT news embeddings (V5.4)
+        label          : (N,)
+        indicators     : (N, W, 3)    — cat(s_o, s_h, s_c)
     """
     dp = data_prepare(pkl_path)
     train, valid, test = dp.prepare_data(ticker)
@@ -53,7 +29,7 @@ def prepare_for_baselines(pkl_path: str, ticker: str) -> tuple[dict, dict, dict]
         if split and len(split.get("label", [])) > 0:
             split["indicators"] = torch.cat(
                 [split["s_o"], split["s_h"], split["s_c"]], dim=-1
-            )  # (N, W, 3)
+            )
 
     return train, valid, test
 
@@ -62,18 +38,6 @@ def merge_tickers(
     splits_per_ticker: dict[str, tuple[dict, dict, dict]],
     shuffle_train: bool = True,
 ) -> tuple[dict, dict, dict]:
-    """
-    Gộp data nhiều tickers thành một dataset.
-
-    Parameters
-    ----------
-    splits_per_ticker : {ticker: (train, valid, test)}
-    shuffle_train     : bool — shuffle train sau khi gộp
-
-    Returns
-    -------
-    (merged_train, merged_valid, merged_test)
-    """
     def _merge(dicts):
         if not dicts:
             return {}
@@ -101,12 +65,6 @@ def merge_tickers(
 
 
 def load_all_available_tickers(pkl_path: str) -> tuple[dict, dict, dict]:
-    """
-    Load tất cả tickers có trong GlobalConfig.TICKERS.
-    Skip ticker nào không có đủ data (ít nhất 100 training samples).
-
-    Returns merged train/valid/test.
-    """
     splits = {}
     for ticker in GlobalConfig.TICKERS:
         try:
@@ -115,7 +73,8 @@ def load_all_available_tickers(pkl_path: str) -> tuple[dict, dict, dict]:
                 splits[ticker] = (tr, va, te)
                 n_train = len(tr["label"])
                 n_news  = int((tr["s_n"].abs().sum(dim=-1).sum(dim=-1) > 0).sum())
-                print(f"  {ticker}: {n_train} train  news_coverage={n_news}/{n_train}")
+                print(f"  {ticker}: {n_train} train  news_coverage={n_news}/{n_train}  "
+                      f"news_dim={tr['s_n'].shape[-1]}D")
             else:
                 print(f"  {ticker}: skip (insufficient data)")
         except Exception as e:

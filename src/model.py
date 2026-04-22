@@ -2,12 +2,10 @@
 """
 StockMovementModel — Sequential Gated Cross-Attention (paper-compliant)
 
-Thay đổi so với phiên bản cũ:
-  1. [Bug 1 fixed]  news_mask được pass vào fusion_stage1 thay vì bị bỏ qua.
-  2. [Bug 2 fixed]  ticker_emb được dùng thật sự (không còn zeros).
-  3. [Sequential]   Stage 2 dùng H_id (output stage 1) làm primary,
-                    đúng theo Eq. 15-19 của paper MSGCA.
-  4. [Removed]      modality_gate bị bỏ — không còn parallel combine.
+V3 changes:
+  1. news_mask passed into multimodal_encoder (for NewsEncoder temporal_attn)
+  2. news_dim default updated to 768 (FinBERT CLS)
+  3. All other logic unchanged
 """
 
 import torch
@@ -43,7 +41,7 @@ class StockMovementModel(nn.Module):
         macro_dim: int,
         news_dim:  int,
         dim:       int,
-        input_dim: int,       # = window_size
+        input_dim: int,
         output_dim: int,
         num_head:  int,
         device,
@@ -51,7 +49,7 @@ class StockMovementModel(nn.Module):
         class_weights=None,
         use_focal_loss: bool  = True,
         focal_gamma:    float = 2.0,
-        use_gnn:        bool  = False,   # legacy compat, unused
+        use_gnn:        bool  = False,
         n_tickers:      int   = N_TICKERS,
         ticker_emb_dim: int   = 16,
     ):
@@ -60,8 +58,7 @@ class StockMovementModel(nn.Module):
         self.news_dim = news_dim
         self.dim      = dim
 
-        # ── Ticker embedding ──────────────────────────────────────────────────
-        # 9 tickers → 16D → projected to dim
+        # Ticker embedding
         self.ticker_emb  = nn.Embedding(n_tickers, ticker_emb_dim, padding_idx=None)
         self.ticker_proj = nn.Sequential(
             nn.Linear(ticker_emb_dim, dim),
@@ -69,7 +66,7 @@ class StockMovementModel(nn.Module):
             nn.Tanh(),
         )
 
-        # ── Encoders ──────────────────────────────────────────────────────────
+        # Encoders (news_dim = 768 for FinBERT, was 1024 for Voyage)
         self.multimodal_encoder = MultimodalSourceEncoding(
             price_dim=price_dim,
             macro_dim=macro_dim,
@@ -78,15 +75,11 @@ class StockMovementModel(nn.Module):
             dropout=dropout,
         )
 
-        # ── Sequential Gated Cross-Attention Fusion ───────────────────────────
-        # Stage 1: price (primary) × news  (aux)  → H_id      [Eq. 10-14]
-        # Stage 2: H_id  (primary) × macro (aux)  → H_idm     [Eq. 15-19]
+        # Sequential Gated Cross-Attention Fusion
         self.fusion_stage1 = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
         self.fusion_stage2 = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
 
-        # ── Predictor ─────────────────────────────────────────────────────────
-        # Input: cat(H_idm, v_i, v_t_seq) → (B, T, 3*dim)
-        # Khớp với paper Eq. 20: h = h_{i,d,m} ⊕ h_i, plus ticker bias
+        # Predictor
         self.pre_predict_proj = nn.Sequential(
             nn.Linear(3 * dim, 2 * dim),
             nn.LayerNorm(2 * dim),
@@ -100,13 +93,12 @@ class StockMovementModel(nn.Module):
             dropout=dropout,
         )
 
-        # ── Loss ──────────────────────────────────────────────────────────────
+        # Loss
         if use_focal_loss:
             self.loss_fn = FocalLoss(alpha=class_weights, gamma=focal_gamma)
         else:
             self.loss_fn = nn.CrossEntropyLoss(weight=class_weights)
 
-        # ── Weight init ────────────────────────────────────────────────────────
         nn.init.normal_(self.ticker_emb.weight, mean=0.0, std=0.02)
 
     def forward(
@@ -122,7 +114,6 @@ class StockMovementModel(nn.Module):
         B = s_o.shape[0]
         T = s_o.shape[1]
 
-        # ── Move inputs to device ─────────────────────────────────────────────
         s_o = s_o.to(self.device)
         s_h = s_h.to(self.device)
         s_c = s_c.to(self.device)
@@ -130,45 +121,43 @@ class StockMovementModel(nn.Module):
         s_n = (s_n.to(self.device) if s_n is not None
                else torch.zeros(B, T, self.news_dim, device=self.device))
 
-        # ── Ticker embedding [Bug 2 fixed] ────────────────────────────────────
-        # Dùng ticker_id thật sự thay vì zeros
+        # Ticker embedding
         if ticker_id is not None:
             tid = ticker_id.to(self.device)
         else:
             tid = torch.zeros(B, dtype=torch.long, device=self.device)
-        v_t = self.ticker_proj(self.ticker_emb(tid))   # (B, dim)
+        v_t = self.ticker_proj(self.ticker_emb(tid))  # (B, dim)
 
-        # ── Encode modalities ─────────────────────────────────────────────────
-        v_m, v_i, v_n = self.multimodal_encoder(s_o, s_h, s_c, s_m, s_n)
-        if v_n is None:
-            v_n = torch.zeros_like(v_i)
-
-        # ── Sequential Gated Fusion [Bug 1 fixed + Sequential design] ─────────
-        # news_mask: (B, T) bool, True = ngày không có tin → loại khỏi attention
+        # Move news_mask to device
         news_mask_dev = (
             news_mask.to(self.device) if news_mask is not None else None
         )
 
-        # Stage 1: v_i × v_n → H_id  (Eq. 10-14, news_mask áp dụng ở đây)
+        # Encode modalities — pass news_mask into encoder for temporal_attn
+        v_m, v_i, v_n = self.multimodal_encoder(
+            s_o, s_h, s_c, s_m, s_n,
+            news_mask=news_mask_dev,   # V3: propagated to NewsEncoder.temporal_attn
+        )
+        if v_n is None:
+            v_n = torch.zeros_like(v_i)
+
+        # Stage 1: price × news (news_mask applied in fusion gate)
         H_id  = self.fusion_stage1(primary=v_i, aux=v_n, aux_mask=news_mask_dev)
 
-        # Stage 2: H_id × v_m → H_idm  (Eq. 15-19, H_id làm primary — sequential)
-        H_idm = self.fusion_stage2(primary=H_id, aux=v_m)   # macro không cần mask
+        # Stage 2: H_id × macro (no mask needed — macro always available)
+        H_idm = self.fusion_stage2(primary=H_id, aux=v_m)
 
-        # ── Ticker-conditioned prediction ─────────────────────────────────────
-        # Broadcast v_t theo time dimension rồi concatenate với H_idm và v_i
-        # → giữ nguyên input dim 3*dim cho pre_predict_proj
-        v_t_seq  = v_t.unsqueeze(1).expand(-1, T, -1)           # (B, T, dim)
-        combined = torch.cat([H_idm, v_i, v_t_seq], dim=-1)     # (B, T, 3*dim)
-        H_final  = self.pre_predict_proj(combined)               # (B, T, 2*dim)
+        # Ticker-conditioned prediction
+        v_t_seq  = v_t.unsqueeze(1).expand(-1, T, -1)
+        combined = torch.cat([H_idm, v_i, v_t_seq], dim=-1)
+        H_final  = self.pre_predict_proj(combined)
 
-        H_pred_fused = H_final[:, :, :self.dim]   # (B, T, dim) — from H_idm branch
-        H_pred_orig  = H_final[:, :, self.dim:]   # (B, T, dim) — from v_i branch
+        H_pred_fused = H_final[:, :, :self.dim]
+        H_pred_orig  = H_final[:, :, self.dim:]
 
         logits = self.movement_predictor(fused_seq=H_pred_fused, orig_seq=H_pred_orig)
         logits = torch.clamp(logits, -15, 15)
 
-        # ── Output routing ────────────────────────────────────────────────────
         def _target(lbl):
             if isinstance(lbl, list):
                 return torch.tensor(

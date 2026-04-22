@@ -1,44 +1,48 @@
 #!/usr/bin/env python3
-# embed_news.py — V7.1 (Unified: SHA1 + Meta-based cache reading + merge-on-write fix)
+# embed_news.py — V8.0 (FinBERT per-triple + Voyage legacy, unified CLI)
 """
-Stage A.5 — News Embedding (UNIFIED VERSION)
+Stage A.5 — News Embedding
 
-V7 changes vs V6 (embed_news_batch.py):
-  Hỗ trợ CẢ HAI loại cache:
+V8.0 changes vs V7.1:
+  Added FinBERT per-triple embedding path (PRIMARY, recommended):
+    --finbert          Use FinBERT [CLS] with impact-weighted aggregation
+                       Output: 768D vectors (FinBERT CLS dimension)
 
-  1. New-format cache (V5.2+, extract_corpus.py V5.2+):
-     File có _meta field → {"triples": [...], "_meta": {"date": ..., "primary_ticker": ...}, "_v": "v5.2"}
-     → Đọc bằng preload_cache_directory() (fast, 1 scan/lần)
-     → Hỗ trợ multi-article concat files (extract V5.3)
+  Kept Voyage path (LEGACY, requires API key):
+    (no flag)          Use Voyage voyage-finance-2
+                       Output: 1024D vectors
 
-  2. Old-format cache (trước V5.2):
-     File chỉ có {"triples": [...]} không có _meta
-     → Đọc bằng SHA1-based fallback (tính SHA1 từ title+content trong DataFrame)
-     → Tương thích hoàn toàn với embed_news.py V5
+  FinBERT approach rationale:
+    - Directional embedding space: "Apple cuts guidance" and
+      "Apple raises guidance" land on opposite sides (FinBERT was
+      fine-tuned on financial sentiment labels).
+    - Per-triple encoding: each KG triple (~20 tokens) encoded
+      individually, then aggregated with weights =
+      |price_impact_score| × confidence × relevance_to_ticker
+      (Gemini-scored fields directly weight the aggregation).
+    - Local inference: no API cost, deterministic, auditable.
+    - Paper 3 (Chronos-Fuse) confirms fine-tuning sentence encoders
+      causes semantic collapse → FinBERT kept FROZEN.
 
-  Quy tắc ưu tiên:
-    - Mỗi (date, ticker): thử meta-based trước
-    - Nếu trống → fallback SHA1-based
-    - Kết quả merge và dedup
+  Backward compatibility:
+    - run_embed_news() (Voyage) unchanged
+    - run_embed_news_finbert() is the new function
+    - Output JSON format identical: {"YYYY-MM-DD": {"TICKER": [Nd]}}
+    - news_embeddings.json dimension changes 1024→768 when using FinBERT
 
-  V7.1 — Merge-on-write fix:
-    Bug V7: khi chạy --ticker TSLA rồi --ticker AAPL rồi --ticker MSFT,
-    mỗi lần ghi đè hoàn toàn news_embeddings.json → chỉ còn MSFT.
-    Fix: khi ticker_filter được set, load existing output rồi merge
-    trước khi ghi. Chỉ (date, ticker) mới được ghi đè — các ticker
-    khác trong file cũ được giữ nguyên.
-
-  Output: {"YYYY-MM-DD": {"TICKER": [1024D vector]}}
-  Format giống hệt V5 và V6 — backward compatible.
+V7.1 features retained:
+  - Unified SHA1 + meta-based cache reading
+  - Merge-on-write for per-ticker runs
+  - --check-cache, --check-output, --force-sha1, --force-meta flags
 
 Usage:
-    python embed_news_full.py                            # toàn bộ (rebuild sạch)
-    python embed_news_full.py --ticker TSLA              # 1 ticker (merge vào file hiện tại)
-    python embed_news_full.py --ticker TSLA --date 2022
-    python embed_news_full.py --ticker TSLA --force-sha1  # chỉ dùng SHA1 (debug)
-    python embed_news_full.py --ticker TSLA --force-meta  # chỉ dùng _meta (debug)
-    python embed_news_full.py --check-cache              # kiểm tra cache stats (không embed)
-    python embed_news_full.py --check-output             # kiểm tra news_embeddings.json hiện tại
+    python embed_news.py --finbert                     # FinBERT, all tickers (PRIMARY)
+    python embed_news.py --finbert --ticker TSLA       # FinBERT, 1 ticker
+    python embed_news.py --finbert --date 2023         # FinBERT, date filter
+    python embed_news.py                               # Voyage legacy (needs API key)
+    python embed_news.py --ticker TSLA                 # Voyage, 1 ticker
+    python embed_news.py --check-cache                 # cache stats, no embedding
+    python embed_news.py --check-output                # output JSON stats
 """
 
 from __future__ import annotations
@@ -53,6 +57,7 @@ import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -65,11 +70,180 @@ from configs.ticker_aliases import TICKER_NAME_MAP
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VOYAGE EMBEDDER
+# FINBERT PER-TRIPLE EMBEDDER  (V8.0 — PRIMARY PATH)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FinBERTPerTripleEmbedder:
+    """
+    FinBERT [CLS] embedding with impact-weighted aggregation per (date, ticker).
+
+    Pipeline:
+      For each (date, ticker):
+        1. Get filtered KG triples from cache
+        2. Format each triple as short text (~20–40 tokens)
+        3. FinBERT [CLS] → 768D embedding per triple
+        4. Weighted mean: weight = |price_impact_score| × confidence × relevance
+        5. Output: 768D daily embedding (or zero vector if no triples)
+
+    Key design decisions:
+      - FROZEN encoder: Paper 3 (Chronos-Fuse) shows fine-tuning causes
+        semantic collapse (MSE degrades 6× vs frozen).
+      - Per-triple encoding: avoids the Voyage problem of serializing all
+        triples into one long text that loses individual impact scores.
+      - Relation → verb mapping: FinBERT understands natural language verbs
+        better than uppercase codes like "POS_IMPACTS".
+      - Directional space: FinBERT fine-tuned on financial sentiment →
+        "CUTS guidance" and "RAISES guidance" are antipodal in embedding space.
+    """
+
+    EMBED_DIM = 768
+
+    RELATION_VERBS: Dict[str, str] = {
+        "ANNOUNCES":    "announces",
+        "RAISES":       "raises",
+        "CUTS":         "cuts",
+        "INVESTS_IN":   "invests in",
+        "DIVESTS":      "divests from",
+        "APPOINTS":     "appoints",
+        "POS_IMPACTS":  "positively impacts",
+        "NEG_IMPACTS":  "negatively impacts",
+        "COMPETES_WITH":"competes with",
+        "REGULATES":    "regulates",
+        "SUPPLIES_TO":  "supplies to",
+        "CONTROLS":     "controls",
+        "SIGNALS":      "signals",
+        "RELATES_TO":   "relates to",
+    }
+
+    def __init__(
+        self,
+        model_name:  str = "ProsusAI/finbert",
+        device:      str = None,
+        batch_size:  int = 32,
+        cache_dir:   str = None,
+    ):
+        try:
+            import torch
+            from transformers import AutoTokenizer, AutoModel
+        except ImportError:
+            raise RuntimeError(
+                "FinBERT requires: pip install transformers accelerate\n"
+                "Run: pip install transformers accelerate"
+            )
+
+        import torch as _torch
+        if device is None:
+            device = "cuda" if _torch.cuda.is_available() else "cpu"
+        self.device     = device
+        self.batch_size = batch_size
+        self._torch     = _torch
+
+        print(f"Loading FinBERT '{model_name}' → device: {device}")
+        cache_dir_hf = cache_dir  # HuggingFace model cache (None = default ~/.cache)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir_hf)
+        self.model     = AutoModel.from_pretrained(model_name, cache_dir=cache_dir_hf)
+        self.model.eval()
+        self.model.to(self.device)
+
+        # Freeze ALL parameters — no fine-tuning (semantic collapse risk)
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        print(f"  FinBERT loaded. Parameters FROZEN. Output dim: {self.EMBED_DIM}D")
+
+    def _format_triple(self, triple: Dict, ticker: str) -> str:
+        """
+        Format one KG triple as short natural-language text for FinBERT.
+
+        Template: "{subject} {verb} {object}. {reasoning}. Impact on {ticker}."
+        Target length: ~20–40 tokens (well within FinBERT 512-token limit).
+        """
+        subj   = triple.get("subject", {}).get("name", "")
+        rel    = triple.get("relation", "")
+        obj    = triple.get("object",  {}).get("name", "")
+        reason = (triple.get("reasoning") or "").strip()
+
+        verb = self.RELATION_VERBS.get(rel, rel.lower().replace("_", " "))
+        text = f"{subj} {verb} {obj}"
+
+        # Append reasoning if compact (Gemini writes ≤15-word reasons)
+        if reason and len(reason) <= 80:
+            text += f". {reason}"
+
+        # Ticker context: FinBERT knows who this signal is for
+        text += f". Impact on {ticker}."
+
+        return text
+
+    def _encode_batch(self, texts: List[str]) -> "np.ndarray":
+        """Encode list of texts → [CLS] hidden states (N, 768)."""
+        import torch
+
+        if not texts:
+            return np.zeros((0, self.EMBED_DIM), dtype=np.float32)
+
+        all_cls = []
+        for i in range(0, len(texts), self.batch_size):
+            batch = texts[i: i + self.batch_size]
+            inputs = self.tokenizer(
+                batch,
+                return_tensors="pt",
+                max_length=128,   # triple texts are short; 128 is generous
+                truncation=True,
+                padding=True,
+            ).to(self.device)
+
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+
+            # [CLS] token = index 0 of last_hidden_state
+            cls = outputs.last_hidden_state[:, 0, :]  # (B, 768)
+            all_cls.append(cls.cpu().numpy())
+
+        return np.vstack(all_cls).astype(np.float32)
+
+    def embed_triples(self, triples: List[Dict], ticker: str) -> List[float]:
+        """
+        Convert KG triples for one (date, ticker) → 768D embedding.
+
+        Aggregation: impact-weighted mean.
+          weight_i = |price_impact_score_i| × confidence_i × relevance_i
+
+        Returns zero vector (list of 768 floats) if triples is empty.
+        news_mask in the model will mark this day as "no news".
+        """
+        if not triples:
+            return [0.0] * self.EMBED_DIM
+
+        # Step 1: format each triple as NL text
+        texts = [self._format_triple(t, ticker) for t in triples]
+
+        # Step 2: encode
+        embeddings = self._encode_batch(texts)  # (N, 768)
+
+        # Step 3: compute Gemini-scored weights
+        weights = []
+        for t in triples:
+            impact = abs(float(t.get("price_impact_score", 0.0)))
+            conf   = float(t.get("confidence", 0.65))
+            rel    = float(t.get("relevance_to_ticker", 0.5))
+            w      = impact * conf * rel
+            weights.append(max(w, 1e-6))  # floor to avoid all-zero weight array
+
+        weights_arr = np.array(weights, dtype=np.float32)
+        weights_arr /= weights_arr.sum()  # normalize to sum=1
+
+        # Step 4: weighted mean
+        daily_emb = (embeddings * weights_arr[:, np.newaxis]).sum(axis=0)
+        return daily_emb.tolist()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VOYAGE EMBEDDER  (V7.1 — LEGACY PATH, kept for backward compat)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class VoyageEmbedder:
-    """Rate-limited Voyage embedder với disk cache (SHA1-keyed)."""
+    """Rate-limited Voyage embedder with disk cache (SHA1-keyed). Legacy path."""
 
     def __init__(self, cache_dir: str):
         self.api_key = os.getenv("VOYAGE_API_KEY", GlobalConfig.VOYAGE_API_KEY)
@@ -137,7 +311,8 @@ class VoyageEmbedder:
             return [o if o is not None else [0.0] * 1024 for o in out]
 
         url     = "https://api.voyageai.com/v1/embeddings"
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        headers = {"Authorization": f"Bearer {self.api_key}",
+                   "Content-Type": "application/json"}
 
         def _chunks(lst, n):
             for i in range(0, len(lst), n):
@@ -153,7 +328,8 @@ class VoyageEmbedder:
                     self._rpm_guard()
                     if self.base_sleep > 0:
                         time.sleep(self.base_sleep)
-                    r = requests.post(url, headers=headers, json=payload, timeout=(15, 120))
+                    r = requests.post(url, headers=headers, json=payload,
+                                      timeout=(15, 120))
                     self._req_times.append(time.time())
                     if r.status_code == 429:
                         wait = self.backoff_base * (2 ** attempt) + 2.0
@@ -178,7 +354,7 @@ class VoyageEmbedder:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UTILS
+# SHARED UTILS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _sha1(s: str) -> str:
@@ -229,6 +405,7 @@ def _ticker_mentioned_in_triple(ticker: str, triple: Dict) -> bool:
     return False
 
 def triples_to_text(triples: List[Dict], ticker: str) -> str:
+    """Serialize triples to plain text for Voyage embedding (legacy path)."""
     if not triples:
         return ""
     sorted_triples = sorted(
@@ -252,15 +429,15 @@ def triples_to_text(triples: List[Dict], ticker: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CACHE SCANNING & LOADING
+# CACHE STORE (shared by both Voyage and FinBERT paths)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CacheStore:
     """
-    Unified cache store: preload và lookup từ CẢ HAI format.
+    Unified cache store: preload from BOTH new-format (_meta) and old-format (SHA1).
 
-    meta_entries: List[Dict]  — files có _meta (new format V5.2+)
-    sha1_no_meta: Set[str]    — SHA1 của files không có _meta (old format)
+    meta_entries : List[Dict]  — files with _meta (new format V5.2+)
+    sha1_no_meta : Set[str]    — SHA1s of files without _meta (old format)
     """
 
     def __init__(self, cache_dir: str):
@@ -290,21 +467,19 @@ class CacheStore:
             except Exception:
                 continue
 
-            triples = data.get("triples", [])
-            meta    = data.get("_meta", {})
-            date_val  = meta.get("date")
-            primary   = str(meta.get("primary_ticker", "")).upper()
+            triples  = data.get("triples", [])
+            meta     = data.get("_meta", {})
+            date_val = meta.get("date")
+            primary  = str(meta.get("primary_ticker", "")).upper()
 
             if date_val and triples:
-                # New format: has _meta with date
                 self.meta_entries.append({
-                    "date":            str(date_val),
-                    "primary_ticker":  primary,
-                    "triples":         triples,
+                    "date":           str(date_val),
+                    "primary_ticker": primary,
+                    "triples":        triples,
                 })
                 n_meta += 1
             elif triples:
-                # Old format: has triples but NO _meta
                 sha1 = fname[:-5]
                 self.sha1_no_meta.add(sha1)
                 n_no_meta += 1
@@ -315,20 +490,16 @@ class CacheStore:
 
     def get_triples_meta(
         self,
-        date_str: str,
-        ticker: str,
-        min_relevance: float,
-        min_confidence: float,
+        date_str: str, ticker: str,
+        min_relevance: float, min_confidence: float,
     ) -> List[Dict]:
-        """Lookup via _meta entries (new format). Fast — in-memory."""
+        """Lookup via _meta entries (new format). In-memory, fast."""
         all_triples: List[Dict] = []
-
         for entry in self.meta_entries:
             if entry["date"] != date_str:
                 continue
             primary = entry["primary_ticker"]
             raw     = entry["triples"]
-
             if primary == ticker.upper():
                 filtered = [
                     t for t in raw
@@ -343,24 +514,17 @@ class CacheStore:
                     and float(t.get("relevance_to_ticker", 0)) >= min_relevance
                 ]
             all_triples.extend(filtered)
-
         return all_triples
 
     def get_triples_sha1(
         self,
-        day_df: pd.DataFrame,
-        ticker: str,
-        min_relevance: float,
-        min_confidence: float,
+        day_df: pd.DataFrame, ticker: str,
+        min_relevance: float, min_confidence: float,
     ) -> List[Dict]:
-        """
-        Fallback: SHA1-based lookup (old format files, no _meta).
-        """
+        """Fallback: SHA1-based lookup (old-format files, no _meta)."""
         if not self.sha1_no_meta:
             return []
-
         all_triples: List[Dict] = []
-
         for _, row in day_df.iterrows():
             title   = _norm(str(row.get("title",   "") or ""))
             content = _norm(str(row.get("content", "") or ""))
@@ -372,11 +536,9 @@ class CacheStore:
             full_text = "\n\n".join(parts)
             if not full_text:
                 continue
-
             h = _sha1(full_text)
             if h not in self.sha1_no_meta:
                 continue
-
             path = os.path.join(self.cache_dir, f"{h}.json")
             try:
                 with open(path, "r", encoding="utf-8") as f:
@@ -384,9 +546,7 @@ class CacheStore:
                 raw = data.get("triples", [])
             except Exception:
                 continue
-
             primary = str(row.get("primary_ticker") or ticker)
-
             if primary.upper() == ticker.upper():
                 filtered = [
                     t for t in raw
@@ -401,13 +561,12 @@ class CacheStore:
                     and float(t.get("relevance_to_ticker", 0)) >= min_relevance
                 ]
             all_triples.extend(filtered)
-
         return all_triples
 
 
 def _dedup_triples(triples: List[Dict]) -> List[Dict]:
     """Simple exact dedup by (subject, relation, object)."""
-    seen:   set       = set()
+    seen: set = set()
     result: List[Dict] = []
     for t in triples:
         key = (
@@ -422,67 +581,67 @@ def _dedup_triples(triples: List[Dict]) -> List[Dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OUTPUT DIAGNOSTICS (--check-output)
+# DIAGNOSTICS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def check_output_stats(output_path: str):
-    """In thống kê về news_embeddings.json hiện tại."""
+    """Print stats about existing news_embeddings.json."""
     print(f"\nOutput file: {output_path}")
     if not os.path.exists(output_path):
-        print("  Không tồn tại.")
+        print("  Not found.")
         return
     try:
         with open(output_path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
-        print(f"  Lỗi đọc file: {e}")
+        print(f"  Read error: {e}")
         return
 
-    print(f"  Tổng số dates: {len(data)}")
+    print(f"  Total dates: {len(data)}")
     if not data:
         return
 
-    # Collect all tickers
     all_tickers: Dict[str, int] = {}
+    detected_dims: set = set()
+    n_zero, n_total = 0, 0
+
     for date_str, ticker_dict in data.items():
-        for t in ticker_dict:
+        for t, vec in ticker_dict.items():
             all_tickers[t] = all_tickers.get(t, 0) + 1
+            n_total += 1
+            if isinstance(vec, list):
+                if len(vec) > 0:
+                    detected_dims.add(len(vec))
+                if all(v == 0.0 for v in vec[:10]):
+                    n_zero += 1
 
     dates_sorted = sorted(data.keys())
     print(f"  Date range: {dates_sorted[0]} → {dates_sorted[-1]}")
-    print(f"  Tickers có trong file:")
+    print(f"  Embedding dim(s) detected: {sorted(detected_dims)}")
+    if 768 in detected_dims:
+        print(f"  → 768D = FinBERT CLS (current pipeline)")
+    if 1024 in detected_dims:
+        print(f"  → 1024D = Voyage legacy (rebuild with --finbert to upgrade)")
+    print(f"  Tickers in file:")
     for t, cnt in sorted(all_tickers.items()):
-        print(f"    {t}: {cnt} ngày")
+        print(f"    {t}: {cnt} days")
+    print(f"  Zero vectors (no news): {n_zero}/{n_total} "
+          f"({100 * n_zero / max(n_total, 1):.1f}%)")
 
-    # Check for zero vectors
-    n_zero = 0
-    n_total = 0
-    for date_str, ticker_dict in data.items():
-        for t, vec in ticker_dict.items():
-            n_total += 1
-            if isinstance(vec, list) and all(v == 0.0 for v in vec[:10]):
-                n_zero += 1
-    print(f"  Zero vectors (no embedding): {n_zero}/{n_total} ({100*n_zero/max(n_total,1):.1f}%)")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CACHE DIAGNOSTIC (--check-cache)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def check_cache_stats(cache_dir: str):
-    """In thống kê về cache directory. Không embed gì cả."""
+    """Print stats about cache directory."""
     print(f"\nCache directory: {cache_dir}")
     if not os.path.exists(cache_dir):
-        print("  Không tồn tại.")
+        print("  Not found.")
         return
 
-    files = [f for f in os.listdir(cache_dir) if f.endswith(".json") and not f.startswith("_")]
-    print(f"  Tổng files: {len(files)}")
+    files = [f for f in os.listdir(cache_dir)
+             if f.endswith(".json") and not f.startswith("_")]
+    print(f"  Total files: {len(files)}")
 
-    n_with_meta   = 0
-    n_no_meta     = 0
-    n_empty       = 0
-    date_set: set = set()
+    n_with_meta, n_no_meta, n_empty = 0, 0, 0
+    date_set:   set = set()
     ticker_set: set = set()
 
     for fname in files:
@@ -492,8 +651,8 @@ def check_cache_stats(cache_dir: str):
                 data = json.load(f)
         except Exception:
             continue
-        triples = data.get("triples", [])
-        meta    = data.get("_meta", {})
+        triples  = data.get("triples", [])
+        meta     = data.get("_meta", {})
         date_val = meta.get("date")
         primary  = meta.get("primary_ticker", "")
 
@@ -507,54 +666,29 @@ def check_cache_stats(cache_dir: str):
         else:
             n_no_meta += 1
 
-    print(f"  New-format (có _meta, có triples): {n_with_meta}")
-    print(f"  Old-format (không có _meta):       {n_no_meta}")
-    print(f"  Empty (không có triples):           {n_empty}")
+    print(f"  New-format (with _meta, has triples): {n_with_meta}")
+    print(f"  Old-format (no _meta):                {n_no_meta}")
+    print(f"  Empty (no triples):                   {n_empty}")
     if date_set:
-        dates_sorted = sorted(date_set)
-        print(f"  Ngày đầu (new-format): {dates_sorted[0]}")
-        print(f"  Ngày cuối (new-format): {dates_sorted[-1]}")
-        print(f"  Tickers trong _meta: {sorted(ticker_set)}")
+        ds = sorted(date_set)
+        print(f"  Date range (new-format): {ds[0]} → {ds[-1]}")
+        print(f"  Tickers in _meta: {sorted(ticker_set)}")
     print()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN EMBED LOGIC
+# SHARED DATAFRAME NORMALIZATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _load_existing_output(output_path: str) -> Dict[str, Dict[str, List[float]]]:
-    """Load existing news_embeddings.json nếu tồn tại. Trả về {} nếu lỗi."""
-    if not os.path.exists(output_path):
-        return {}
-    try:
-        with open(output_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        # Validate structure
-        if isinstance(data, dict):
-            return data
-    except Exception as e:
-        print(f"  Warning: could not load existing output ({e}) — starting fresh")
-    return {}
-
-
-def run_embed_news(
-    news_df:        pd.DataFrame,
-    cache_dir:      str,
-    output_path:    str,
-    voyage_cache:   str,
-    min_relevance:  float = None,
-    min_confidence: float = None,
-    ticker_filter:  Optional[str] = None,
-    date_prefix:    Optional[str] = None,
-    force_sha1:     bool = False,
-    force_meta:     bool = False,
-) -> str:
-    if min_relevance  is None: min_relevance  = GlobalConfig.KG_MIN_RELEVANCE
-    if min_confidence is None: min_confidence = GlobalConfig.KG_MIN_CONFIDENCE
-
-    voyage = VoyageEmbedder(cache_dir=voyage_cache)
-
-    # ── Normalize DataFrame ───────────────────────────────────────────────
+def _normalize_news_df(
+    news_df:       pd.DataFrame,
+    ticker_filter: Optional[str] = None,
+    date_prefix:   Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Normalise news DataFrame columns and apply optional filters.
+    Shared by both Voyage and FinBERT paths.
+    """
     df = news_df.copy()
     if "headline" in df.columns and "title" not in df.columns:
         df = df.rename(columns={"headline": "title"})
@@ -568,7 +702,6 @@ def run_embed_news(
     if "content" not in df.columns: df["content"] = ""
     if "title"   not in df.columns: df["title"]   = ""
 
-    # Auto-detect date column
     if "date" not in df.columns:
         DATE_CANDS = [
             "created_at", "createdAt", "published_at", "publishedAt",
@@ -589,7 +722,7 @@ def run_embed_news(
 
     ticker_col = next((c for c in ("symbols", "equity") if c in df.columns), None)
     if ticker_col is None:
-        raise ValueError("No ticker column found.")
+        raise ValueError("No ticker column found (expected 'symbols' or 'equity').")
 
     df["_all_tickers"] = df[ticker_col].apply(_parse_tickers)
     df = df[df["_all_tickers"].map(len) > 0]
@@ -612,9 +745,190 @@ def run_embed_news(
     if date_prefix:
         df = df[df["date"].astype(str).str.startswith(date_prefix)]
 
+    return df
+
+
+def _load_existing_output(output_path: str) -> Dict[str, Dict[str, List[float]]]:
+    """Load existing news_embeddings.json. Return {} on error."""
+    if not os.path.exists(output_path):
+        return {}
+    try:
+        with open(output_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception as e:
+        print(f"  Warning: could not load existing output ({e}) — starting fresh")
+    return {}
+
+
+def _save_output(
+    new_output:    Dict[str, Dict[str, List[float]]],
+    output_path:   str,
+    ticker_filter: Optional[str],
+) -> str:
+    """
+    Merge-on-write + save.
+
+    When ticker_filter is set, load existing output and merge so that
+    other tickers already in the file are preserved.
+    When no filter (full rebuild), write new_output directly.
+    """
+    if ticker_filter:
+        existing = _load_existing_output(output_path)
+        if existing:
+            n_ex = len(set(t for d in existing.values() for t in d))
+            print(f"\nMerging with existing output:")
+            print(f"  Existing: {len(existing)} dates, ~{n_ex} tickers")
+            print(f"  New data: {len(new_output)} dates for {ticker_filter.upper()}")
+            merged: Dict[str, Dict[str, List[float]]] = defaultdict(dict)
+            for ds, td in existing.items():
+                merged[ds].update(td)
+            for ds, td in new_output.items():
+                merged[ds].update(td)
+            final = merged
+            n_f = len(set(t for d in final.values() for t in d))
+            print(f"  Final: {len(final)} dates, ~{n_f} tickers")
+        else:
+            print(f"\nNo existing output — creating new file for {ticker_filter.upper()}")
+            final = new_output
+    else:
+        final = new_output
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(dict(final), f, ensure_ascii=False)
+
+    print(f"\nSaved: {output_path}")
+    print(f"  Dates: {len(final)}")
+    if final:
+        sample_date = next(iter(final))
+        print(f"  Sample ({sample_date}): tickers = {sorted(final[sample_date].keys())}")
+    return output_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FINBERT EMBED FUNCTION  (V8.0 — PRIMARY)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_embed_news_finbert(
+    news_df:          pd.DataFrame,
+    cache_dir:        str,
+    output_path:      str,
+    finbert_model:    str = "ProsusAI/finbert",
+    finbert_cache_dir: Optional[str] = None,
+    min_relevance:    float = None,
+    min_confidence:   float = None,
+    ticker_filter:    Optional[str] = None,
+    date_prefix:      Optional[str] = None,
+    device:           Optional[str] = None,
+) -> str:
+    """
+    FinBERT per-triple embedding pipeline.
+
+    1. Normalise DataFrame
+    2. Load KG triple cache (meta + SHA1 fallback)
+    3. For each (ticker, date): embed triples → 768D weighted mean
+    4. Merge-on-write + save
+
+    Output format: {"YYYY-MM-DD": {"TICKER": [768D vector]}}
+    Zero vector = no triples (news_mask handles this in model).
+    """
+    if min_relevance  is None: min_relevance  = GlobalConfig.KG_MIN_RELEVANCE
+    if min_confidence is None: min_confidence = GlobalConfig.KG_MIN_CONFIDENCE
+
+    # Lazy-load FinBERT (slow on first call, ~10s)
+    embedder = FinBERTPerTripleEmbedder(
+        model_name=finbert_model,
+        device=device,
+        cache_dir=finbert_cache_dir,
+    )
+    EMPTY_VEC = [0.0] * FinBERTPerTripleEmbedder.EMBED_DIM
+
+    df = _normalize_news_df(news_df, ticker_filter, date_prefix)
     tickers = sorted(df["equity"].unique())
-    mode_str = "sha1-only" if force_sha1 else ("meta-only" if force_meta else "unified (meta + sha1 fallback)")
-    print(f"\nEmbed news V7.1 (Unified + merge-on-write): {len(tickers)} tickers — mode: {mode_str}")
+
+    print(f"\nEmbed news V8.0 (FinBERT per-triple, {FinBERTPerTripleEmbedder.EMBED_DIM}D)")
+    print(f"  Tickers   : {len(tickers)}")
+    print(f"  Cache dir : {cache_dir}")
+    print(f"  Output    : {output_path}")
+    if ticker_filter:
+        print(f"  Filter    : {ticker_filter.upper()} — will MERGE into existing output")
+    else:
+        print(f"  Filter    : none — full REBUILD")
+    print()
+
+    cache_store = CacheStore(cache_dir)
+    cache_store.load()
+
+    new_output: Dict[str, Dict[str, List[float]]] = defaultdict(dict)
+    stats = {"n_with_triples": 0, "n_empty": 0, "total_triples": 0}
+
+    for ticker in tickers:
+        df_t  = df[df["equity"] == ticker].copy()
+        dates = sorted(df_t["date"].unique())
+
+        for d in dates:
+            date_str = str(d)
+            day_df   = df_t[df_t["date"] == d]
+
+            # Get triples: meta first, SHA1 fallback, then dedup
+            meta_triples = cache_store.get_triples_meta(
+                date_str, ticker, min_relevance, min_confidence)
+            sha1_triples = cache_store.get_triples_sha1(
+                day_df, ticker, min_relevance, min_confidence)
+            all_triples  = _dedup_triples(meta_triples + sha1_triples)
+
+            if all_triples:
+                stats["n_with_triples"] += 1
+                stats["total_triples"]  += len(all_triples)
+                daily_emb = embedder.embed_triples(all_triples, ticker)
+                new_output[date_str][ticker] = daily_emb
+            else:
+                stats["n_empty"] += 1
+                new_output[date_str][ticker] = EMPTY_VEC
+
+    avg_t = stats["total_triples"] / max(stats["n_with_triples"], 1)
+    print(f"Embedding stats:")
+    print(f"  Days with triples : {stats['n_with_triples']}")
+    print(f"  Days empty (zeros): {stats['n_empty']}")
+    print(f"  Avg triples/day   : {avg_t:.1f}")
+
+    return _save_output(new_output, output_path, ticker_filter)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VOYAGE EMBED FUNCTION  (V7.1 — LEGACY)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_embed_news(
+    news_df:        pd.DataFrame,
+    cache_dir:      str,
+    output_path:    str,
+    voyage_cache:   str,
+    min_relevance:  float = None,
+    min_confidence: float = None,
+    ticker_filter:  Optional[str] = None,
+    date_prefix:    Optional[str] = None,
+    force_sha1:     bool = False,
+    force_meta:     bool = False,
+) -> str:
+    """
+    Voyage embedding pipeline (legacy, 1024D).
+    Kept for backward compatibility. Use run_embed_news_finbert() for new work.
+    """
+    if min_relevance  is None: min_relevance  = GlobalConfig.KG_MIN_RELEVANCE
+    if min_confidence is None: min_confidence = GlobalConfig.KG_MIN_CONFIDENCE
+
+    voyage = VoyageEmbedder(cache_dir=voyage_cache)
+
+    df = _normalize_news_df(news_df, ticker_filter, date_prefix)
+    tickers = sorted(df["equity"].unique())
+
+    mode_str = ("sha1-only" if force_sha1 else
+                "meta-only" if force_meta else
+                "unified (meta + sha1 fallback)")
+    print(f"\nEmbed news V7.1 (Voyage 1024D, legacy): {len(tickers)} tickers — mode: {mode_str}")
     print(f"Cache dir : {cache_dir}")
     print(f"Output    : {output_path}")
     if ticker_filter:
@@ -623,11 +937,9 @@ def run_embed_news(
         print(f"No ticker filter — will REBUILD entire output")
     print()
 
-    # ── Load cache store once ─────────────────────────────────────────────
     cache_store = CacheStore(cache_dir)
     cache_store.load()
 
-    # ── Build (ticker, date) → triples text ───────────────────────────────
     ticker_date_text: Dict[Tuple[str, str], str] = {}
     stats = {"meta_only": 0, "sha1_only": 0, "both": 0, "empty": 0}
 
@@ -639,32 +951,24 @@ def run_embed_news(
             date_str = str(d)
             day_df   = df_t[df_t["date"] == d]
 
-            # Meta-based lookup
             meta_triples: List[Dict] = []
             if not force_sha1:
                 meta_triples = cache_store.get_triples_meta(
                     date_str, ticker, min_relevance, min_confidence)
 
-            # SHA1-based fallback
             sha1_triples: List[Dict] = []
             if not force_meta:
                 sha1_triples = cache_store.get_triples_sha1(
                     day_df, ticker, min_relevance, min_confidence)
 
-            # Merge + dedup
             all_triples = _dedup_triples(meta_triples + sha1_triples)
 
-            # Stats
             has_meta = bool(meta_triples)
             has_sha1 = bool(sha1_triples)
-            if has_meta and has_sha1:
-                stats["both"] += 1
-            elif has_meta:
-                stats["meta_only"] += 1
-            elif has_sha1:
-                stats["sha1_only"] += 1
-            else:
-                stats["empty"] += 1
+            if has_meta and has_sha1:   stats["both"] += 1
+            elif has_meta:              stats["meta_only"] += 1
+            elif has_sha1:              stats["sha1_only"] += 1
+            else:                       stats["empty"] += 1
 
             text = triples_to_text(all_triples, ticker)
             ticker_date_text[(ticker, date_str)] = text
@@ -676,7 +980,6 @@ def run_embed_news(
     print(f"  No cache found (zeros):        {stats['empty']}")
     print(f"  Total pairs: {len(ticker_date_text)}")
 
-    # ── Embed via Voyage ──────────────────────────────────────────────────
     unique_texts = list(set(ticker_date_text.values()))
     non_empty    = [t for t in unique_texts if t]
     empty_vec    = [0.0] * 1024
@@ -689,66 +992,11 @@ def run_embed_news(
         text_to_emb = {}
         print("\nNo text to embed (all pairs empty).")
 
-    # ── Build new output dict ─────────────────────────────────────────────
     new_output: Dict[str, Dict[str, List[float]]] = defaultdict(dict)
     for (ticker, date_str), text in ticker_date_text.items():
         new_output[date_str][ticker] = text_to_emb.get(text, empty_vec)
 
-    # ── Merge-on-write: load existing output and merge ────────────────────
-    # IMPORTANT: khi chạy per-ticker (--ticker TSLA, --ticker AAPL...),
-    # mỗi lần chỉ compute new_output cho 1 ticker.  Nếu ghi thẳng sẽ xoá
-    # các tickers khác đã embed.  Fix: load existing → merge → ghi.
-    #
-    # Quy tắc merge:
-    #   - existing[date][ticker] được GIỮ NGUYÊN nếu ticker không trong
-    #     current run (ticker_filter khác)
-    #   - existing[date][ticker] bị GHI ĐÈ nếu ticker trong current run
-    #     (fresh computation có thể tốt hơn cached)
-    #   - Khi không có ticker_filter (rebuild toàn bộ): KHÔNG load existing
-    #     (intentional full rebuild)
-
-    if ticker_filter:
-        existing_output = _load_existing_output(output_path)
-        if existing_output:
-            n_existing_tickers = len(set(
-                t for d in existing_output.values() for t in d
-            ))
-            print(f"\nMerging with existing output:")
-            print(f"  Existing: {len(existing_output)} dates, ~{n_existing_tickers} tickers")
-            print(f"  New data: {len(new_output)} dates for {ticker_filter.upper()}")
-
-            # Start from existing, then overwrite with new data
-            merged: Dict[str, Dict[str, List[float]]] = defaultdict(dict)
-            for date_str, ticker_dict in existing_output.items():
-                merged[date_str].update(ticker_dict)
-            for date_str, ticker_dict in new_output.items():
-                merged[date_str].update(ticker_dict)
-
-            final_output = merged
-            n_final_tickers = len(set(
-                t for d in final_output.values() for t in d
-            ))
-            print(f"  Final: {len(final_output)} dates, ~{n_final_tickers} tickers")
-        else:
-            print(f"\nNo existing output found — creating new file for {ticker_filter.upper()}")
-            final_output = new_output
-    else:
-        # Full rebuild: use new_output directly (intentional, no merge)
-        final_output = new_output
-
-    # ── Save ──────────────────────────────────────────────────────────────
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(dict(final_output), f, ensure_ascii=False)
-
-    print(f"\nSaved: {output_path}")
-    print(f"  Dates: {len(final_output)}")
-    if final_output:
-        sample_date = next(iter(final_output))
-        sample_tickers = sorted(final_output[sample_date].keys())
-        print(f"  Sample ({sample_date}): tickers = {sample_tickers}")
-
-    return output_path
+    return _save_output(new_output, output_path, ticker_filter)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -757,31 +1005,63 @@ def run_embed_news(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Stage A.5 — Embed news triples via Voyage (V7.1 Unified + merge-on-write)"
+        description=(
+            "Stage A.5 — News Embedding\n"
+            "  --finbert  : FinBERT per-triple (768D, PRIMARY, recommended)\n"
+            "  (no flag)  : Voyage legacy (1024D, requires VOYAGE_API_KEY)"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--news",      default=None, help="Path to news parquet")
-    parser.add_argument("--cache-dir", default=None, help="Article triple cache dir")
-    parser.add_argument("--output",    default=None, help="Output JSON path")
-    parser.add_argument("--ticker",    default=None, help="Filter to 1 ticker, e.g. TSLA")
-    parser.add_argument("--date",      default=None, help="Date prefix, e.g. '2022-06'")
-    parser.add_argument("--min-relevance",  type=float, default=None)
-    parser.add_argument("--min-confidence", type=float, default=None)
+
+    # ── Shared args ──────────────────────────────────────────────────────────
+    parser.add_argument("--news",      default=None,
+                        help="Path to news parquet (default: interim/concatenated_news_filtered.parquet)")
+    parser.add_argument("--cache-dir", default=None,
+                        help="Article triple cache dir (default: from GlobalConfig)")
+    parser.add_argument("--output",    default=None,
+                        help="Output JSON path (default: interim/kg_embeddings/news_embeddings.json)")
+    parser.add_argument("--ticker",    default=None,
+                        help="Filter to 1 ticker, e.g. TSLA (merges into existing output)")
+    parser.add_argument("--date",      default=None,
+                        help="Date prefix filter, e.g. '2023-06'")
+    parser.add_argument("--min-relevance",  type=float, default=None,
+                        help="Min relevance_to_ticker threshold (default: GlobalConfig)")
+    parser.add_argument("--min-confidence", type=float, default=None,
+                        help="Min confidence threshold (default: GlobalConfig)")
+
+    # ── FinBERT-specific args ────────────────────────────────────────────────
+    parser.add_argument("--finbert", action="store_true",
+                        help="Use FinBERT per-triple embedder (768D, PRIMARY). "
+                             "Requires: pip install transformers accelerate")
+    parser.add_argument("--finbert-model", default=None,
+                        help="HuggingFace model name (default: ProsusAI/finbert)")
+    parser.add_argument("--finbert-device", default=None,
+                        help="Device for FinBERT inference, e.g. cuda or cpu")
+
+    # ── Voyage-specific args ─────────────────────────────────────────────────
     parser.add_argument("--force-sha1",  action="store_true",
-                        help="Only use SHA1 lookup (old format only, for debugging)")
+                        help="[Voyage] Only use SHA1 lookup (debug)")
     parser.add_argument("--force-meta",  action="store_true",
-                        help="Only use _meta scan (new format only, for debugging)")
-    parser.add_argument("--check-cache", action="store_true",
+                        help="[Voyage] Only use _meta scan (debug)")
+
+    # ── Diagnostic modes ────────────────────────────────────────────────────
+    parser.add_argument("--check-cache",  action="store_true",
                         help="Print cache stats and exit (no embedding)")
     parser.add_argument("--check-output", action="store_true",
                         help="Print current news_embeddings.json stats and exit")
+
     args = parser.parse_args()
 
+    # ── Resolve paths ────────────────────────────────────────────────────────
     cache_dir = args.cache_dir or GlobalConfig.kg_cache_dir()
-    output_path = args.output or os.path.join(
-        GlobalConfig.INTERIM_PATH, "kg_embeddings", "news_embeddings.json"
-    )
+    if args.output:
+        output_path = args.output
+    elif args.finbert:
+        output_path = GlobalConfig.finbert_emb_path()  # news_embeddings_finbert.json (768D)
+    else:
+        output_path = GlobalConfig.voyage_emb_path()   # news_embeddings_voyage.json  (1024D)
 
-    # ── Check modes ───────────────────────────────────────────────────────
+    # ── Diagnostic modes ────────────────────────────────────────────────────
     if args.check_cache:
         check_cache_stats(cache_dir)
         return
@@ -790,7 +1070,7 @@ def main():
         check_output_stats(output_path)
         return
 
-    # ── Validate ──────────────────────────────────────────────────────────
+    # ── Validate common inputs ───────────────────────────────────────────────
     news_path = args.news or os.path.join(
         GlobalConfig.INTERIM_PATH, "concatenated_news_filtered.parquet"
     )
@@ -803,27 +1083,50 @@ def main():
         print("Run Stage A first: python extract_corpus.py")
         sys.exit(1)
 
-    if args.force_sha1 and args.force_meta:
-        print("Cannot use --force-sha1 and --force-meta together.")
-        sys.exit(1)
-
-    voyage_cache = GlobalConfig.kg_voyage_cache_dir()
-
     df = pd.read_parquet(news_path)
     print(f"Loaded {len(df):,} rows from {news_path}")
 
-    run_embed_news(
-        news_df=df,
-        cache_dir=cache_dir,
-        output_path=output_path,
-        voyage_cache=voyage_cache,
-        min_relevance=args.min_relevance,
-        min_confidence=args.min_confidence,
-        ticker_filter=args.ticker,
-        force_sha1=args.force_sha1,
-        force_meta=args.force_meta,
-        date_prefix=args.date,
-    )
+    # ── Route to embedder ────────────────────────────────────────────────────
+    if args.finbert:
+        # FinBERT path (PRIMARY)
+        finbert_model = (
+            args.finbert_model
+            or getattr(GlobalConfig, "FINBERT_MODEL", "ProsusAI/finbert")
+        )
+        finbert_cache = getattr(GlobalConfig, "finbert_cache_dir", lambda: None)()
+
+        run_embed_news_finbert(
+            news_df=df,
+            cache_dir=cache_dir,
+            output_path=output_path,
+            finbert_model=finbert_model,
+            finbert_cache_dir=finbert_cache,
+            min_relevance=args.min_relevance,
+            min_confidence=args.min_confidence,
+            ticker_filter=args.ticker,
+            date_prefix=args.date,
+            device=args.finbert_device,
+        )
+
+    else:
+        # Voyage path (LEGACY)
+        if args.force_sha1 and args.force_meta:
+            print("Cannot use --force-sha1 and --force-meta together.")
+            sys.exit(1)
+
+        voyage_cache = GlobalConfig.kg_voyage_cache_dir()
+        run_embed_news(
+            news_df=df,
+            cache_dir=cache_dir,
+            output_path=output_path,
+            voyage_cache=voyage_cache,
+            min_relevance=args.min_relevance,
+            min_confidence=args.min_confidence,
+            ticker_filter=args.ticker,
+            date_prefix=args.date,
+            force_sha1=args.force_sha1,
+            force_meta=args.force_meta,
+        )
 
 
 if __name__ == "__main__":

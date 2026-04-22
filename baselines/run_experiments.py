@@ -32,6 +32,7 @@ if PROJECT_ROOT not in sys.path:
 from configs.config import TrainConfig, GlobalConfig
 from src.data_loader import data_prepare, N_TICKERS
 from src.model import StockMovementModel
+# from main import pretrain_news_branch
 from baselines.hparam_search import (
     grid_search_flat, final_eval_flat, SEEDS, get_all_combinations,
     FlatDataset, _eval_flat_mcc, _eval_flat_both, _forward_flat,
@@ -243,6 +244,8 @@ def _run_msgca_production_one_seed(
     # This prevents the patience=30 trigger at epoch 41 when model hasn't warmed up yet
     min_eval_epoch = warmup_epochs + 5   # start checking 5 epochs after warmup ends
 
+    # pretrain_news_branch(model, ldr, DEVICE, include_ticker_id=True, epochs=50)
+
     for epoch in range(max_epochs):
         ep_loss = _train_epoch(model, ldr, opt)
         if epoch < warmup_epochs:
@@ -275,6 +278,9 @@ def _run_msgca_production_one_seed(
     cosine2 = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt2, T_max=max(best_epoch - warmup_epochs, 1), eta_min=1e-6
     )
+
+    # pretrain_news_branch(model2, ldr2, DEVICE, include_ticker_id=True, epochs=50)
+
     for ep in range(best_epoch):
         _train_epoch(model2, ldr2, opt2)
         if ep < warmup_epochs: warmup2.step()
@@ -358,6 +364,8 @@ def _run_msgca_one_seed(
     best_mcc, best_epoch, no_improve = -2.0, 1, 0
     min_active = max(warmup_epochs, 40)
 
+    # pretrain_news_branch(model, ldr, DEVICE, include_ticker_id=True, epochs=50)
+
     for epoch in range(max_epochs):
         _train_epoch(model, ldr, opt)
         if epoch < warmup_epochs: warmup.step()
@@ -378,6 +386,8 @@ def _run_msgca_one_seed(
     model2, opt2 = _build_msgca_model(macro_dim, news_dim, hp["lr"], hp["dropout"], hp["focal_gamma"])
     ldr2         = DataLoader(MSGCADataset(train_full), batch_size=32, shuffle=True, drop_last=False)
     sched2       = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=best_epoch, eta_min=1e-6)
+
+    # pretrain_news_branch(model2, ldr2, DEVICE, include_ticker_id=True, epochs=50)
 
     for _ in range(best_epoch):
         _train_epoch(model2, ldr2, opt2)
