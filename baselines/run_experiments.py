@@ -9,11 +9,13 @@ CHANGES vs previous:
   4. Thêm --load-saved-model: load model đã train từ output/ làm kết quả seed=42,
      train thêm seeds [123,256,512,1024] và báo cáo mean±std.
      Test split trùng khớp: run_experiments inner_T=627 = main.py val_end=627.
+  5. early_stop_patience + news_modality_dropout đọc từ TrainConfig:
+     chỉ cần đổi configs/config.py — áp dụng cho main.py + cả 2 file này.
 
 USAGE:
   python baselines/run_experiments.py
   python baselines/run_experiments.py --skip-search
-  python baselines/run_experiments.py --load-saved-model output/best_model_label=rolling_price=vol_adjusted_tid_seed42_standard.pt
+  python baselines/run_experiments.py --load-saved-model output/best_model_label=rolling_price=vol_adjusted_tid_seed42_fixed.pt
   python baselines/run_experiments.py --models LSTM ALSTM --n-seeds 3
   python baselines/run_experiments.py --skip-msgca-inline --output-dir output
 """
@@ -41,6 +43,12 @@ from baselines.hparam_search import (
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# ── Shared training control — đọc từ TrainConfig (configs/config.py) ──────────
+# Để vô hiệu hóa early stopping (train đủ 200ep): đặt early_stop_patience = 9999
+# Để tắt modality dropout: đặt news_modality_dropout = 0.0
+_PATIENCE    = TrainConfig.early_stop_patience    # default 30
+_MOD_DROPOUT = TrainConfig.news_modality_dropout  # default 0.30
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -137,8 +145,30 @@ def _build_msgca_model(macro_dim, news_dim, lr, dropout, focal_gamma, cw=None):
         device=DEVICE,
         n_tickers=N_TICKERS,
     ).to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4, eps=1e-6)
+    opt = _make_adamw(model, lr)
     return model, opt
+
+
+def _make_adamw(model: nn.Module, lr: float) -> torch.optim.Optimizer:
+    """
+    AdamW với param groups riêng biệt — khớp chính xác main.py.
+    LayerNorm.weight + bias không có weight_decay (tránh kéo scale LN về 0).
+    """
+    no_decay_kws = ["bias", "LayerNorm.weight", "layernorm.weight",
+                    "norm.weight", "attn_norm.weight", "out_norm.weight"]
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if any(kw in name for kw in no_decay_kws):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return torch.optim.AdamW(
+        [{"params": decay,    "weight_decay": 1e-4},
+         {"params": no_decay, "weight_decay": 0.0}],
+        lr=lr,
+    )
 
 
 def _build_msgca_model_production(macro_dim, news_dim, lr, dropout, train_labels):
@@ -157,7 +187,7 @@ def _build_msgca_model_production(macro_dim, news_dim, lr, dropout, train_labels
         device=DEVICE,
         n_tickers=N_TICKERS,
     ).to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4, eps=1e-6)
+    opt = _make_adamw(model, lr)
     return model, opt
 
 
@@ -188,29 +218,36 @@ def _eval_msgca(model, data, batch_size=64):
 
 def _train_epoch(model, loader, opt):
     """
-    Train 1 epoch — standard per-batch SGD (NOT gradient accumulation).
+    Train 1 epoch với news modality dropout (khớp main.py).
+    NEWS_MODALITY_DROPOUT đọc từ TrainConfig — đổi config.py để tắt/bật.
 
-    CRITICAL FIX: zero_grad() and step() must be called INSIDE the batch loop.
-    Previous code called them outside → accumulated gradient of ALL batches
-    before a single update → weight jump of 162× normal mini-batch gradient
-    → FocalLoss gradient explosion → class collapse (MCC=0).
+    CRITICAL FIX: zero_grad() và step() phải được gọi INSIDE the batch loop.
     """
     model.train()
     total_loss = 0.0
     for batch in loader:
-        opt.zero_grad(set_to_none=True)      # ← inside loop: fresh gradient each batch
+        opt.zero_grad(set_to_none=True)
+
+        # News Modality Dropout — khớp main.py [FIX-3]
+        s_n_in  = batch["s_n"].to(DEVICE)
+        mask_in = batch.get("news_mask")
+        if _MOD_DROPOUT > 0.0 and torch.rand(1).item() < _MOD_DROPOUT:
+            s_n_in  = torch.zeros_like(s_n_in)
+            if mask_in is not None:
+                mask_in = torch.ones_like(mask_in, dtype=torch.bool)
+
         loss = model(
             batch["s_o"].to(DEVICE), batch["s_h"].to(DEVICE),
             batch["s_c"].to(DEVICE), batch["s_m"].to(DEVICE),
-            batch["s_n"].to(DEVICE), batch["label"].to(DEVICE),
+            s_n_in, batch["label"].to(DEVICE),
             mode="train",
             ticker_id=batch.get("ticker_id"),
-            news_mask=batch.get("news_mask"),
+            news_mask=mask_in.to(DEVICE) if mask_in is not None else None,
         )
         if torch.isfinite(loss):
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()                       # ← inside loop: update after each batch
+            opt.step()
             total_loss += loss.item()
     return total_loss
 
@@ -219,15 +256,18 @@ def _run_msgca_production_one_seed(
     seed, train_hval, val_hval, train_full, test,
     macro_dim, news_dim,
     lr=1e-4, dropout=0.1,
-    max_epochs=200, patience=30, warmup_epochs=15, verbose=False,
+    max_epochs=200, patience=None, warmup_epochs=15, verbose=False,
 ):
     """
     Train one seed with PRODUCTION setup: FocalLoss(gamma=2.0) + class weights.
+    patience=None → dùng _PATIENCE từ TrainConfig (config.py).
     Protocol matches main.py:
       Phase 1: train_hval → find best_epoch via val MCC
       Phase 2: train_full for best_epoch, eval on test
     Scheduler: LinearLR warmup → CosineAnnealingLR (no restarts).
     """
+    if patience is None:
+        patience = _PATIENCE
     import random
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
 
@@ -240,9 +280,8 @@ def _run_msgca_production_one_seed(
     )
 
     best_mcc, best_epoch, no_improve = -2.0, 1, 0
-    # Start checking after warmup only — not a fixed 40-epoch delay
-    # This prevents the patience=30 trigger at epoch 41 when model hasn't warmed up yet
-    min_eval_epoch = warmup_epochs + 5   # start checking 5 epochs after warmup ends
+    # Bắt đầu check sau warmup; patience đọc từ TrainConfig (config.py)
+    min_eval_epoch = warmup_epochs + 5
 
     # pretrain_news_branch(model, ldr, DEVICE, include_ticker_id=True, epochs=50)
 
@@ -327,7 +366,7 @@ def run_msgca_best(
             train_full=train_full, test=test,
             macro_dim=macro_dim, news_dim=news_dim,
             lr=lr, dropout=dropout,
-            max_epochs=200, patience=30, warmup_epochs=15, verbose=verbose,
+            max_epochs=200, patience=None, warmup_epochs=15, verbose=verbose,
         )
         acc_list.append(acc); mcc_list.append(mcc); ep_list.append(ep)
         if verbose:
@@ -345,13 +384,16 @@ def run_msgca_best(
 def _run_msgca_one_seed(
     seed, train_hval, val_hval, train_full, test,
     macro_dim, news_dim, hp,
-    max_epochs=150, patience=30, warmup_epochs=15, verbose=False,
+    max_epochs=150, patience=None, warmup_epochs=15, verbose=False,
 ):
     """
     2-phase training for one seed (FAIR/CE mode — for MSGCA_FV row):
       Phase 1: train_hval → early stopping → find best_epoch
       Phase 2: train_full for best_epoch → eval on test
+    patience=None → dùng _PATIENCE từ TrainConfig (config.py).
     """
+    if patience is None:
+        patience = _PATIENCE
     import random
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
 
@@ -691,7 +733,7 @@ def _auto_detect_best_model(output_dir="output") -> Optional[str]:
     if not pt_files:
         return None
     # Ưu tiên standard split (seed42) — cùng split với run_experiments test set
-    standard = [f for f in pt_files if "standard" in f and "seed42" in f]
+    standard = [f for f in pt_files if "fixed" in f and "seed42" in f]
     candidates = standard if standard else pt_files
     candidates.sort(key=lambda f: os.path.getmtime(os.path.join(output_dir, f)), reverse=True)
     return os.path.join(output_dir, candidates[0])

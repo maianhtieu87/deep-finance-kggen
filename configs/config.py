@@ -180,6 +180,17 @@ class TrainConfig:
     label_smoothing = 0.1
     drop_out = 0.1
 
+    # ── Shared training control — ONE place to change for all files ───────────
+    # early_stop_patience: số epoch không cải thiện val_MCC trước khi dừng.
+    #   Đặt thành giá trị lớn (ví dụ 9999) để vô hiệu hóa early stopping
+    #   và quay về chế độ train đủ max_epochs — áp dụng cho TOÀN BỘ:
+    #   main.py · run_experiments.py · run_ablation.py
+    early_stop_patience: int = 30
+
+    # news_modality_dropout: xác suất mỗi step trong training zero toàn bộ news.
+    #   Đặt thành 0.0 để tắt hoàn toàn. Áp dụng cho toàn bộ files trên.
+    news_modality_dropout: float = 0.30
+
 
 class ModelConfig:
     price_lstm_hidden = 64;  price_lstm_layers = 2

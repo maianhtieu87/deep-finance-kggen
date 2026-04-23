@@ -86,6 +86,12 @@ SEEDS       = [42, 123, 256, 512, 1024]
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
+# ── Shared training control — đọc từ TrainConfig (configs/config.py) ──────────
+# Để vô hiệu hóa early stopping (train đủ fv_epochs): đặt early_stop_patience = 9999
+# Để tắt modality dropout: đặt news_modality_dropout = 0.0
+_PATIENCE    = TrainConfig.early_stop_patience    # default 30
+_MOD_DROPOUT = TrainConfig.news_modality_dropout  # default 0.30
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ABLATION VARIANTS
@@ -253,6 +259,28 @@ def build_model(
     ).to(DEVICE)
 
 
+def _make_adamw(model: StockMovementModel, lr: float = 1e-4) -> torch.optim.Optimizer:
+    """
+    AdamW với param groups riêng biệt — khớp chính xác main.py.
+    LayerNorm.weight + bias không có weight_decay (tránh kéo scale LN về 0).
+    """
+    no_decay_kws = ["bias", "LayerNorm.weight", "layernorm.weight",
+                    "norm.weight", "attn_norm.weight", "out_norm.weight"]
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if any(kw in name for kw in no_decay_kws):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return torch.optim.AdamW(
+        [{"params": decay,    "weight_decay": TrainConfig.weight_decay},
+         {"params": no_decay, "weight_decay": 0.0}],
+        lr=lr,
+    )
+
+
 def _make_dataloader(dataset: StockDataset, shuffle: bool, batch_size: int) -> DataLoader:
     """Shared DataLoader factory — num_workers=0 on Windows (avoids subprocess reimport)."""
     return DataLoader(
@@ -324,14 +352,14 @@ def find_saved_model(output_dir: str, seed: int) -> Optional[str]:
     Tìm model đã save từ main.py cho seed này.
 
     main.py save path:
-      output/best_model_label={label}_price={price}_{tid}_seed{seed}_standard.pt
+      output/best_model_label={label}_price={price}_{tid}_seed{seed}_fixed.pt
 
-    Glob pattern: best_model_*_seed{seed}_standard.pt
+    Glob pattern: best_model_*_seed{seed}_fixed.pt
     Trả về file mới nhất nếu có nhiều match (nhiều label/price-mode), None nếu không có.
 
     KHÔNG tìm msgca_results_seed{seed}.json — file đó từ WF protocol cũ đã deprecated.
     """
-    pattern = os.path.join(output_dir, f"best_model_*_seed{seed}_standard.pt")
+    pattern = os.path.join(output_dir, f"best_model_*_seed{seed}_fixed.pt")
     matches = glob.glob(pattern)
     if not matches:
         return None
@@ -373,13 +401,13 @@ def run_baseline_wf(
     Lấy kết quả baseline theo 2 phương án ưu tiên:
 
     Phương án 1 (ưu tiên):
-      Tìm best_model_*_seed{seed}_standard.pt trong output_dir
+      Tìm best_model_*_seed{seed}_fixed.pt trong output_dir
       → load và evaluate → kết quả giống hệt main.py output
       → Source: "loaded from .pt"
 
     Phương án 2 (fallback):
-      Không tìm thấy .pt → retrain với fixed_val+warmup+200ep
-      (cùng protocol với main.py nhưng train/val split hơi khác)
+      Không tìm thấy .pt → retrain với fixed_val+warmup+fv_epochs
+      patience và modality dropout lấy từ TrainConfig (configs/config.py)
       → Source: "retrained"
 
     Không còn đọc msgca_results_seed{seed}.json — deprecated từ V3.
@@ -405,7 +433,7 @@ def run_baseline_wf(
                 seed=seed,
                 train_data=train_hval, val_data=val_fixed, test_data=test,
                 macro_dim=macro_dim, news_dim=news_dim,
-                max_epochs=200, patience=30, warmup_epochs=10,
+                max_epochs=200, patience=None, warmup_epochs=10,
             )
             sources.append("retrained")
 
@@ -553,15 +581,18 @@ def run_seed_fixed_val(
     zero_news:     bool  = False,
     zero_macro:    bool  = False,
     max_epochs:    int   = 200,
-    patience:      int   = 30,
+    patience:      int   = None,   # None → dùng _PATIENCE từ TrainConfig
     warmup_epochs: int   = 10,
     use_focal:     bool  = True,
     focal_gamma:   float = 2.0,
 ) -> Tuple[float, float]:
     """
     Fixed val + LR warmup + early stopping.
-    Protocol khớp với main.py: Adam lr=1e-4, wd=1e-4, CosineAnnealing.
+    Protocol khớp với main.py: AdamW lr=1e-4, wd=1e-4, CosineAnnealing.
+    patience=None → dùng _PATIENCE từ TrainConfig (configs/config.py).
     """
+    if patience is None:
+        patience = _PATIENCE
     set_seed(seed)
     cw    = compute_class_weights(train_data["label"]).to(DEVICE)
     model = build_model(macro_dim, news_dim, use_focal, focal_gamma, cw)
@@ -570,7 +601,7 @@ def run_seed_fixed_val(
         ds, shuffle=True,
         batch_size=getattr(TrainConfig, "batch_size", 32)
     )
-    opt    = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    opt    = _make_adamw(model, lr=TrainConfig.learning_rate)
     warmup = torch.optim.lr_scheduler.LinearLR(
         opt, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs
     )
@@ -586,14 +617,22 @@ def run_seed_fixed_val(
             opt.zero_grad()
             s_n = batch["s_n"].to(DEVICE)
             s_m = batch["s_m"].to(DEVICE)
+            # zero_news / zero_macro: ablation zeros (phải apply ở đây)
             if zero_news:  s_n = torch.zeros_like(s_n)
             if zero_macro: s_m = torch.zeros_like(s_m)
+            # News Modality Dropout: chỉ apply khi KHÔNG zero_news
+            # (không có ý nghĩa dropout thêm khi đã bỏ hẳn news)
+            mask_in = batch.get("news_mask")
+            if not zero_news and _MOD_DROPOUT > 0.0 and torch.rand(1).item() < _MOD_DROPOUT:
+                s_n     = torch.zeros_like(s_n)
+                if mask_in is not None:
+                    mask_in = torch.ones_like(mask_in, dtype=torch.bool)
             loss = model(
                 batch["s_o"].to(DEVICE), batch["s_h"].to(DEVICE),
                 batch["s_c"].to(DEVICE), s_m, s_n,
                 batch["label"].to(DEVICE), mode="train",
                 ticker_id=batch.get("ticker_id"),
-                news_mask=batch.get("news_mask"),
+                news_mask=mask_in.to(DEVICE) if mask_in is not None else None,
             )
             if torch.isfinite(loss):
                 loss.backward()
@@ -706,7 +745,7 @@ def run_variant(
                 train_data=train_hval, val_data=val_fixed, test_data=test,
                 macro_dim=macro_dim, news_dim=news_dim,
                 zero_news=zero_news, zero_macro=zero_macro,
-                max_epochs=fv_max_epochs, patience=30, warmup_epochs=10,
+                max_epochs=fv_max_epochs, patience=None, warmup_epochs=10,
             )
             acc_list.append(acc)
             mcc_list.append(mcc)
