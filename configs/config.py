@@ -169,6 +169,23 @@ class TrainConfig:
     #   "voyage"  → 1024D (Voyage-finance-2 API, requires VOYAGE_API_KEY)
     news_embedder = "finbert"
 
+    QUALITY_DIM = 4   # [log_n_triples, avg_confidence, avg_relevance, avg_impact]
+
+    @classmethod
+    def finbert_quality_path(cls):
+        """Path to FinBERT quality stats JSON (4D per ticker per day)."""
+        base = cls.finbert_emb_path()
+        return base.replace(".json", "_quality.json")
+
+    @classmethod
+    def news_quality_path(cls, embedder: str = None) -> str:
+        from configs.config import TrainConfig
+        embedder = embedder or TrainConfig.news_embedder
+        if embedder == "finbert":
+            return cls.finbert_quality_path()
+        # Voyage không có quality stats (legacy) → return None
+        return None
+    
     @classmethod
     def news_embed_dim(cls) -> int:
         """Derive news embedding dim from the active embedder."""
@@ -185,7 +202,7 @@ class TrainConfig:
     #   Đặt thành giá trị lớn (ví dụ 9999) để vô hiệu hóa early stopping
     #   và quay về chế độ train đủ max_epochs — áp dụng cho TOÀN BỘ:
     #   main.py · run_experiments.py · run_ablation.py
-    early_stop_patience: int = 30
+    early_stop_patience: int = 9999
 
     # news_modality_dropout: xác suất mỗi step trong training zero toàn bộ news.
     #   Đặt thành 0.0 để tắt hoàn toàn. Áp dụng cho toàn bộ files trên.

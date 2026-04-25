@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # baselines/run_ablation.py — V3 (baseline_wf synced với main.py standard split)
 """
 End-to-end ablation study cho MSGCA.
@@ -98,7 +99,8 @@ _MOD_DROPOUT = TrainConfig.news_modality_dropout  # default 0.30
 # ─────────────────────────────────────────────────────────────────────────────
 
 ALL_VARIANTS = [
-    "baseline_wf",    # Reference: same model as main.py, same test set
+    "baseline_wf",    # Reference A: MSGCA_Best (FocalLoss+weights) — loaded from main.py .pt
+    "baseline_fv",    # Reference B: MSGCA_FV (CE, fair comparison) — loaded from run_experiments.py JSON
     "no_news",        # Q1: s_n = zeros train+test → retrain without news
     "no_macro",       # Q3: s_m = zeros train+test → retrain without macro
     "fixed_val",      # Q2: fixed val + warmup + 200ep (protocol sanity check)
@@ -106,7 +108,8 @@ ALL_VARIANTS = [
 ]
 
 VARIANT_DESCRIPTIONS = {
-    "baseline_wf":   "MSGCA standard split 200ep — load main.py .pt (reference)",
+    "baseline_wf":   "MSGCA_Best (FocalLoss+CW) — load main.py .pt    [Ref-A]",
+    "baseline_fv":   "MSGCA_FV (CE, fair) — load run_experiments JSON  [Ref-B]",
     "no_news":       "No news: retrain from scratch, s_n=zeros train+test  [Q1]",
     "no_macro":      "No macro: retrain from scratch, s_m=zeros train+test [Q3]",
     "fixed_val":     "Fixed val + warmup + 200 epochs                      [Q2]",
@@ -119,11 +122,12 @@ VARIANT_DESCRIPTIONS = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 class StockDataset(Dataset):
-    _KEYS = ["s_o", "s_h", "s_c", "s_m", "s_n", "news_mask", "label", "ticker_id"]
+    _KEYS = ["s_o", "s_h", "s_c", "s_m", "s_n", "news_mask", "label",
+             "ticker_id", "news_quality"]
 
     def __init__(self, d: dict):
         self.d    = d
-        self.keys = [k for k in self._KEYS if k in d]
+        self.keys = [k for k in self._KEYS if k in d]  # guard: skip absent keys
 
     def __len__(self):
         return len(self.d["label"])
@@ -256,6 +260,7 @@ def build_model(
         focal_gamma=focal_gamma,
         device=DEVICE,
         n_tickers=N_TICKERS,
+        quality_dim=getattr(GlobalConfig, "QUALITY_DIM", 4),
     ).to(DEVICE)
 
 
@@ -325,6 +330,7 @@ def evaluate(
             s_m = batch["s_m"].to(DEVICE)
             if zero_news:  s_n = torch.zeros_like(s_n)
             if zero_macro: s_m = torch.zeros_like(s_m)
+            q = batch.get("news_quality")
             _, _, preds = model(
                 batch["s_o"].to(DEVICE), batch["s_h"].to(DEVICE),
                 batch["s_c"].to(DEVICE), s_m, s_n,
@@ -332,6 +338,7 @@ def evaluate(
                 mode="test", return_preds=True,
                 ticker_id=batch.get("ticker_id"),
                 news_mask=batch.get("news_mask"),
+                news_quality=q.to(DEVICE) if (q is not None and not zero_news) else None,
             )
             preds_all.extend(preds.cpu().numpy())
             labels_all.extend(batch["label"].numpy())
@@ -346,6 +353,62 @@ def evaluate(
 # ─────────────────────────────────────────────────────────────────────────────
 # BASELINE_WF — V3: load main.py .pt hoặc retrain
 # ─────────────────────────────────────────────────────────────────────────────
+
+def load_msgca_fv_from_experiments(results_dir: str) -> Optional[dict]:
+    """
+    Load MSGCA_FV results pre-computed by run_experiments.py.
+
+    Source file: baselines/results/raw_results.json
+    Key        : "MSGCA_FV"
+
+    Returns dict with acc_mean/acc_std/mcc_mean/mcc_std/acc_list/mcc_list,
+    or None if file not found / key absent.
+
+    Academic rationale:
+      MSGCA_FV uses CE loss (no class weights) for fair comparison with baselines.
+      Showing it alongside MSGCA_Best in the ablation table gives reviewers
+      the full picture: Ref-A (production) vs Ref-B (fair) vs ablated variants.
+      Delta MCC is reported against Ref-A (FocalLoss variants vs FocalLoss full model)
+      for internal consistency; Ref-B is shown as a secondary anchor.
+    """
+    raw_path = os.path.join(results_dir, "raw_results.json")
+    if not os.path.exists(raw_path):
+        print(f"  [baseline_fv] raw_results.json not found: {raw_path}")
+        print(f"  Run: python baselines/run_experiments.py first.")
+        return None
+
+    try:
+        with open(raw_path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as e:
+        print(f"  [baseline_fv] Error reading {raw_path}: {e}")
+        return None
+
+    if "MSGCA_FV" not in raw:
+        print(f"  [baseline_fv] 'MSGCA_FV' key not found in {raw_path}")
+        print(f"  Keys present: {list(raw.keys())}")
+        return None
+
+    fv = raw["MSGCA_FV"]
+    # Validate required keys
+    required = ["acc_mean", "acc_std", "mcc_mean", "mcc_std"]
+    if not all(k in fv for k in required):
+        print(f"  [baseline_fv] Missing keys in MSGCA_FV entry: {fv.keys()}")
+        return None
+
+    result = {
+        "acc_mean":   float(fv["acc_mean"]),
+        "acc_std":    float(fv["acc_std"]),
+        "mcc_mean":   float(fv["mcc_mean"]),
+        "mcc_std":    float(fv["mcc_std"]),
+        "acc_list":   fv.get("acc_list", []),
+        "mcc_list":   fv.get("mcc_list", []),
+        "n_seeds":    int(fv.get("n_seeds", len(fv.get("mcc_list", [])))),
+        "source":     "loaded from run_experiments raw_results.json",
+        "loss_mode":  "CE (fair comparison)",
+    }
+    return result
+
 
 def find_saved_model(output_dir: str, seed: int) -> Optional[str]:
     """
@@ -507,12 +570,14 @@ def find_best_epoch_wf(
                 s_m = batch["s_m"].to(DEVICE)
                 if zero_news:  s_n = torch.zeros_like(s_n)
                 if zero_macro: s_m = torch.zeros_like(s_m)
+                q = batch.get("news_quality")
                 loss = model(
                     batch["s_o"].to(DEVICE), batch["s_h"].to(DEVICE),
                     batch["s_c"].to(DEVICE), s_m, s_n,
                     batch["label"].to(DEVICE), mode="train",
                     ticker_id=batch.get("ticker_id"),
                     news_mask=batch.get("news_mask"),
+                    news_quality=q.to(DEVICE) if (q is not None and not zero_news) else None,
                 )
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -552,12 +617,14 @@ def run_seed_walkforward(
             s_m = batch["s_m"].to(DEVICE)
             if zero_news:  s_n = torch.zeros_like(s_n)
             if zero_macro: s_m = torch.zeros_like(s_m)
+            q = batch.get("news_quality")
             loss = model(
                 batch["s_o"].to(DEVICE), batch["s_h"].to(DEVICE),
                 batch["s_c"].to(DEVICE), s_m, s_n,
                 batch["label"].to(DEVICE), mode="train",
                 ticker_id=batch.get("ticker_id"),
                 news_mask=batch.get("news_mask"),
+                news_quality=q.to(DEVICE) if (q is not None and not zero_news) else None,
             )
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -623,16 +690,19 @@ def run_seed_fixed_val(
             # News Modality Dropout: chỉ apply khi KHÔNG zero_news
             # (không có ý nghĩa dropout thêm khi đã bỏ hẳn news)
             mask_in = batch.get("news_mask")
+            q_in    = batch.get("news_quality")
             if not zero_news and _MOD_DROPOUT > 0.0 and torch.rand(1).item() < _MOD_DROPOUT:
                 s_n     = torch.zeros_like(s_n)
                 if mask_in is not None:
                     mask_in = torch.ones_like(mask_in, dtype=torch.bool)
+                q_in = None   # drop quality together with news
             loss = model(
                 batch["s_o"].to(DEVICE), batch["s_h"].to(DEVICE),
                 batch["s_c"].to(DEVICE), s_m, s_n,
                 batch["label"].to(DEVICE), mode="train",
                 ticker_id=batch.get("ticker_id"),
                 news_mask=mask_in.to(DEVICE) if mask_in is not None else None,
+                news_quality=q_in.to(DEVICE) if q_in is not None else None,
             )
             if torch.isfinite(loss):
                 loss.backward()
@@ -772,68 +842,113 @@ def run_variant(
 
 def format_ablation_table(results: dict) -> str:
     lines = []
-    sep = "=" * 112
+    sep = "=" * 125
     lines += [
         sep,
-        "  ABLATION STUDY — MSGCA V3  (Mean +/- Std  |  test=[85%:100%] T_max)",
+        "  ABLATION STUDY -- MSGCA  (Mean +/- Std  |  test=[85%:100%] T_max)",
         f"  News dim    : {NEWS_EMB_DIM}D (FinBERT CLS per-triple weighted-mean)",
         "  Methodology : each non-baseline variant RETRAINED from scratch",
-        "               (zeros in BOTH train AND eval — not post-hoc zeroing)",
-        "  baseline_wf : loaded from main.py .pt (same model, same test set)",
+        "               (zeros applied in BOTH train AND eval -- not post-hoc zeroing)",
+        "  Ref-A [baseline_wf] : MSGCA_Best (FocalLoss+CW) -- loaded from main.py .pt",
+        "  Ref-B [baseline_fv] : MSGCA_FV   (CE, fair)     -- loaded from run_experiments.py",
+        "  dRef-A = MCC_variant - MCC_Ref-A  (primary delta, same loss function as variants)",
+        "  dRef-B = MCC_variant - MCC_Ref-B  (secondary delta, vs fair-comparison model)",
         sep,
-        f"{'Variant':<20} {'Description':<55} {'ACC':>14} {'MCC':>14}  vs baseline",
-        "-" * 112,
+        f"{'Variant':<20} {'Description':<56} {'ACC':>14} {'MCC':>14}  {'dRef-A':>8}  {'dRef-B':>8}",
+        "-" * 125,
     ]
 
-    ref_mcc = results.get("baseline_wf", {}).get("mcc_mean", 0.0)
+    ref_a_mcc = results.get("baseline_wf", {}).get("mcc_mean", None)
+    ref_b_mcc = results.get("baseline_fv", {}).get("mcc_mean", None)
 
     for v in ALL_VARIANTS:
         if v not in results:
             continue
         r    = results[v]
-        desc = VARIANT_DESCRIPTIONS.get(v, "")[:54]
+        desc = VARIANT_DESCRIPTIONS.get(v, "")[:55]
         acc  = f"{r['acc_mean']:.4f}+/-{r['acc_std']:.4f}"
         mcc  = f"{r['mcc_mean']:.4f}+/-{r['mcc_std']:.4f}"
-        src  = f" [{r.get('source', '')}]" if r.get("source") else ""
 
+        # dRef-A
         if v == "baseline_wf":
-            delta = f"(reference){src}"
+            delta_a = "(Ref-A)"
+        elif ref_a_mcc is not None:
+            d = r["mcc_mean"] - ref_a_mcc
+            delta_a = f"{'+' if d >= 0 else ''}{d:.4f}"
         else:
-            d     = r["mcc_mean"] - ref_mcc
-            sign  = "+" if d >= 0 else ""
-            delta = f"{sign}{d:.4f}"
+            delta_a = "  N/A  "
 
-        lines.append(f"{v:<20} {desc:<55} {acc:>14} {mcc:>14}  {delta}")
+        # dRef-B
+        if v == "baseline_fv":
+            delta_b = "(Ref-B)"
+        elif ref_b_mcc is not None:
+            d = r["mcc_mean"] - ref_b_mcc
+            delta_b = f"{'+' if d >= 0 else ''}{d:.4f}"
+        else:
+            delta_b = "  N/A  "
+
+        lines.append(
+            f"{v:<20} {desc:<56} {acc:>14} {mcc:>14}  {delta_a:>8}  {delta_b:>8}"
+        )
 
     lines.append(sep)
-    lines.append("\nINTERPRETATION (vs baseline_wf, same test set as main.py):")
+    lines.append("\nINTERPRETATION:")
 
-    if "no_news" in results and "baseline_wf" in results:
-        d = results["no_news"]["mcc_mean"] - ref_mcc
-        if d > 0.005:
-            lines.append(f"  Q1 NEWS:  +{d:.4f} → FinBERT news signal HURTS model.")
-            lines.append("            Action: (a) improve KG extraction, (b) increase news/day coverage,")
-            lines.append("                    (c) re-examine FinBERT aggregation weights")
-        elif d < -0.005:
-            lines.append(f"  Q1 NEWS:  {d:.4f} → FinBERT news HELPS model. Channel contributing.")
+    # Q1: News channel
+    if "no_news" in results and ref_a_mcc is not None:
+        d_a = results["no_news"]["mcc_mean"] - ref_a_mcc
+        d_b_str = ""
+        if ref_b_mcc is not None:
+            d_b = results["no_news"]["mcc_mean"] - ref_b_mcc
+            d_b_str = f"  dRef-B={d_b:+.4f}"
+        tag = f"dRef-A={d_a:+.4f}{d_b_str}"
+        if d_a > 0.005:
+            lines.append(f"  Q1 NEWS  ({tag}): News HURTS model (Ref-A). "
+                         "Consider improving KG quality, coverage, or gating strategy.")
+        elif d_a < -0.005:
+            lines.append(f"  Q1 NEWS  ({tag}): News HELPS model -- channel contributing positively.")
         else:
-            lines.append(f"  Q1 NEWS:  Δ={d:+.4f} → Negligible. Signal present but weak.")
+            lines.append(f"  Q1 NEWS  ({tag}): Negligible effect (|d|<0.005). "
+                         "Signal present but weak or already captured by price.")
 
-    if "no_macro" in results and "baseline_wf" in results:
-        d = results["no_macro"]["mcc_mean"] - ref_mcc
-        if d < -0.005:
-            lines.append(f"  Q3 MACRO: {d:.4f} → Macro contributes meaningfully to prediction.")
-        elif d > 0.005:
-            lines.append(f"  Q3 MACRO: +{d:.4f} → Macro may be adding noise via Stage2 fusion.")
+    # Q3: Macro channel
+    if "no_macro" in results and ref_a_mcc is not None:
+        d_a = results["no_macro"]["mcc_mean"] - ref_a_mcc
+        d_b_str = ""
+        if ref_b_mcc is not None:
+            d_b = results["no_macro"]["mcc_mean"] - ref_b_mcc
+            d_b_str = f"  dRef-B={d_b:+.4f}"
+        tag = f"dRef-A={d_a:+.4f}{d_b_str}"
+        if d_a < -0.005:
+            lines.append(f"  Q3 MACRO ({tag}): Macro contributes meaningfully to prediction.")
+        elif d_a > 0.005:
+            lines.append(f"  Q3 MACRO ({tag}): Macro adds noise via Stage2 fusion.")
         else:
-            lines.append(f"  Q3 MACRO: Δ={d:+.4f} → Small effect.")
+            lines.append(f"  Q3 MACRO ({tag}): Small macro effect.")
 
-    if "fixed_val" in results and "baseline_wf" in results:
-        d = results["fixed_val"]["mcc_mean"] - ref_mcc
+    # Q2: Protocol sanity
+    if "fixed_val" in results and ref_a_mcc is not None:
+        d_a = results["fixed_val"]["mcc_mean"] - ref_a_mcc
+        if abs(d_a) < 0.01:
+            verdict = "Protocol matched. Expected ~0 vs Ref-A."
+        else:
+            verdict = "Some variance vs Ref-A (different train/val split or seeds)."
+        lines.append(f"  Q2 PROTO (dRef-A={d_a:+.4f}): {verdict}")
+
+    # Ref-A vs Ref-B gap note
+    if ref_a_mcc is not None and ref_b_mcc is not None:
+        gap = ref_b_mcc - ref_a_mcc
+        direction = "outperforms" if gap > 0 else "underperforms"
+        if abs(gap) > 0.005:
+            note = ("CE loss may generalize better on this dataset size (~4.7k train samples). "
+                    "Report MSGCA_FV as primary result in paper (fair comparison row)."
+                    if gap > 0
+                    else "FocalLoss+CW model is stronger here.")
+        else:
+            note = "Difference within noise -- FocalLoss and CE perform similarly."
         lines.append(
-            f"  Q2 PROTO: Δ={d:+.4f} → "
-            + ("Protocol matched. Expected ~0 vs loaded baseline." if abs(d) < 0.01
-               else "Some variance vs loaded baseline (different train/val split).")
+            f"\n  NOTE: Ref-B (MSGCA_FV/CE) {direction} Ref-A (MSGCA_Best/FocalLoss)"
+            f" by {gap:+.4f} MCC. {note}"
         )
 
     return "\n".join(lines)
@@ -889,10 +1004,10 @@ def main():
     all_results: Dict[str, dict] = {}
     total_t0 = time.time()
 
-    # baseline_wf: special path — load .pt hoặc retrain
+    # ── baseline_wf: load .pt từ main.py hoặc retrain ─────────────────────────
     if "baseline_wf" in variants:
-        print(f"\n  Variant    : baseline_wf")
-        print(f"  Strategy   : auto-detect best_model_*_seed*_standard.pt in '{args.load_from}/'")
+        print(f"\n  Variant    : baseline_wf  [Ref-A: MSGCA_Best, FocalLoss+CW]")
+        print(f"  Strategy   : auto-detect best_model_*_seed*_fixed.pt in '{args.load_from}/'")
         t0 = time.time()
         all_results["baseline_wf"] = run_baseline_wf(
             splits=splits, n_seeds=args.n_seeds, output_dir=args.load_from,
@@ -902,6 +1017,24 @@ def main():
               f"MCC={r['mcc_mean']:.4f}+/-{r['mcc_std']:.4f}  "
               f"({(time.time() - t0) / 60:.1f} min)")
         variants = [v for v in variants if v != "baseline_wf"]
+
+    # ── baseline_fv: load MSGCA_FV từ run_experiments.py JSON — zero compute ──
+    if "baseline_fv" in variants:
+        experiments_results_dir = os.path.join(
+            os.path.dirname(__file__), "results"
+        )
+        print(f"\n  Variant    : baseline_fv  [Ref-B: MSGCA_FV, CE loss]")
+        print(f"  Strategy   : load from {experiments_results_dir}/raw_results.json (no retraining)")
+        fv_result = load_msgca_fv_from_experiments(experiments_results_dir)
+        if fv_result is not None:
+            all_results["baseline_fv"] = fv_result
+            print(f"  -> ACC={fv_result['acc_mean']:.4f}+/-{fv_result['acc_std']:.4f}  "
+                  f"MCC={fv_result['mcc_mean']:.4f}+/-{fv_result['mcc_std']:.4f}  "
+                  f"[n_seeds={fv_result['n_seeds']}]  (0.0 min — loaded)")
+        else:
+            print(f"  -> SKIPPED (raw_results.json not found or MSGCA_FV key absent)")
+            print(f"     Run: python baselines/run_experiments.py first")
+        variants = [v for v in variants if v != "baseline_fv"]
 
     # Các variants còn lại
     for variant in variants:

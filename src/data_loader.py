@@ -1,10 +1,27 @@
 # src/data_loader.py
 """
-Data Loader — V5.6
+Data Loader — V5.7
 
-V5.6 change: NEWS_EMB_DIM now derived from GlobalConfig.news_emb_dim()
-  which reads TrainConfig.news_embedder ("finbert" → 768D, "voyage" → 1024D).
-  No more hardcoded dimension — switch embedder in config.py only.
+V5.7 vs V5.6:
+  Phase 2 quality support:
+    - _load_rows() reads 'news_quality' from each day entry
+    - _build_news_quality() builds (T, window_size, QUALITY_DIM) tensor
+    - prepare_data() includes s_q_t in _make() output dict as 'news_quality'
+    - s_q_all added to NaN-check loop (was missing in previous version)
+
+  news_quality tensor shape: (B, T, QUALITY_DIM) — default QUALITY_DIM=4
+    [0] log(1 + n_triples)
+    [1] avg_confidence
+    [2] avg_relevance_to_ticker
+    [3] avg_abs_impact
+
+  When no quality data (Voyage embedder or quality JSON absent):
+    s_q stays all-zero → znorm produces all-zero → quality gate falls back
+    to norm proxy inside NewsEncoder.
+
+V5.6 change retained:
+  NEWS_EMB_DIM derived from GlobalConfig.news_emb_dim() based on
+  TrainConfig.news_embedder. No more hardcoded dimension.
 """
 
 import pickle
@@ -61,6 +78,8 @@ class data_prepare:
         self.label_mode        = label_mode
         self.include_ticker_id = include_ticker_id
         self._cache_rows       = {}
+        # QUALITY_DIM: 4 khi dùng finbert + quality JSON, 4 khi fallback (zeros)
+        self.quality_dim       = getattr(GlobalConfig, "QUALITY_DIM", 4)
 
         embedder       = TrainConfig.news_embedder
         embedder_label = self._EMBEDDER_LABEL.get(embedder, embedder)
@@ -69,7 +88,10 @@ class data_prepare:
         print(f"Price mode     : {self.price_mode}")
         print(f"Label mode     : {self.label_mode}")
         print(f"News embed dim : {self.news_dim}D ({embedder_label})")
+        print(f"Quality dim    : {self.quality_dim}D")
         print(f"Ticker ID      : {'enabled' if include_ticker_id else 'disabled'}")
+
+    # ── Row loading ───────────────────────────────────────────────────────────
 
     def _load_rows(self, target_ticker: str):
         if target_ticker in self._cache_rows:
@@ -88,12 +110,15 @@ class data_prepare:
             if None in (s_o, s_h, s_c): continue
 
             rows.append({
-                "date":     date_key,
-                "s_o":      s_o,
-                "s_h":      s_h,
-                "s_c":      s_c,
-                "macro":    day.get("macro", {}),
-                "news_emb": day.get("news_embedding", {}).get(target_ticker, None),
+                "date":         date_key,
+                "s_o":          s_o,
+                "s_h":          s_h,
+                "s_c":          s_c,
+                "macro":        day.get("macro", {}),
+                "news_emb":     day.get("news_embedding", {}).get(target_ticker, None),
+                # V5.7: quality stats from builder.py section 2.4b
+                # None if quality JSON absent or no triples for this (date, ticker)
+                "news_quality": day.get("news_quality", {}).get(target_ticker, None),
             })
 
         self._cache_rows[target_ticker] = rows
@@ -103,6 +128,8 @@ class data_prepare:
         rows = self._load_rows(target_ticker)
         if len(rows) < self.window_size + 1: return 0
         return len(rows) - self.window_size
+
+    # ── Data preparation ──────────────────────────────────────────────────────
 
     def prepare_data(self, target_ticker: str, train_end=None, val_end=None, test_end=None):
         rows = self._load_rows(target_ticker)
@@ -141,16 +168,25 @@ class data_prepare:
 
         s_n_all, news_mask_all = self._build_news(rows, T, train_end)
 
-        for name, arr in [("s_o", s_o_all), ("s_h", s_h_all), ("s_c", s_c_all),
-                          ("s_m", s_m_all), ("s_n", s_n_all)]:
+        # V5.7: quality tensor — zeros when no quality data (all embedder paths safe)
+        s_q_all = self._build_news_quality(rows, T, train_end)
+
+        # ── NaN cleanup (apply to ALL float arrays including s_q) ─────────────
+        for name, arr in [
+            ("s_o", s_o_all), ("s_h", s_h_all), ("s_c", s_c_all),
+            ("s_m", s_m_all), ("s_n", s_n_all),
+            ("s_q", s_q_all),   # V5.7: was missing in previous version
+        ]:
             n_nan = int(np.isnan(arr).sum())
-            if n_nan > 0: arr[:] = np.nan_to_num(arr, nan=0.0)
+            if n_nan > 0:
+                arr[:] = np.nan_to_num(arr, nan=0.0)
 
         s_o_t  = torch.tensor(s_o_all,      dtype=torch.float32)
         s_h_t  = torch.tensor(s_h_all,      dtype=torch.float32)
         s_c_t  = torch.tensor(s_c_all,      dtype=torch.float32)
         s_m_t  = torch.tensor(s_m_all,      dtype=torch.float32)
         s_n_t  = torch.tensor(s_n_all,      dtype=torch.float32)
+        s_q_t  = torch.tensor(s_q_all,      dtype=torch.float32)
         mask_t = torch.tensor(news_mask_all, dtype=torch.bool)
         lbl_t  = torch.tensor(labels,        dtype=torch.long)
 
@@ -163,13 +199,14 @@ class data_prepare:
         def _make(a, b):
             if a >= b: return {}
             d = {
-                "s_o":       _s(s_o_t,  a, b),
-                "s_h":       _s(s_h_t,  a, b),
-                "s_c":       _s(s_c_t,  a, b),
-                "s_m":       _s(s_m_t,  a, b),
-                "s_n":       _s(s_n_t,  a, b),
-                "news_mask": _s(mask_t, a, b),
-                "label":     _s(lbl_t,  a, b),
+                "s_o":          _s(s_o_t,  a, b),
+                "s_h":          _s(s_h_t,  a, b),
+                "s_c":          _s(s_c_t,  a, b),
+                "s_m":          _s(s_m_t,  a, b),
+                "s_n":          _s(s_n_t,  a, b),
+                "news_mask":    _s(mask_t, a, b),
+                "label":        _s(lbl_t,  a, b),
+                "news_quality": _s(s_q_t,  a, b),  # V5.7: always present (zeros if no data)
             }
             if self.include_ticker_id:
                 d["ticker_id"] = _s(tid_t, a, b)
@@ -179,6 +216,8 @@ class data_prepare:
         va = _make(train_end, val_end)
         te = _make(val_end,   test_end)
         return tr, va, te
+
+    # ── Feature builders ──────────────────────────────────────────────────────
 
     def _build_price_features(self, close_arr, open_arr, high_arr, T, train_end):
         if self.price_mode == "vol_adjusted":
@@ -265,6 +304,35 @@ class data_prepare:
         s_n = self._znorm(s_n, s_n[:train_end])
         s_n[mask] = 0.0
         return s_n, mask
+
+    def _build_news_quality(self, rows: list, T: int, train_end: int) -> np.ndarray:
+        """
+        Build quality stats tensor: (T, window_size, quality_dim).
+
+        Zeros when:
+          - Quality JSON not loaded (Voyage embedder or file absent)
+          - This (date, ticker) had no triples → embed_news.py stored [0,0,0,0]
+          - train_end = 0 (edge case; znorm produces zeros safely)
+
+        After znorm, no-quality days will have values ≠ 0 if other days in the
+        training set had non-zero quality. The downstream NewsEncoder handles
+        this: when news_mask=True, the gate is hard-zeroed regardless.
+        """
+        q_dim = self.quality_dim
+        s_q   = np.zeros((T, self.window_size, q_dim), dtype=np.float32)
+
+        for t in range(T):
+            for w, row in enumerate(rows[t: t + self.window_size]):
+                q = row.get("news_quality")
+                if q is not None and len(q) == q_dim:
+                    s_q[t, w, :] = q
+
+        # Znorm on training distribution to avoid leakage.
+        # If all zeros (no quality data at all) → mu=0, std≈1e-8 → stays 0.
+        s_q = self._znorm(s_q, s_q[:train_end])
+        return s_q
+
+    # ── Label builders ────────────────────────────────────────────────────────
 
     def _build_labels(self, ret_s: pd.Series, T: int, train_end: int) -> np.ndarray:
         if self.label_mode == "rolling":

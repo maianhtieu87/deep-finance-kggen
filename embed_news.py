@@ -808,28 +808,111 @@ def _save_output(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# QUALITY OUTPUT HELPERS  (V8.1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+QUALITY_DIM = 4
+"""
+Quality vector layout per (date, ticker):
+  [0] log(1 + n_triples)      — signal volume, log-scaled để tránh outlier
+  [1] avg_confidence           — extractor confidence trung bình
+  [2] avg_relevance_to_ticker  — độ liên quan trực tiếp với ticker
+  [3] avg_abs_impact           — độ mạnh tác động giá trung bình
+"""
+
+
+def _compute_quality_4d(triples: List[Dict]) -> List[float]:
+    """
+    Compute 4D quality vector từ danh sách triples đã filter.
+    Returns [0.0, 0.0, 0.0, 0.0] nếu triples rỗng.
+    """
+    if not triples:
+        return [0.0, 0.0, 0.0, 0.0]
+
+    n   = len(triples)
+    confs   = [float(t.get("confidence",          0.65)) for t in triples]
+    rels    = [float(t.get("relevance_to_ticker",  0.50)) for t in triples]
+    impacts = [abs(float(t.get("price_impact_score", 0.0))) for t in triples]
+
+    return [
+        float(np.log1p(n)),         # log(1 + n_triples)
+        float(np.mean(confs)),      # avg_confidence
+        float(np.mean(rels)),       # avg_relevance_to_ticker
+        float(np.mean(impacts)),    # avg_abs_impact
+    ]
+
+
+def _save_quality_output(
+    quality_dict:  Dict[str, Dict[str, List[float]]],
+    quality_path:  str,
+    ticker_filter: Optional[str],
+) -> None:
+    """
+    Merge-on-write + save quality JSON.
+    Cùng logic với _save_output() để đảm bảo per-ticker run không xóa ticker khác.
+
+    Format: {"YYYY-MM-DD": {"TICKER": [4 floats]}}
+    """
+    if ticker_filter:
+        existing: Dict[str, Dict[str, List[float]]] = {}
+        if os.path.exists(quality_path):
+            try:
+                with open(quality_path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+            except Exception as e:
+                print(f"  [quality] Could not load existing ({e}) — starting fresh")
+        if existing:
+            merged: Dict[str, Dict[str, List[float]]] = defaultdict(dict)
+            for ds, td in existing.items():
+                merged[ds].update(td)
+            for ds, td in quality_dict.items():
+                merged[ds].update(td)
+            final = merged
+        else:
+            final = quality_dict
+    else:
+        final = quality_dict
+
+    os.makedirs(os.path.dirname(os.path.abspath(quality_path)), exist_ok=True)
+    with open(quality_path, "w", encoding="utf-8") as f:
+        json.dump(dict(final), f, ensure_ascii=False)
+
+    total_pairs = sum(len(v) for v in final.values())
+    print(f"  Quality saved : {quality_path}")
+    print(f"  Quality pairs : {total_pairs} (dates={len(final)}, dim={QUALITY_DIM})")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FINBERT EMBED FUNCTION  (V8.0 — PRIMARY)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_embed_news_finbert(
-    news_df:          pd.DataFrame,
-    cache_dir:        str,
-    output_path:      str,
-    finbert_model:    str = "ProsusAI/finbert",
+    news_df:           pd.DataFrame,
+    cache_dir:         str,
+    output_path:       str,
+    finbert_model:     str          = "ProsusAI/finbert",
     finbert_cache_dir: Optional[str] = None,
-    min_relevance:    float = None,
-    min_confidence:   float = None,
-    ticker_filter:    Optional[str] = None,
-    date_prefix:      Optional[str] = None,
-    device:           Optional[str] = None,
+    min_relevance:     float        = None,
+    min_confidence:    float        = None,
+    ticker_filter:     Optional[str] = None,
+    date_prefix:       Optional[str] = None,
+    device:            Optional[str] = None,
+    quality_output_path: Optional[str] = None,   # V8.1: path for 4D quality JSON
 ) -> str:
     """
     FinBERT per-triple embedding pipeline.
 
+    V8.1 adds quality output as a side-effect of the same triple loop:
+      Embedding output  (768D): output_path            (e.g. news_embeddings_finbert.json)
+      Quality output     (4D) : quality_output_path    (e.g. news_embeddings_finbert_quality.json)
+
+    Quality vector per (date, ticker): [log(1+n_triples), avg_conf, avg_rel, avg_abs_impact]
+    If quality_output_path is None → auto-derived from output_path (recommended).
+
     1. Normalise DataFrame
     2. Load KG triple cache (meta + SHA1 fallback)
-    3. For each (ticker, date): embed triples → 768D weighted mean
-    4. Merge-on-write + save
+    3. For each (ticker, date): embed triples → 768D weighted mean + 4D quality stats
+    4. Merge-on-write + save both outputs
 
     Output format: {"YYYY-MM-DD": {"TICKER": [768D vector]}}
     Zero vector = no triples (news_mask handles this in model).
@@ -837,31 +920,38 @@ def run_embed_news_finbert(
     if min_relevance  is None: min_relevance  = GlobalConfig.KG_MIN_RELEVANCE
     if min_confidence is None: min_confidence = GlobalConfig.KG_MIN_CONFIDENCE
 
+    # V8.1: Auto-derive quality path nếu không cung cấp
+    if quality_output_path is None:
+        quality_output_path = output_path.replace(".json", "_quality.json")
+
     # Lazy-load FinBERT (slow on first call, ~10s)
     embedder = FinBERTPerTripleEmbedder(
         model_name=finbert_model,
         device=device,
         cache_dir=finbert_cache_dir,
     )
-    EMPTY_VEC = [0.0] * FinBERTPerTripleEmbedder.EMBED_DIM
+    EMPTY_VEC     = [0.0] * FinBERTPerTripleEmbedder.EMBED_DIM
+    EMPTY_QUALITY = [0.0] * QUALITY_DIM
 
     df = _normalize_news_df(news_df, ticker_filter, date_prefix)
     tickers = sorted(df["equity"].unique())
 
-    print(f"\nEmbed news V8.0 (FinBERT per-triple, {FinBERTPerTripleEmbedder.EMBED_DIM}D)")
-    print(f"  Tickers   : {len(tickers)}")
-    print(f"  Cache dir : {cache_dir}")
-    print(f"  Output    : {output_path}")
+    print(f"\nEmbed news V8.1 (FinBERT per-triple, {FinBERTPerTripleEmbedder.EMBED_DIM}D + {QUALITY_DIM}D quality)")
+    print(f"  Tickers      : {len(tickers)}")
+    print(f"  Cache dir    : {cache_dir}")
+    print(f"  Output (emb) : {output_path}")
+    print(f"  Output (qty) : {quality_output_path}")
     if ticker_filter:
-        print(f"  Filter    : {ticker_filter.upper()} — will MERGE into existing output")
+        print(f"  Filter       : {ticker_filter.upper()} — will MERGE into existing output")
     else:
-        print(f"  Filter    : none — full REBUILD")
+        print(f"  Filter       : none — full REBUILD")
     print()
 
     cache_store = CacheStore(cache_dir)
     cache_store.load()
 
-    new_output: Dict[str, Dict[str, List[float]]] = defaultdict(dict)
+    new_output:  Dict[str, Dict[str, List[float]]] = defaultdict(dict)
+    quality_out: Dict[str, Dict[str, List[float]]] = defaultdict(dict)
     stats = {"n_with_triples": 0, "n_empty": 0, "total_triples": 0}
 
     for ticker in tickers:
@@ -883,10 +973,13 @@ def run_embed_news_finbert(
                 stats["n_with_triples"] += 1
                 stats["total_triples"]  += len(all_triples)
                 daily_emb = embedder.embed_triples(all_triples, ticker)
-                new_output[date_str][ticker] = daily_emb
+                new_output[date_str][ticker]  = daily_emb
+                # V8.1: quality stats từ cùng all_triples (zero extra cost)
+                quality_out[date_str][ticker] = _compute_quality_4d(all_triples)
             else:
                 stats["n_empty"] += 1
-                new_output[date_str][ticker] = EMPTY_VEC
+                new_output[date_str][ticker]  = EMPTY_VEC
+                quality_out[date_str][ticker] = EMPTY_QUALITY
 
     avg_t = stats["total_triples"] / max(stats["n_with_triples"], 1)
     print(f"Embedding stats:")
@@ -894,6 +987,8 @@ def run_embed_news_finbert(
     print(f"  Days empty (zeros): {stats['n_empty']}")
     print(f"  Avg triples/day   : {avg_t:.1f}")
 
+    # V8.1: Save quality output TRƯỚC embedding output để nếu crash thì biết quality đã xong
+    _save_quality_output(quality_out, quality_output_path, ticker_filter)
     return _save_output(new_output, output_path, ticker_filter)
 
 
@@ -1019,7 +1114,11 @@ def main():
     parser.add_argument("--cache-dir", default=None,
                         help="Article triple cache dir (default: from GlobalConfig)")
     parser.add_argument("--output",    default=None,
-                        help="Output JSON path (default: interim/kg_embeddings/news_embeddings.json)")
+                        help="Output JSON path (default: interim/kg_embeddings/news_embeddings_finbert.json)")
+    parser.add_argument("--quality-output", default=None,
+                        help="[FinBERT] Quality stats JSON path. "
+                             "Default: same dir as --output, with '_quality' suffix. "
+                             "E.g. news_embeddings_finbert_quality.json (4D per ticker/day)")
     parser.add_argument("--ticker",    default=None,
                         help="Filter to 1 ticker, e.g. TSLA (merges into existing output)")
     parser.add_argument("--date",      default=None,
@@ -1106,6 +1205,7 @@ def main():
             ticker_filter=args.ticker,
             date_prefix=args.date,
             device=args.finbert_device,
+            quality_output_path=args.quality_output,  # V8.1: None → auto-derive
         )
 
     else:

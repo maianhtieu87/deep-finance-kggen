@@ -2,27 +2,21 @@
 """
 StockMovementModel — Sequential Gated Cross-Attention
 
-CHANGES vs V3:
-  [FIX-P2] Sửa lỗi H_pred_orig không thực sự là "original price signal".
+Phase 2 changes (vs previous):
+  [PHASE2-1] quality_dim parameter in __init__
+    - Passed through to MultimodalSourceEncoding → NewsEncoder → quality_mlp
+    - quality_dim=1 : Phase 1 (norm proxy, backward-compat default)
+    - quality_dim=4 : Phase 2 (pipeline quality from KG triples)
+    - Read from GlobalConfig.QUALITY_DIM at call site (main.py)
 
-  Vấn đề cũ:
-    combined = cat([H_idm, v_i, v_t_seq])  → Linear(3dim, 2dim)
-    H_pred_fused = H_final[:, :, :dim]     # = projection của mix(H_idm+v_i+v_t)
-    H_pred_orig  = H_final[:, :, dim:]     # = CŨNG projection của mix(H_idm+v_i+v_t)
-    → Cả 2 path vào predictor đều từ cùng 1 input → feat_agg nhận redundant info
-    → Predictor không có "shortcut" đến price signal thuần → gradient kém
+  [PHASE2-2] news_quality in forward()
+    - Optional (B, T, quality_dim) tensor from batch
+    - Sent to device + passed to multimodal_encoder → news_encoder
+    - None when no quality data or during modality dropout
 
-  Fix:
-    fused_input  = cat([H_idm, v_t_seq])   → fused_proj(Linear 2dim → dim)
-    H_pred_fused = fused_proj(fused_input)  # multimodal + ticker context
-    H_pred_orig  = v_i                      # PURE price signal (BiGRU output)
-    → feat_agg nhận: (1) multimodal summary, (2) raw price features
-    → price signal có direct path đến logits, không bị pha trộn với news/macro
-    → Gradient từ loss chảy trực tiếp về IndicatorEncoder qua orig path
-
-  Param count change:
-    Cũ: Linear(3*dim, 2*dim) = 3*64*2*64 = 24,576
-    Mới: Linear(2*dim, dim)  = 2*64*64   = 8,192   (nhỏ hơn, ít overfit hơn)
+Previous fixes retained:
+  [FIX-P2] Dual-path predictor: H_pred_fused = fused_proj(H_idm + ticker),
+           H_pred_orig = v_i (pure price BiGRU, direct gradient path)
 """
 
 import torch
@@ -30,7 +24,7 @@ from torch import nn
 import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, matthews_corrcoef
 
-from configs.config import TrainConfig
+from configs.config import TrainConfig, GlobalConfig
 from src.data_loader import N_TICKERS
 from encoders.mutil_encoder import MultimodalSourceEncoding
 from src.fusion import StableGatedCrossAttention
@@ -54,21 +48,22 @@ class FocalLoss(nn.Module):
 class StockMovementModel(nn.Module):
     def __init__(
         self,
-        price_dim:   int,
-        macro_dim:   int,
-        news_dim:    int,
-        dim:         int,
-        input_dim:   int,
-        output_dim:  int,
-        num_head:    int,
+        price_dim:      int,
+        macro_dim:      int,
+        news_dim:       int,
+        dim:            int,
+        input_dim:      int,
+        output_dim:     int,
+        num_head:       int,
         device,
-        dropout:     float = 0.1,
+        dropout:        float = 0.1,
         class_weights=None,
         use_focal_loss: bool  = True,
         focal_gamma:    float = 2.0,
         use_gnn:        bool  = False,
         n_tickers:      int   = N_TICKERS,
         ticker_emb_dim: int   = 16,
+        quality_dim:    int   = 1,    # [PHASE2-1] 1=norm proxy; 4=pipeline quality
     ):
         super().__init__()
         self.device   = device
@@ -84,12 +79,14 @@ class StockMovementModel(nn.Module):
         )
 
         # ── Multimodal encoders ───────────────────────────────────────────────
+        # [PHASE2-1] quality_dim passed to MultimodalSourceEncoding → NewsEncoder
         self.multimodal_encoder = MultimodalSourceEncoding(
             price_dim=price_dim,
             macro_dim=macro_dim,
             news_dim=news_dim,
             dim=dim,
             dropout=dropout,
+            quality_dim=quality_dim,
         )
 
         # ── Sequential Gated Cross-Attention Fusion ───────────────────────────
@@ -97,25 +94,10 @@ class StockMovementModel(nn.Module):
         self.fusion_stage2 = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
 
         # ── [FIX-P2] Predictor input projection ──────────────────────────────
-        #
-        # Cũ: pre_predict_proj = Linear(3*dim → 2*dim)
-        #     Input: cat([H_idm, v_i, v_t_seq]) — mixed signal
-        #     Output split thành fused/orig — cả 2 cùng nguồn → redundant
-        #
-        # Mới: fused_proj = Linear(2*dim → dim)
-        #     Input: cat([H_idm, v_t_seq]) — multimodal + ticker ONLY
-        #     orig path nhận v_i trực tiếp — PURE price, không mixing
-        #
-        # Rationale:
-        #   FinegrainedMovementPrediction đang làm dual-path prediction:
-        #     path1 (fused): "what does the multimodal model think?"
-        #     path2 (orig):  "what does raw price alone think?"
-        #   Để dual-path có ý nghĩa, 2 path phải có information khác nhau.
-        #   Với fix này, gradient từ loss có 2 distinct paths:
-        #     - Qua fused_proj → H_idm → fusion → news/price/macro encoders
-        #     - Qua v_i        → IndicatorEncoder (direct, không qua fusion)
+        # fused_proj: cat([H_idm, v_t_seq]) → dim  (multimodal + ticker only)
+        # orig path : v_i directly             (pure price, no mixing)
         self.fused_proj = nn.Sequential(
-            nn.Linear(2 * dim, dim),     # cat([H_idm, v_t_seq]) → dim
+            nn.Linear(2 * dim, dim),
             nn.LayerNorm(dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -141,10 +123,11 @@ class StockMovementModel(nn.Module):
         self,
         s_o, s_h, s_c, s_m, s_n,
         label=None,
-        mode:         str  = "train",
-        return_preds: bool = False,
+        mode:          str  = "train",
+        return_preds:  bool = False,
         ticker_id=None,
         news_mask=None,
+        news_quality=None,   # [PHASE2-2] (B, T, quality_dim) or None
         **kwargs,
     ):
         B = s_o.shape[0]
@@ -162,35 +145,33 @@ class StockMovementModel(nn.Module):
                else torch.zeros(B, dtype=torch.long, device=self.device))
         v_t = self.ticker_proj(self.ticker_emb(tid))   # (B, dim)
 
-        news_mask_dev = (news_mask.to(self.device) if news_mask is not None else None)
+        news_mask_dev    = (news_mask.to(self.device)
+                            if news_mask is not None else None)
+
+        # [PHASE2-2] Move quality tensor to device; None = norm proxy fallback
+        news_quality_dev = (news_quality.to(self.device)
+                            if news_quality is not None else None)
 
         # ── Encode modalities ─────────────────────────────────────────────────
-        v_m, v_i, v_n = self.multimodal_encoder(
+        v_m, v_i, v_n, g_n = self.multimodal_encoder(
             s_o, s_h, s_c, s_m, s_n,
             news_mask=news_mask_dev,
+            news_quality=news_quality_dev,   # [PHASE2-2]
         )
         if v_n is None:
             v_n = torch.zeros_like(v_i)
 
         # ── Fusion ────────────────────────────────────────────────────────────
-        # Stage 1: price × news
+        # Stage 1: price × news (news_mask gates out no-news positions)
         H_id  = self.fusion_stage1(primary=v_i, aux=v_n, aux_mask=news_mask_dev)
-        # Stage 2: H_id × macro
+        # Stage 2: (price+news) × macro
         H_idm = self.fusion_stage2(primary=H_id, aux=v_m)
 
         # ── [FIX-P2] Dual-path prediction ────────────────────────────────────
-        #
-        # fused path: multimodal output H_idm, conditioned on ticker
-        #   → tells the predictor what the full model (price+news+macro) thinks
         v_t_seq      = v_t.unsqueeze(1).expand(-1, T, -1)   # (B, T, dim)
         fused_input  = torch.cat([H_idm, v_t_seq], dim=-1)  # (B, T, 2*dim)
         H_pred_fused = self.fused_proj(fused_input)          # (B, T, dim)
-
-        # orig path: pure price BiGRU output v_i, NO mixing with news/macro
-        #   → tells the predictor what price pattern alone suggests
-        #   → acts as a skip connection from IndicatorEncoder to logits
-        #   → direct gradient path: loss → time_agg_orig → v_i → BiGRU
-        H_pred_orig  = v_i                                   # (B, T, dim)
+        H_pred_orig  = v_i                                   # (B, T, dim) — pure price
 
         logits = self.movement_predictor(
             fused_seq=H_pred_fused,

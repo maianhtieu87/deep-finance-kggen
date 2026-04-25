@@ -2,23 +2,25 @@
 """
 Training script — Standard Time Series Split (Train/Val/Test)
 
-CHANGES vs previous version:
-  [FIX-1] Scheduler: CosineAnnealingWarmRestarts → CosineAnnealingLR
-    - Bỏ restart → không có LR spike làm disrupted convergence ở ep30/ep90
-    - LR giảm mượt từ lr_max → eta_min suốt max_epochs
+Phase 2 changes:
+  [PHASE2-A] StockDataset._BASE_KEYS: added "news_quality"
+    - news_quality is always present in data_loader V5.7 output
+      (zeros when no quality file; real 4D vectors when available)
 
-  [FIX-2] Param groups: tách weight_decay khỏi LayerNorm/bias
-    - LayerNorm.weight, bias không nên có weight_decay
-    - Dùng AdamW (built-in decoupled decay) thay Adam
+  [PHASE2-B] evaluate(): pass news_quality from batch to model
+    - batch.get("news_quality") → .to(device) or None
 
-  [FIX-3] News Modality Dropout trong training loop
-    - Xác suất NEWS_MODALITY_DROPOUT: zero toàn bộ s_n + full mask
-    - Buộc model học dự đoán khi không có news → prevent shortcut
-    - Khi có news, model học extract signal thực sự
+  [PHASE2-C] train_and_evaluate():
+    - StockMovementModel instantiation: pass quality_dim from GlobalConfig
+    - Modality dropout: quality_in=None when dropping news
+      (conceptually clean: full news drop = zero embeddings + no quality signal)
+    - Training loss call: pass quality_in to model
 
-  [FIX-4] Early Stopping với patience
-    - Tránh overfit catastrophic (ep155: val_mcc=0.05)
-    - Best model checkpoint vẫn được giữ lại
+Previous fixes retained:
+  [FIX-1] CosineAnnealingLR (no restarts)
+  [FIX-2] AdamW with separate param groups (no weight_decay on LN/bias)
+  [FIX-3] News Modality Dropout
+  [FIX-4] Early Stopping with patience
 """
 
 import sys
@@ -40,9 +42,7 @@ from src.model import StockMovementModel
 from src.data_loader import data_prepare, N_TICKERS
 from configs.config import TrainConfig, GlobalConfig
 
-# ── Shared hyperparams — đổi tại TrainConfig trong configs/config.py ─────────
-# Để tắt early stopping : TrainConfig.early_stop_patience  = 9999
-# Để tắt modality dropout: TrainConfig.news_modality_dropout = 0.0
+# ── Shared hyperparams ────────────────────────────────────────────────────────
 NEWS_MODALITY_DROPOUT = TrainConfig.news_modality_dropout   # default 0.30
 EARLY_STOP_PATIENCE   = TrainConfig.early_stop_patience     # default 30
 
@@ -63,13 +63,20 @@ device = torch.device(
 
 
 class StockDataset(Dataset):
-    _BASE_KEYS = ["s_o", "s_h", "s_c", "s_m", "s_n", "news_mask", "label"]
+    # [PHASE2-A] "news_quality" added — always present from data_loader V5.7
+    _BASE_KEYS = [
+        "s_o", "s_h", "s_c", "s_m", "s_n",
+        "news_mask", "label",
+        "news_quality",   # (T, window_size, quality_dim) — zeros if no quality file
+    ]
 
     def __init__(self, d: dict):
         self.d    = d
         self.keys = list(self._BASE_KEYS)
         if "ticker_id" in d:
             self.keys.append("ticker_id")
+        # Guard: drop keys not present in d (backward-compat with old PKL)
+        self.keys = [k for k in self.keys if k in d]
 
     def __len__(self) -> int:
         return len(self.d["label"])
@@ -111,6 +118,15 @@ def compute_class_weights(labels: torch.Tensor, suppress_print=False) -> torch.T
     return wt
 
 
+def _batch_quality(batch: dict) -> "torch.Tensor | None":
+    """
+    Extract news_quality from batch safely.
+    Returns tensor on CPU (caller moves to device), or None if absent.
+    """
+    q = batch.get("news_quality")
+    return q if (q is not None and isinstance(q, torch.Tensor)) else None
+
+
 def evaluate(model: StockMovementModel, data_dict: dict) -> tuple:
     if not data_dict or len(data_dict.get("label", [])) == 0:
         return 0.0, 0.0
@@ -120,6 +136,8 @@ def evaluate(model: StockMovementModel, data_dict: dict) -> tuple:
     all_preds, all_labels = [], []
     with torch.no_grad():
         for batch in ldr:
+            # [PHASE2-B] pass news_quality from batch
+            q = _batch_quality(batch)
             _, _, preds = model(
                 batch["s_o"].to(device),
                 batch["s_h"].to(device),
@@ -131,6 +149,7 @@ def evaluate(model: StockMovementModel, data_dict: dict) -> tuple:
                 return_preds=True,
                 ticker_id=batch.get("ticker_id"),
                 news_mask=batch["news_mask"].to(device),
+                news_quality=q.to(device) if q is not None else None,  # [PHASE2-B]
             )
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(batch["label"].cpu().numpy())
@@ -140,17 +159,13 @@ def evaluate(model: StockMovementModel, data_dict: dict) -> tuple:
 
 def _make_optimizer(model: StockMovementModel, lr: float, weight_decay: float):
     """
-    [FIX-2] Tách param groups: LayerNorm weights + biases không có weight_decay.
-
-    Lý do: weight_decay (L2) trên LayerNorm.weight làm scale của normalized output
-    bị kéo về 0 theo thời gian → gradient thông qua LN bị triệt tiêu.
-    AdamW implement decoupled weight decay đúng chuẩn (Loshchilov & Hutter 2019),
-    khác Adam + L2 regularization (sai về mặt lý thuyết).
+    [FIX-2] AdamW với separate param groups: LayerNorm + bias không có weight_decay.
     """
-    no_decay_keywords = ["bias", "LayerNorm.weight", "layernorm.weight",
-                         "norm.weight", "attn_norm.weight", "out_norm.weight"]
-
-    decay_params   = []
+    no_decay_keywords = [
+        "bias", "LayerNorm.weight", "layernorm.weight",
+        "norm.weight", "attn_norm.weight", "out_norm.weight",
+    ]
+    decay_params    = []
     no_decay_params = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -160,16 +175,18 @@ def _make_optimizer(model: StockMovementModel, lr: float, weight_decay: float):
         else:
             decay_params.append(param)
 
-    param_groups = [
-        {"params": decay_params,    "weight_decay": weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
-    ]
-    return torch.optim.AdamW(param_groups, lr=lr)
+    return torch.optim.AdamW(
+        [
+            {"params": decay_params,    "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
+        lr=lr,
+    )
 
 
 def train_and_evaluate(
     train_data: dict, val_data: dict, test_data: dict,
-    include_ticker_id: bool, max_epochs: int, save_path: str
+    include_ticker_id: bool, max_epochs: int, save_path: str,
 ):
     print(f"\n{'-'*60}")
     print(f"TRAINING (Epochs: {max_epochs}, "
@@ -181,7 +198,15 @@ def train_and_evaluate(
 
     s_m_dim = train_data["s_m"].shape[-1]
     s_n_dim = train_data["s_n"].shape[-1]
-    cw = compute_class_weights(train_data["label"]).to(device)
+    cw      = compute_class_weights(train_data["label"]).to(device)
+
+    # [PHASE2-C] Read quality_dim from config.
+    # Default MUST match data_loader.py default (both use 4).
+    # data_loader builds quality tensor with dim=4 regardless of config,
+    # so model must also be built with dim=4 to avoid shape mismatch.
+    quality_dim = getattr(GlobalConfig, "QUALITY_DIM", 4)
+    print(f"  Quality dim           : {quality_dim}D "
+          f"({'pipeline' if quality_dim > 1 else 'norm proxy'})")
 
     ds_train  = StockDataset(train_data)
     ldr_train = DataLoader(
@@ -191,6 +216,7 @@ def train_and_evaluate(
         drop_last=False,
     )
 
+    # [PHASE2-C] pass quality_dim so MultimodalSourceEncoding → NewsEncoder built correctly
     model = StockMovementModel(
         price_dim=1, macro_dim=s_m_dim, news_dim=s_n_dim,
         dim=TrainConfig.dim, input_dim=TrainConfig.window_size,
@@ -199,18 +225,16 @@ def train_and_evaluate(
         use_focal_loss=getattr(TrainConfig, "use_focal_loss", True),
         focal_gamma=getattr(TrainConfig, "focal_gamma", 2.0),
         device=device, n_tickers=N_TICKERS,
+        quality_dim=quality_dim,   # [PHASE2-C]
     ).to(device)
 
-    # [FIX-2] AdamW + separate param groups
     optimizer = _make_optimizer(
         model,
         lr=getattr(TrainConfig, "learning_rate", 1e-4),
         weight_decay=getattr(TrainConfig, "weight_decay", 1e-4),
     )
 
-    # [FIX-1] CosineAnnealingLR — không có restart, LR giảm monotone
-    # T_max = max_epochs: LR đi từ lr_max → eta_min trong đúng 1 cycle
-    # Không còn LR spike tại ep30/ep90 phá vỡ convergence
+    # [FIX-1] CosineAnnealingLR — no restarts, monotone decay
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max_epochs, eta_min=1e-6
     )
@@ -219,7 +243,7 @@ def train_and_evaluate(
 
     best_val_mcc     = -1.0
     best_epoch       = 0
-    patience_counter = 0   # [FIX-4]
+    patience_counter = 0
 
     for epoch in range(max_epochs):
         model.train()
@@ -229,22 +253,17 @@ def train_and_evaluate(
             optimizer.zero_grad()
 
             # ── [FIX-3] News Modality Dropout ────────────────────────────────
-            # Với xác suất NEWS_MODALITY_DROPOUT, zero toàn bộ news input.
-            # Mask được set True (= no news) cho toàn bộ T positions.
-            #
-            # Hiệu quả:
-            #   - Model học cách dự đoán chỉ từ price+macro → baseline ổn định
-            #   - Khi news có mặt (70% steps), model học extract incremental signal
-            #   - Ngăn news branch bị completely ignored (do price signal mạnh hơn)
-            #   - Tương tự DropPath / Modality Dropout trong multimodal literature
+            # [PHASE2-C] When dropping news: also set quality_in=None so
+            # NewsEncoder falls back to norm proxy (norm of zero vector = 0 → gate≈0).
+            # Keeps the conceptual contract: "no news" = zero embedding + no quality.
             if torch.rand(1).item() < NEWS_MODALITY_DROPOUT:
-                s_n_in   = torch.zeros_like(batch["s_n"])
-                mask_in  = torch.ones(
-                    batch["news_mask"].shape, dtype=torch.bool
-                )
+                s_n_in     = torch.zeros_like(batch["s_n"])
+                mask_in    = torch.ones(batch["news_mask"].shape, dtype=torch.bool)
+                quality_in = None                       # drop quality together with news
             else:
-                s_n_in  = batch["s_n"]
-                mask_in = batch["news_mask"]
+                s_n_in     = batch["s_n"]
+                mask_in    = batch["news_mask"]
+                quality_in = _batch_quality(batch)      # real quality or None
 
             loss = model(
                 batch["s_o"].to(device),
@@ -254,10 +273,15 @@ def train_and_evaluate(
                 s_n_in.to(device),
                 batch["label"].to(device),
                 mode="train",
-                ticker_id=(batch["ticker_id"]
-                           if include_ticker_id and "ticker_id" in batch
-                           else None),
+                ticker_id=(
+                    batch["ticker_id"]
+                    if include_ticker_id and "ticker_id" in batch
+                    else None
+                ),
                 news_mask=mask_in.to(device),
+                news_quality=(                          # [PHASE2-C]
+                    quality_in.to(device) if quality_in is not None else None
+                ),
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -333,7 +357,7 @@ def main():
         include_ticker_id=include_tid,
     )
 
-    valid_T = [dp.get_max_T(t) for t in tickers if dp.get_max_T(t) > 0]
+    valid_T      = [dp.get_max_T(t) for t in tickers if dp.get_max_T(t) > 0]
     if not valid_T:
         print("No valid data found.")
         return

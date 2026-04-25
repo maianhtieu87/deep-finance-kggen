@@ -144,6 +144,7 @@ def _build_msgca_model(macro_dim, news_dim, lr, dropout, focal_gamma, cw=None):
         focal_gamma=focal_gamma,
         device=DEVICE,
         n_tickers=N_TICKERS,
+        quality_dim=getattr(GlobalConfig, "QUALITY_DIM", 4),
     ).to(DEVICE)
     opt = _make_adamw(model, lr)
     return model, opt
@@ -186,13 +187,14 @@ def _build_msgca_model_production(macro_dim, news_dim, lr, dropout, train_labels
         focal_gamma=2.0,
         device=DEVICE,
         n_tickers=N_TICKERS,
+        quality_dim=getattr(GlobalConfig, "QUALITY_DIM", 4),
     ).to(DEVICE)
     opt = _make_adamw(model, lr)
     return model, opt
 
 
 def _eval_msgca(model, data, batch_size=64):
-    """Evaluate MSGCA — pass news_mask + ticker_id."""
+    """Evaluate MSGCA — pass news_mask + news_quality + ticker_id."""
     from sklearn.metrics import accuracy_score, matthews_corrcoef
     if not data or len(data.get("label", [])) == 0: return 0.0, 0.0
     model.eval()
@@ -200,6 +202,7 @@ def _eval_msgca(model, data, batch_size=64):
     preds_all, labels_all = [], []
     with torch.no_grad():
         for batch in ldr:
+            q = batch.get("news_quality")
             _, _, preds = model(
                 batch["s_o"].to(DEVICE), batch["s_h"].to(DEVICE),
                 batch["s_c"].to(DEVICE), batch["s_m"].to(DEVICE),
@@ -207,6 +210,7 @@ def _eval_msgca(model, data, batch_size=64):
                 mode="test", return_preds=True,
                 ticker_id=batch.get("ticker_id"),
                 news_mask=batch.get("news_mask"),
+                news_quality=q.to(DEVICE) if q is not None else None,
             )
             preds_all.extend(preds.cpu().numpy())
             labels_all.extend(batch["label"].numpy())
@@ -231,10 +235,12 @@ def _train_epoch(model, loader, opt):
         # News Modality Dropout — khớp main.py [FIX-3]
         s_n_in  = batch["s_n"].to(DEVICE)
         mask_in = batch.get("news_mask")
+        q_in    = batch.get("news_quality")   # (B, T, quality_dim) or None
         if _MOD_DROPOUT > 0.0 and torch.rand(1).item() < _MOD_DROPOUT:
             s_n_in  = torch.zeros_like(s_n_in)
             if mask_in is not None:
                 mask_in = torch.ones_like(mask_in, dtype=torch.bool)
+            q_in = None   # drop quality together with news (matches main.py)
 
         loss = model(
             batch["s_o"].to(DEVICE), batch["s_h"].to(DEVICE),
@@ -243,6 +249,7 @@ def _train_epoch(model, loader, opt):
             mode="train",
             ticker_id=batch.get("ticker_id"),
             news_mask=mask_in.to(DEVICE) if mask_in is not None else None,
+            news_quality=q_in.to(DEVICE) if q_in is not None else None,
         )
         if torch.isfinite(loss):
             loss.backward()
@@ -516,6 +523,7 @@ def load_and_eval_saved_model(
         class_weights=None,
         use_focal_loss=False,
         device=DEVICE, n_tickers=N_TICKERS,
+        quality_dim=getattr(GlobalConfig, "QUALITY_DIM", 4),
     ).to(DEVICE)
 
     state = torch.load(model_path, map_location=DEVICE, weights_only=True)
