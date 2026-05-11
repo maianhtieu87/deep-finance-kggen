@@ -1,10 +1,28 @@
 """
-MSGCA Trainer — 2-phase training logic for MSGCA_FV (CE loss mode).
+MSGCA Trainer — 2-phase training logic cho MSGCA_FV (CE loss mode).
 
-Phase 1: train on [0:hval_split] with early stopping → find best_epoch
-Phase 2: retrain on [0:inner_T]  for best_epoch    → evaluate on test
+Phase 1: train trên train_hval → tìm best_epoch qua val_MCC
+Phase 2: retrain trên train_full đúng best_epoch lần → eval test
 
-This module is self-contained: all imports are local.
+Module này tự chứa: tất cả imports là local.
+
+─── PROTOCOL GốC ĐẢ TẠO RA ACC=0.4324, MCC=0.1394 ──────────────────────
+  Nguồn: baselines/run_experiments.py → run_msgca_with_saved_model()
+  Kết quả: raw_results.json → ep_mean=42.75, seed42_from_saved=true
+
+  - seed=42  : load từ output/best_model_...seed42_fixed.pt (train bởi main.py)
+  - seed 123,256,512,1024 : _run_msgca_one_seed() với:
+      patience  = TrainConfig.early_stop_patience = 9999  (đủ 150 ep)
+      max_epochs= 150
+      hp        = {lr=1e-4, dropout=0.2, focal_gamma=2.0}  (CE mode, focal_gamma bỏ qua)
+      warmup    = LinearLR(0.1→1.0, 15ep) + CosineAnnealing
+      min_active= max(warmup_epochs, 40) = 40
+      Phase 2   : CosineAnnealing(T_max=best_epoch), KHÔNG có warmup
+
+  → MODULE NÀY DÙNG PROTOCOL NÀY (patience=9999) ĐỂ TÁI LẬP SEEDS 123-1024.
+  → Seed=42 sẽ cho kết quả gần đúng (không hoàn toàn vì main.py dùng
+    single-phase + focal loss + class weights, khác 2-phase CE của module này).
+──────────────────────────────────────────────────────────────────────────────
 """
 
 import random
@@ -207,7 +225,8 @@ def run_one_seed(
     hp:          dict,
     device:      torch.device,
     max_epochs:  int   = 150,
-    patience:    int   = 30,
+    patience:    int   = 9999,  # 9999 = chạy đủ 150 ep, pick epoch có val_MCC tốt nhất
+                                # đây là protocol gốc tạo ra ACC=0.4324 (TrainConfig.early_stop_patience=9999)
     warmup_epochs: int = 15,
     mod_dropout: float = 0.30,
     verbose:     bool  = False,
@@ -218,10 +237,16 @@ def run_one_seed(
     quality_dim: int   = 4,
 ) -> Tuple[float, float, int]:
     """
-    2-phase training for one random seed.
+    2-phase training cho 1 random seed.
 
-    Phase 1: train on train_hval → early stopping on val_hval MCC → find best_epoch
-    Phase 2: retrain on train_full for best_epoch → evaluate on test
+    Phase 1: train trên train_hval, track best val_MCC → tìm best_epoch
+             patience=9999 (default) → chạy đủ max_epochs, pick epoch có val_MCC cao nhất
+             Đây là protocol gốc (_run_msgca_one_seed với patience=9999 từ TrainConfig)
+             Ví dụ: seed=42 có thể cho best_epoch~43, seed khác tương tự.
+
+    Phase 2: retrain trên train_full đúng best_epoch lần → eval test
+             Scheduler: CosineAnnealingLR(T_max=best_epoch) — KHÔNG có warmup
+             (khớp chính xác _run_msgca_one_seed trong run_experiments.py)
 
     Returns: (acc, mcc, best_epoch)
     """
@@ -245,7 +270,9 @@ def run_one_seed(
     )
 
     best_mcc, best_epoch, no_improve = -2.0, 1, 0
-    min_active = max(warmup_epochs, 40)   # don't start early-stopping before epoch 40
+    # KHÔNG lưu best_state — Phase 2 luôn retrain từ đầu với best_epoch
+    # Khớp chính xác _run_msgca_one_seed trong run_experiments.py (gốc)
+    min_active = max(warmup_epochs, 40)   # bắt đầu check val sau warmup + ít nhất 40 ep
 
     for epoch in range(max_epochs):
         train_epoch(model, ldr, opt, device, mod_dropout=mod_dropout)
@@ -257,17 +284,21 @@ def run_one_seed(
         if epoch >= min_active:
             _, mcc = eval_model(model, val_hval, device)
             if mcc > best_mcc:
-                best_mcc = mcc
+                best_mcc   = mcc
                 best_epoch = epoch + 1
                 no_improve = 0
+                if verbose:
+                    print(f"      ep {best_epoch:3d}: val_MCC={mcc:.4f}  ← new best")
             else:
                 no_improve += 1
                 if no_improve >= patience:
+                    if verbose:
+                        print(f"      ep {epoch+1:3d}: no improve {no_improve}/{patience} — early stop")
                     break
 
-        if verbose and (epoch + 1) % 20 == 0:
+        elif verbose and (epoch + 1) % 20 == 0:
             _, cur_mcc = eval_model(model, val_hval, device)
-            print(f"      ep {epoch+1:3d}: val_MCC={cur_mcc:.4f}")
+            print(f"      ep {epoch+1:3d}: val_MCC={cur_mcc:.4f}  (warmup phase)")
 
     if verbose:
         print(f"    Phase1 done: best_ep={best_epoch}  val_MCC={best_mcc:.4f}")
@@ -399,14 +430,20 @@ def final_eval(
     n_tickers:   int   = N_TICKERS,
     quality_dim: int   = 4,
     max_epochs:  int   = 150,
-    patience:    int   = 30,
+    patience:    int   = 9999,  # 9999 = chạy đủ 150 ep, pick best val_MCC epoch
+                                # khớp TrainConfig.early_stop_patience=9999 (protocol gốc)
     warmup_epochs: int = 15,
     mod_dropout: float = 0.30,
     verbose:     bool  = True,
 ) -> dict:
     """
-    Final evaluation with n_seeds using best_hparams.
-    Reports mean±std ACC and MCC across seeds.
+    Final evaluation với n_seeds dùng best_hparams.
+    Reports mean±std ACC và MCC across seeds.
+
+    Protocol mặc định (patience=9999) = chạy đủ 150 ep, chọn epoch có val_MCC cao nhất.
+    Khớp _run_msgca_one_seed trong run_experiments.py với patience=9999
+    (TrainConfig.early_stop_patience=9999).
+    → protocol gốc tạo ra seeds 123,256,512,1024 của MSGCA_FV (ACC=0.4324)
     """
     acc_list, mcc_list, ep_list = [], [], []
 

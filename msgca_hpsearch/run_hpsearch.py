@@ -33,8 +33,24 @@ NOTES
 -----
 - Dataset: unified_dataset_test.pkl (produced by deep-finance-kggen pipeline)
 - Loss: Cross-Entropy (no focal loss, no class weights) — fair comparison mode
-- Scheduler: LinearLR warmup → CosineAnnealingLR
-- Early stopping: on val MCC, starts after max(warmup_epochs, 40) epochs
+- Scheduler: LinearLR warmup (15ep) → CosineAnnealingLR
+- min_active: bắt đầu check val_MCC sau max(warmup, 40) epochs
+
+PROTOCOL GốC TẠO RA MSGCA_FV (ACC=0.4324, MCC=0.1394)
+---------------------------------------------------------
+  Nguồn: baselines/results/raw_results.json  (ep_mean=42.75, seed42_from_saved=true)
+
+  seeds 123,256,512,1024 được train bởi run_experiments.py
+  với _run_msgca_one_seed(patience=9999, max_epochs=150):
+    → Phase 1: chạy đủ 150 ep, pick best val_MCC epoch (~42-43)
+    → Phase 2: retrain bấy nhiêu ep, không có warmup
+    → HP gốc: lr=1e-4, dropout=0.2
+
+  seed=42 được load từ saved .pt (main.py: single-phase, focal loss)
+    → Module này không thể tái lập hoàn toàn seed=42.
+
+  Để tái lập gần đúng nhất với module này (2-phase CE):
+    python run_hpsearch.py --data data.pkl --lr 1e-4 --dropout 0.2 --mode eval
 """
 
 import argparse
@@ -118,15 +134,22 @@ def parse_args():
     # ── Training control ──────────────────────────────────────────────────────
     ap.add_argument("--n-seeds",      type=int,   default=5,    help="Seeds for final eval (default: 5)")
     ap.add_argument("--max-epochs",   type=int,   default=150,  help="Max training epochs (default: 150)")
-    ap.add_argument("--patience",     type=int,   default=30,   help="Early stopping patience (default: 30)")
+    ap.add_argument("--patience",     type=int,   default=9999,
+                    help=(
+                        "Early stopping patience cho FINAL EVAL (default: 9999).\n"
+                        "9999 = chạy đủ max_epochs, pick best val_MCC epoch.\n"
+                        "      Đây là protocol gốc: TrainConfig.early_stop_patience=9999.\n"
+                        "      ep_mean=42.75 được tạo ra bởi chế độ này.\n"
+                        "30   = early stop 30 ep không cải thiện — search nhanh hơn."
+                    ))
     ap.add_argument("--warmup",       type=int,   default=15,   help="Warmup epochs (default: 15)")
     ap.add_argument("--mod-dropout",  type=float, default=0.30, help="News modality dropout prob (default: 0.30)")
 
     # ── Search-specific ───────────────────────────────────────────────────────
     ap.add_argument("--search-max-epochs", type=int, default=None,
                     help="Max epochs during search phase (default: min(max_epochs, 100))")
-    ap.add_argument("--search-patience",   type=int, default=None,
-                    help="Patience during search phase (default: min(patience, 20))")
+    ap.add_argument("--search-patience",   type=int, default=30,
+                    help="Patience during search phase (default: 30). Lower = faster search.")
 
     # ── Data split ────────────────────────────────────────────────────────────
     ap.add_argument("--train-ratio", type=float, default=0.70, help="Train ratio (default: 0.70)")
@@ -253,7 +276,7 @@ def main():
             print(f"  Resuming from {len(resume_results)} previous results")
 
         search_max_epochs = args.search_max_epochs or min(args.max_epochs, 100)
-        search_patience   = args.search_patience   or min(args.patience, 20)
+        search_patience   = args.search_patience   # default 30 — fast search
 
         t0 = time.time()
         search_result = grid_search(
