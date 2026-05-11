@@ -1,0 +1,6 @@
+# msgca_hpsearch — Placeholder for results
+
+Results files will be saved here automatically:
+- msgca_best_hparams.json  — best hyperparameters from grid search
+- msgca_all_results.json   — all search results (used for --resume)
+- msgca_final_eval.json    — final n-seed evaluation results
